@@ -884,11 +884,28 @@ class Ross3DMetaForCausalLM(ABC):
             cat_cur_input_ids_noim = torch.cat(cur_input_ids_noim)
             cur_input_embeds = self.get_model().embed_tokens(cat_cur_input_ids_noim)
 
+            # Hanwen
             # Add input coord PE
             if hasattr(self.config, "coord_token_ids") and (use_sin3d_pe or use_mlp_pe):
                 query_coord_tokens = (cat_cur_input_ids_noim == self.config.coord_token_ids[0])
-                if query_coord_tokens.sum() != 0:
-                    cur_input_embeds[query_coord_tokens] += self.get_model().world_position_embedding(box_input.unsqueeze(0).detach())[:, 0]
+
+                # Only apply world position embedding if everything we need is present
+                if (
+                    query_coord_tokens.sum() != 0
+                    and box_input is not None
+                    and hasattr(self.get_model(), "world_position_embedding")
+                ):
+                    box_tensor = box_input.unsqueeze(0).detach()
+                    box_tensor = box_tensor.to(
+                        device=cur_input_embeds.device,
+                        dtype=cur_input_embeds.dtype,
+                    )
+
+                    cur_input_embeds[query_coord_tokens] += (
+                        self.get_model().world_position_embedding(box_tensor)[:, 0]
+                    )
+                # else: no valid world-position info for this sample → skip instead of crashing
+
 
             
             cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
