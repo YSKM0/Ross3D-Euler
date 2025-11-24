@@ -22,6 +22,7 @@ import torch
 from ross3d.model import *
 from ross3d.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from ross3d.utils import rank0_print
+from types import SimpleNamespace
 
 
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", torch_dtype="float16",attn_implementation="flash_attention_2", customized_config=None, overwrite_config=None, **kwargs):
@@ -87,6 +88,10 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             else:
                 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
                 model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
+
+    # Hanwliu
+    if hasattr(model.config, "text_config") and isinstance(model.config.text_config, dict):
+        model.config.text_config = SimpleNamespace(**model.config.text_config)
 
     rank0_print(f"Model Class: {model.__class__.__name__}")
     image_processor = None

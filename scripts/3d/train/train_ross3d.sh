@@ -27,7 +27,7 @@ torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
     --video_folder data \
     --embodiedscan_folder data/embodiedscan/ \
     --mm_tunable_parts "mm_mlp_adapter,mm_language_model,mm_inv_adapter" \
-    --vision_tower /data/llm_model_zoo/siglip-so400m-patch14-384 \
+    --vision_tower /models/siglip-so400m-patch14-384 \
     --ross_multi_task True \
     --mm_pixel_decoder ./checkpoints/FLUX.1-dev \
     --mm_projector_type mlp2x_gelu \

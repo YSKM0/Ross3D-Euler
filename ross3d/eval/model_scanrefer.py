@@ -102,7 +102,20 @@ def eval_model(questions, args):
             "view_mask_ratio": 0.,
         })
 
-    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name, overwrite_config=config)
+    # Hanwliu
+    forbidden_keys = {"text_config", "vision_config"}
+    safe_overwrite = {}
+    for k, v in config.items():
+        if k in forbidden_keys:
+            continue
+        if isinstance(v, (dict, list)):
+            continue
+        safe_overwrite[k] = v
+
+    # If nothing to override, pass None to keep behavior clean
+    overwrite_arg = safe_overwrite if len(safe_overwrite) > 0 else None
+
+    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name, overwrite_config=overwrite_arg)
 
     if args.lora_path is not None:
         from transformers import AutoTokenizer
@@ -235,7 +248,18 @@ if __name__ == "__main__":
         print(f"The {args.answer_file} already exists!!!")
         exit()
     
-    ray.init()
+    # Hanwliu
+    ray_kwargs = {
+        "include_dashboard": False,
+    }
+
+    slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+
+    if slurm_cpus is not None:
+        ray_kwargs["num_cpus"] = int(slurm_cpus)
+
+    ray.init(**ray_kwargs)
+    
     features = []
     for i in range(args.n_gpu):
         features.append(eval_model.remote(questions[i::args.n_gpu], args))

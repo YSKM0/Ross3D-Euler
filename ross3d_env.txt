@@ -1,0 +1,45 @@
+#!/bin/bash
+#SBATCH --job-name=ross3d_env
+#SBATCH --time=10:00:00
+#SBATCH --cpus-per-task=32
+#SBATCH --mem-per-cpu=2000M
+#SBATCH --gpus=1
+#SBATCH --output=/cluster/scratch/hanwliu/projects/ross3d/logs/%x-%j.out
+
+set -euo pipefail
+
+# --- Load CUDA toolchain so flash-attn can find CUDA/nvcc ---
+module purge
+module load eth_proxy
+module load stack/2024-06 cuda/12.1.1 python/3.10.13
+
+cd /cluster/scratch/hanwliu/projects/ross3d
+export PIP_NO_BUILD_ISOLATION=1
+
+conda env remove -n ross3d -y || true
+conda env create -f env.yml
+conda activate ross3d
+
+export CUDA_HOME="${CUDA_HOME:-$CUDA_ROOT}"
+export PATH="$CUDA_HOME/bin:$PATH"
+
+echo "1111111111111111111111"
+
+# build flash-attn inside the actual env so it can see torch
+pip install flash-attn --no-build-isolation
+
+
+# sanity checks
+python - <<'PY'
+import torch
+print("torch:", torch.__version__)
+print("cuda available:", torch.cuda.is_available())
+print("cuda runtime version:", getattr(torch.version, "cuda", None))
+PY
+
+python - <<'PY'
+import flash_attn
+print("flash-attn import OK")
+PY
+
+echo "success!"

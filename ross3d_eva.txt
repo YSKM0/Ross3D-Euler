@@ -1,0 +1,30 @@
+#!/bin/bash
+#SBATCH --job-name=ross3d_eval
+#SBATCH --time=120:00:00
+#SBATCH --gpus=a100:1
+#SBATCH --ntasks=1 
+#SBATCH --cpus-per-task=8
+#SBATCH --mem-per-cpu=4096M
+#SBATCH --output=logs/%x-%j.out
+#SBATCH --error=logs/%x-%j.err
+
+set -euo pipefail
+set -x  
+
+
+export PYTHONUNBUFFERED=1
+export TRANSFORMERS_VERBOSITY=info
+
+module load stack/2024-06 cuda/12.1.1 gcc/12.2.0
+module load eth_proxy
+
+cd /cluster/scratch/hanwliu/projects/ross3d/
+source /cluster/scratch/hanwliu/miniconda3/etc/profile.d/conda.sh
+conda activate ross3d
+
+EVAL_LOG="logs/eval_all-${SLURM_JOB_ID:-noid}.log"
+
+# bash scripts/3d/eval/eval_sqa3d.sh /cluster/scratch/hanwliu/projects/ross3d/models/llava-v>
+srun bash scripts/3d/eval/eval_all.sh \
+  /cluster/scratch/hanwliu/projects/ross3d/models/llava-video-qwen2-7b-ross3d \
+  32 2>&1 | tee -a "$EVAL_LOG"

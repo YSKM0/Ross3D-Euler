@@ -203,7 +203,18 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     scans = os.listdir(args.dataset_folder)
-    ray.init()
+
+    # Hanwliu
+    ray_kwargs = {
+        "include_dashboard": False,
+    }
+
+    slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+
+    if slurm_cpus is not None:
+        ray_kwargs["num_cpus"] = int(slurm_cpus)
+
+    ray.init(**ray_kwargs)
 
     features = []
     for i in range(args.nproc):
