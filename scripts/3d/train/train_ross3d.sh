@@ -19,7 +19,7 @@ torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
     --view_mask_prob 0.25 \
     \
     --deepspeed scripts/zero3.json \
-    --model_name_or_path lmms-lab/LLaVA-Video-7B-Qwen2 \
+    --model_name_or_path /cluster/scratch/hanwliu/projects/ross3d/models/llava-video-qwen2-7b \
     --pretrain_mm_inv_adapter ./checkpoints/mm_inv_projector.bin \
     --version qwen_1_5 \
     --data_path scripts/3d/train/video3dllm_223k.yaml \

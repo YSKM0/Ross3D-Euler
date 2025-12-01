@@ -26,7 +26,7 @@ conda activate ross3d
 EVAL_LOG="logs/eval_all-${SLURM_JOB_ID:-noid}.log"
 
 # bash scripts/3d/eval/eval_sqa3d.sh /cluster/scratch/hanwliu/projects/ross3d/models/llava-v>
-srun bash scripts/3d/eval/eval_scanqa.sh \
+srun bash scripts/3d/eval/eval_scan2cap.sh \
   /cluster/scratch/hanwliu/projects/ross3d/models/llava-video-qwen2-7b-ross3d \
   uniform \
   32 2>&1 | tee -a "$EVAL_LOG"
