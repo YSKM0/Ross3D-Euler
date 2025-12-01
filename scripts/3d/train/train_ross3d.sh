@@ -6,6 +6,7 @@ echo "MID_RUN_NAME: ${MID_RUN_NAME}"
 # bs=256, lr=1e-5
 set -x
 
+# gradient_accumulation_steps x per_device_train_batch_size x nproc_per_node = 256
 torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
     --master_addr="localhost" --master_port=20409 \
     \
@@ -18,7 +19,7 @@ torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
     --view_mask_ratio 0.25 \
     --view_mask_prob 0.25 \
     \
-    --deepspeed scripts/zero3.json \
+    --deepspeed scripts/3d/zero3.json \
     --model_name_or_path /cluster/scratch/hanwliu/projects/ross3d/models/llava-video-qwen2-7b \
     --pretrain_mm_inv_adapter ./checkpoints/mm_inv_projector.bin \
     --version qwen_1_5 \
