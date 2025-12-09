@@ -584,6 +584,8 @@ class Ross3DTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, *args, **kwargs):
         loss, outputs = self._compute_loss_with_global_step(model, inputs, return_outputs=True)
 
+        log_dict = {}
+
         if outputs.get('vm_loss', None) is not None:
             assert outputs.get('lm_loss', None) is not None
 
@@ -597,6 +599,12 @@ class Ross3DTrainer(Trainer):
                 bev_loss = outputs['bev_loss']
                 log_dict["bev_loss"] = round(bev_loss.item(), 4)
 
+
+        # Hanwliu
+        if "cycle_loss" in outputs:
+            log_dict["cycle_loss"] = round(outputs["cycle_loss"].item(), 4)
+
+        if len(log_dict) > 0:
             self.log(log_dict)
 
         return (loss, outputs) if return_outputs else loss

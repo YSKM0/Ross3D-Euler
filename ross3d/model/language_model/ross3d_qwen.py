@@ -35,6 +35,13 @@ from ross3d.utils import rank_print
 class Ross3DQwenConfig(Qwen2Config):
     model_type = "ross3d_qwen"
 
+    # Hanwliu
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        self.cycle_consist = kwargs.get("cycle_consist", False)
+        self.cycle_consist_weight = kwargs.get("cycle_consist_weight", 1.0)
+        self.cycle_num_walks = kwargs.get("cycle_num_walks", None)
 
 class Ross3DQwenModel(Ross3DMetaModel, Qwen2Model):
     config_class = Ross3DQwenConfig
@@ -51,6 +58,10 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
         # Qwen2ForCausalLM.__init__(self, config)
         config.model_type = "ross3d_qwen"
         config.rope_scaling = None
+
+        # Hanwliu temperature
+        init_tau = getattr(config, "cycle_temp", 0.07)
+        self.cycle_log_temp = nn.Parameter(torch.log(torch.tensor(1.0 / init_tau)))
 
         self.model = Ross3DQwenModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -340,6 +351,20 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
                                                     video_dict["bev_image"], mask)
                 loss += bev_loss
 
+        # Hanwliu
+        cycle_loss = None
+        if self.training and getattr(self.config, "cycle_consist", False):
+            cycle_loss = self.compute_cycle_consistency_loss(
+                hidden_states=hidden_states,
+                boi_ids=boi_ids,
+                eoi_ids=eoi_ids,
+                newline_ids=newline_ids,
+                mask=None,
+                num_walks=getattr(self.config, "cycle_num_walks", None),
+                temperature=getattr(self.config, "cycle_temp", 0.07),
+            )
+            loss = loss + getattr(self.config, "cycle_consist_weight", 1.0) * cycle_loss
+
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
@@ -353,6 +378,7 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             lm_loss=lm_loss,
             vm_loss=vm_loss,
             bev_loss=bev_loss,
+            cycle_loss=cycle_loss, # Hanwliu
         )
 
     @torch.no_grad()

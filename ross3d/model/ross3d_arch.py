@@ -16,6 +16,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union, Dict
+import torch.nn.functional as F
 
 import math
 import re
@@ -1283,6 +1284,140 @@ class Ross3DMetaForCausalLM(ABC):
         return vm_loss
 
 
+    # Hanwliu
+    def compute_cycle_consistency_loss(
+        self,
+        hidden_states: torch.Tensor,
+        boi_ids: List[int],
+        eoi_ids: List[int],
+        newline_ids: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        num_walks: Optional[int] = None,
+        temperature: float = 0.07,
+        eps: float = 1e-8,
+    ) -> torch.Tensor:
+        """
+        Cycle-consistency loss over frame tokens, inspired by
+        'Space-Time Correspondence as a Contrastive Random Walk'.
+
+        Args:
+            hidden_states: [B, L, D] full LLM hidden states (B must be 1 here).
+            boi_ids, eoi_ids, newline_ids:
+                frame indexing info from prepare_inputs_labels_for_multimodal.
+            mask: optional [num_frames] bool/0-1 tensor; frames with mask==1
+                  are ignored (never used in the walk).
+            num_walks:
+                If None     -> use ALL visible frames for one CRW walk.
+                If integer  -> uniformly sample that many distinct frames
+                               from the visible pool, then run CRW on them.
+            temperature: softmax temperature for similarities.
+        Returns:
+            scalar loss (torch.Tensor).
+        """
+        batch_size = hidden_states.shape[0]
+        assert batch_size == 1, "Cycle consistency is implemented for batch_size == 1"
+
+        # ---- 1. Reconstruct per-frame patch features [T, P, D]
+        boi_ids = torch.LongTensor(boi_ids)
+        eoi_ids = torch.LongTensor(eoi_ids)
+
+        num_frames = boi_ids.shape[0]
+        patch_h = math.ceil(math.sqrt(self.model.image_embed_len))
+
+        image_hidden_states = torch.zeros(
+            (num_frames, self.model.image_embed_len, hidden_states.shape[-1]),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+        for frame_index, (cur_boi_id, cur_eoi_id) in enumerate(zip(boi_ids, eoi_ids)):
+            if (cur_boi_id is None) or (cur_eoi_id is None):
+                continue
+
+            # same slicing logic as in compute_vm_loss: remove image_newline tokens
+            cur_hidden_states = [hidden_states[0][cur_boi_id: newline_ids[frame_index * patch_h]]]
+            for k in range(frame_index * patch_h + 1, (frame_index + 1) * patch_h):
+                cur_hidden_states.append(
+                    hidden_states[0][newline_ids[k - 1] + 1: newline_ids[k]]
+                )
+            cur_hidden_states.append(
+                hidden_states[0][newline_ids[(frame_index + 1) * patch_h - 1] + 1: cur_eoi_id]
+            )
+            image_hidden_states[frame_index] = torch.cat(cur_hidden_states, dim=0)
+
+        # ---- 2. Drop masked frames completely (never use them)
+        frame_mask = torch.ones(num_frames, dtype=torch.bool, device=hidden_states.device)
+        if mask is not None:
+            frame_mask = frame_mask & (~mask.bool())
+
+        visible_idx = frame_mask.nonzero(as_tuple=False).flatten()
+        if visible_idx.numel() < 2:
+            # not enough frames to form a cycle
+            return torch.zeros(
+                (), device=hidden_states.device, dtype=hidden_states.dtype
+            )
+
+        # ---- 3. Decide which frames to use for the walk
+        if (num_walks is None) or (num_walks >= visible_idx.numel()):
+            selected_idx = visible_idx
+        else:
+            # sample without replacement from visible frames, then sort in time order
+            perm = torch.randperm(visible_idx.numel(), device=hidden_states.device)
+            chosen = perm[:num_walks]
+            selected_idx = visible_idx[chosen]
+            selected_idx, _ = torch.sort(selected_idx)
+
+        # after selection, we form a single walk over these frames
+        feats = image_hidden_states[selected_idx]       # [S, P, D]
+        S, P, D = feats.shape
+        if S < 2:
+            return torch.zeros(
+                (), device=hidden_states.device, dtype=hidden_states.dtype
+            )
+
+        # ---- 4. Normalize features
+        feats = F.normalize(feats, dim=-1)              # [S, P, D]
+
+        # ---- 5. Build neighbor transitions for this subsequence
+        num_steps = S - 1       # k in the paper
+        A_fwd = []              # forward A_s^{s+1}
+        A_bwd = []              # backward A_{s+1}^{s}
+
+        for step in range(num_steps):
+            F_s   = feats[step]       # [P, D]
+            F_sp1 = feats[step + 1]   # [P, D]
+
+            # Neighbor similarity S_s^{s+1}(i,j) = <z_s,i, z_{s+1,j}>
+            tau = torch.exp(-self.cycle_log_temp)
+            sim_fwd = (F_s @ F_sp1.T) / tau
+            # [P, P]
+            A_s_sp1 = F.softmax(sim_fwd, dim=-1)               # row-softmax: t -> t+1
+            A_fwd.append(A_s_sp1)
+
+            # Backward transition: from frame s+1 to s
+            sim_bwd = (F_sp1 @ F_s.T) / temperature            # [P, P]
+            A_sp1_s = F.softmax(sim_bwd, dim=-1)
+            A_bwd.append(A_sp1_s)
+
+        # ---- 6. Forward random walk from first selected frame to last
+        A_1k_bar = A_fwd[0]
+        for step in range(1, num_steps):
+            A_1k_bar = A_1k_bar @ A_fwd[step]   # [P, P]
+
+        # ---- 7. Backward random walk from last back to first
+        A_k1_bar = A_bwd[-1]
+        for step in range(num_steps - 2, -1, -1):
+            A_k1_bar = A_k1_bar @ A_bwd[step]
+
+        # ---- 8. Cycle transition matrix: go out then back
+        M_1 = A_1k_bar @ A_k1_bar              # [P, P]
+
+        # ---- 9. Cycle-consistency loss (cross-entropy to identity)
+        diag_M = torch.diagonal(M_1, dim1=-2, dim2=-1)  # [P]
+        loss = -torch.log(diag_M + eps).mean()
+
+        return loss
+
 @dataclass
 class CausalLMOutputWithPastRoss(ModelOutput):
     lm_loss: Optional[torch.FloatTensor] = None
@@ -1295,3 +1430,5 @@ class CausalLMOutputWithPastRoss(ModelOutput):
     hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
     attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
     scores: Optional[torch.FloatTensor] = None
+    # Hanwliu
+    cycle_loss: Optional[torch.FloatTensor] = None

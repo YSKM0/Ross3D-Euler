@@ -132,6 +132,19 @@ class ModelArguments:
     view_mask_ratio: Optional[float] = field(default=0.)
     view_mask_prob: Optional[float] = field(default=0.)
 
+    #Hanwliu
+    cycle_consist: bool = field(
+        default=False,
+        metadata={"help": "Enable cycle-consistency loss over frame tokens."},
+    )
+    cycle_consist_weight: float = field(
+        default=1.0,
+        metadata={"help": "Weight for the cycle-consistency loss term."},
+    )
+    cycle_num_walks: Optional[int] = field(
+        default=None,
+        metadata={"help": "Number of frames in random walk (None = use all visible frames)."},
+    )
 
 @dataclass
 class DataArguments:
@@ -1521,6 +1534,10 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
             **customized_kwargs,
         )
 
+    setattr(model.config, "cycle_consist", model_args.cycle_consist)
+    setattr(model.config, "cycle_consist_weight", model_args.cycle_consist_weight)
+    setattr(model.config, "cycle_num_walks", model_args.cycle_num_walks)
+    
     return model
 
 
