@@ -1,0 +1,26 @@
+#!/bin/bash
+#SBATCH --job-name=ross3d_eval
+#SBATCH --time=120:00:00
+#SBATCH --gpus=a100_80gb:1
+#SBATCH --ntasks=1 
+#SBATCH --cpus-per-task=8
+#SBATCH --mem-per-cpu=8192
+#SBATCH --output=logs/%x-%j.out
+#SBATCH --error=logs/%x-%j.err
+
+set -euo pipefail
+set -x  
+
+
+export PYTHONUNBUFFERED=1
+export TRANSFORMERS_VERBOSITY=info
+
+module load stack/2024-06 cuda/12.1.1 gcc/12.2.0
+module load openjdk/17.0.8.1_1
+module load eth_proxy
+
+cd /cluster/scratch/hanwliu/projects/ross3d/
+source /cluster/scratch/hanwliu/miniconda3/etc/profile.d/conda.sh
+conda activate ross3d
+
+bash /cluster/scratch/hanwliu/projects/ross3d/scripts/3d/train/train_cycle.sh

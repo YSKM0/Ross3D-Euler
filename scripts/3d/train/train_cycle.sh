@@ -1,23 +1,28 @@
 #!/bin/bash
 
-MID_RUN_NAME="llava-video-qwen2-7b-ross3d"
+MID_RUN_NAME="llava-video-qwen2-7b-ross3d-cycle-1a100"
 echo "MID_RUN_NAME: ${MID_RUN_NAME}"
 
 # bs=256, lr=1e-5
 set -x
 
 # gradient_accumulation_steps x per_device_train_batch_size x nproc_per_node = 256
-torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
+# --ross_multi_task controls bev reconstruction
+# remove --mm_pixel_decoder can set ross_enable to False
+# --ross_enable controls vm reconstruction close it will also close bev reconstruction
+# --view_mask_prob to 0 so no any mask
+# --view_mask_ratio to 0
+torchrun --nproc_per_node=1 --nnodes=1 --node_rank=0 \
     --master_addr="localhost" --master_port=20409 \
     \
     ross3d/train/train_3d.py \
     \
     --per_device_train_batch_size 1 \
-    --gradient_accumulation_steps 32 \
+    --gradient_accumulation_steps 256 \
     --learning_rate 1e-5 \
     --warmup_ratio 0.03 \
-    --view_mask_ratio 0.25 \
-    --view_mask_prob 0.25 \
+    --view_mask_ratio 0.0 \
+    --view_mask_prob 0.0 \
     \
     --deepspeed scripts/3d/zero3.json \
     --model_name_or_path /cluster/scratch/hanwliu/projects/ross3d/models/llava-video-qwen2-7b-ross3d \
@@ -29,8 +34,7 @@ torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
     --embodiedscan_folder data/embodiedscan/ \
     --mm_tunable_parts "mm_mlp_adapter,mm_language_model,mm_inv_adapter" \
     --vision_tower /models/siglip-so400m-patch14-384 \
-    --ross_multi_task True \
-    --mm_pixel_decoder ./checkpoints/FLUX.1-dev \
+    --ross_multi_task False \
     --mm_projector_type mlp2x_gelu \
     --mm_inv_projector_type denoiser_vit3x \
     --mm_vision_select_layer -2 \
@@ -70,4 +74,5 @@ torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
     --group_by_task_length True \
     --frame_sampling_strategy uniform \
     --frames_upbound 32 \
+    --cycle_consist True \
     --report_to wandb --run_name $MID_RUN_NAME
