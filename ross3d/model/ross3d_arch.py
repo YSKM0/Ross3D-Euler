@@ -1291,132 +1291,183 @@ class Ross3DMetaForCausalLM(ABC):
         boi_ids: List[int],
         eoi_ids: List[int],
         newline_ids: torch.Tensor,
+        video_dict: Optional[Dict[str, torch.Tensor]] = None,
         mask: Optional[torch.Tensor] = None,
         num_walks: Optional[int] = None,
-        temperature: float = 0.07,
+        temperature_app: float = 0.07,
+        temperature_geo: float = 0.10,
+        geo_sigma: Optional[float] = None,
+        topk: Optional[int] = 32,
         eps: float = 1e-8,
     ) -> torch.Tensor:
         """
-        Cycle-consistency loss over frame tokens, inspired by
-        'Space-Time Correspondence as a Contrastive Random Walk'.
+        3D-aware CRW cycle-consistency loss.
 
-        Args:
-            hidden_states: [B, L, D] full LLM hidden states (B must be 1 here).
-            boi_ids, eoi_ids, newline_ids:
-                frame indexing info from prepare_inputs_labels_for_multimodal.
-            mask: optional [num_frames] bool/0-1 tensor; frames with mask==1
-                  are ignored (never used in the walk).
-            num_walks:
-                If None     -> use ALL visible frames for one CRW walk.
-                If integer  -> uniformly sample that many distinct frames
-                               from the visible pool, then run CRW on them.
-            temperature: softmax temperature for similarities.
-        Returns:
-            scalar loss (torch.Tensor).
+        - appearance similarity: cosine(feat_t, feat_{t+1})
+        - geometry similarity:  -||x_t - x_{t+1}||^2 / (2*sigma^2)
+        - optional top-k sparsification per row for stability
         """
-        batch_size = hidden_states.shape[0]
-        assert batch_size == 1, "Cycle consistency is implemented for batch_size == 1"
 
-        # ---- 1. Reconstruct per-frame patch features [T, P, D]
+        B = hidden_states.shape[0]
+        assert B == 1, "Cycle consistency implemented for batch_size==1"
+
+        # ---- 1) Reconstruct per-frame patch features [T, P, D]
         boi_ids = torch.LongTensor(boi_ids)
         eoi_ids = torch.LongTensor(eoi_ids)
 
-        num_frames = boi_ids.shape[0]
-        patch_h = math.ceil(math.sqrt(self.model.image_embed_len))
+        T = boi_ids.shape[0]
+        P = self.model.image_embed_len
+        D = hidden_states.shape[-1]
+        patch_h = math.ceil(math.sqrt(P))  # should be 14
 
-        image_hidden_states = torch.zeros(
-            (num_frames, self.model.image_embed_len, hidden_states.shape[-1]),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
+        feats = torch.zeros((T, P, D), dtype=hidden_states.dtype, device=hidden_states.device)
 
-        for frame_index, (cur_boi_id, cur_eoi_id) in enumerate(zip(boi_ids, eoi_ids)):
-            if (cur_boi_id is None) or (cur_eoi_id is None):
+        for t, (cur_boi, cur_eoi) in enumerate(zip(boi_ids, eoi_ids)):
+            if (cur_boi is None) or (cur_eoi is None):
                 continue
 
-            # same slicing logic as in compute_vm_loss: remove image_newline tokens
-            cur_hidden_states = [hidden_states[0][cur_boi_id: newline_ids[frame_index * patch_h]]]
-            for k in range(frame_index * patch_h + 1, (frame_index + 1) * patch_h):
-                cur_hidden_states.append(
-                    hidden_states[0][newline_ids[k - 1] + 1: newline_ids[k]]
-                )
-            cur_hidden_states.append(
-                hidden_states[0][newline_ids[(frame_index + 1) * patch_h - 1] + 1: cur_eoi_id]
-            )
-            image_hidden_states[frame_index] = torch.cat(cur_hidden_states, dim=0)
+            # remove newline tokens exactly like compute_vm_loss
+            cur_rows = [hidden_states[0][cur_boi: newline_ids[t * patch_h]]]
+            for k in range(t * patch_h + 1, (t + 1) * patch_h):
+                cur_rows.append(hidden_states[0][newline_ids[k - 1] + 1: newline_ids[k]])
+            cur_rows.append(hidden_states[0][newline_ids[(t + 1) * patch_h - 1] + 1: cur_eoi])
 
-        # ---- 2. Drop masked frames completely (never use them)
-        frame_mask = torch.ones(num_frames, dtype=torch.bool, device=hidden_states.device)
+            feats[t] = torch.cat(cur_rows, dim=0)
+
+        # ---- 2) Visible frames selection
+        frame_mask = torch.ones(T, dtype=torch.bool, device=hidden_states.device)
         if mask is not None:
             frame_mask = frame_mask & (~mask.bool())
-
         visible_idx = frame_mask.nonzero(as_tuple=False).flatten()
+
         if visible_idx.numel() < 2:
-            # not enough frames to form a cycle
-            return torch.zeros(
-                (), device=hidden_states.device, dtype=hidden_states.dtype
-            )
+            return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
 
-        # ---- 3. Decide which frames to use for the walk
         if (num_walks is None) or (num_walks >= visible_idx.numel()):
-            selected_idx = visible_idx
+            sel = visible_idx
         else:
-            # sample without replacement from visible frames, then sort in time order
             perm = torch.randperm(visible_idx.numel(), device=hidden_states.device)
-            chosen = perm[:num_walks]
-            selected_idx = visible_idx[chosen]
-            selected_idx, _ = torch.sort(selected_idx)
+            sel = visible_idx[perm[:num_walks]]
+            sel, _ = torch.sort(sel)
 
-        # after selection, we form a single walk over these frames
-        feats = image_hidden_states[selected_idx]       # [S, P, D]
-        S, P, D = feats.shape
+        feats = feats[sel]  # [S, P, D]
+        S = feats.shape[0]
         if S < 2:
-            return torch.zeros(
-                (), device=hidden_states.device, dtype=hidden_states.dtype
-            )
+            return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
 
-        # ---- 4. Normalize features
-        feats = F.normalize(feats, dim=-1)              # [S, P, D]
+        # ---- 3) Normalize appearance features
+        feats = F.normalize(feats, dim=-1)
 
-        # ---- 5. Build neighbor transitions for this subsequence
-        num_steps = S - 1       # k in the paper
-        A_fwd = []              # forward A_s^{s+1}
-        A_bwd = []              # backward A_{s+1}^{s}
+        # ---- 4) Build per-patch 3D coords [S, P, 3]
+        coords = None
+        valid_patch = None
+        if (video_dict is not None) and ("world_coords" in video_dict):
+            # video_dict["world_coords"] shape is [B, V, H, W, 3] after merge_video_dict
+            wc = video_dict["world_coords"][0]  # [V, H, W, 3]
+            # average_coordinate_in_patch gives [V, 14, 14, 3]
+            wc_p = self.average_coordinate_in_patch(wc)  # [V, 14, 14, 3]
+            wc_p = wc_p.reshape(wc_p.shape[0], -1, 3)    # [V, 196, 3]
+            coords = wc_p[sel].to(device=hidden_states.device, dtype=torch.float32)
 
-        for step in range(num_steps):
-            F_s   = feats[step]       # [P, D]
-            F_sp1 = feats[step + 1]   # [P, D]
+            # invalid depth in your pipeline becomes (0,0,0) often; treat z<=0 as invalid
+            valid_patch = (coords[..., 2] > 0.0)  # [S, P]
 
-            # Neighbor similarity S_s^{s+1}(i,j) = <z_s,i, z_{s+1,j}>
-            tau = torch.exp(-self.cycle_log_temp)
-            sim_fwd = (F_s @ F_sp1.T) / tau
-            # [P, P]
-            A_s_sp1 = F.softmax(sim_fwd, dim=-1)               # row-softmax: t -> t+1
-            A_fwd.append(A_s_sp1)
+        # if no coords, fall back to appearance-only (still works)
+        use_geo = coords is not None
 
-            # Backward transition: from frame s+1 to s
-            sim_bwd = (F_sp1 @ F_s.T) / temperature            # [P, P]
-            A_sp1_s = F.softmax(sim_bwd, dim=-1)
-            A_bwd.append(A_sp1_s)
+        # choose sigma automatically if not provided
+        if use_geo and (geo_sigma is None):
+            # robust scale from consecutive frame patch distances
+            with torch.no_grad():
+                d = coords[1:] - coords[:-1]  # [S-1, P, 3]
+                dist = torch.linalg.norm(d, dim=-1)  # [S-1, P]
+                if valid_patch is not None:
+                    vm = valid_patch[1:] & valid_patch[:-1]
+                    dist = dist[vm]
+                if dist.numel() > 0:
+                    geo_sigma = torch.quantile(dist, 0.5).clamp(min=1e-3).item()
+                else:
+                    geo_sigma = 0.10
 
-        # ---- 6. Forward random walk from first selected frame to last
-        A_1k_bar = A_fwd[0]
-        for step in range(1, num_steps):
-            A_1k_bar = A_1k_bar @ A_fwd[step]   # [P, P]
+        # ---- 5) Build neighbor transitions
+        A_fwd, A_bwd = [], []
+        tau_app = float(temperature_app)
+        tau_geo = float(temperature_geo)
 
-        # ---- 7. Backward random walk from last back to first
-        A_k1_bar = A_bwd[-1]
-        for step in range(num_steps - 2, -1, -1):
-            A_k1_bar = A_k1_bar @ A_bwd[step]
+        for step in range(S - 1):
+            Fa = feats[step]     # [P, D]
+            Fb = feats[step + 1] # [P, D]
 
-        # ---- 8. Cycle transition matrix: go out then back
-        M_1 = A_1k_bar @ A_k1_bar              # [P, P]
+            # appearance logits
+            logit_app_fwd = (Fa @ Fb.T) / tau_app
+            logit_app_bwd = (Fb @ Fa.T) / tau_app
 
-        # ---- 9. Cycle-consistency loss (cross-entropy to identity)
-        diag_M = torch.diagonal(M_1, dim1=-2, dim2=-1)  # [P]
-        loss = -torch.log(diag_M + eps).mean()
+            if use_geo:
+                Xa = coords[step]     # [P, 3]
+                Xb = coords[step + 1] # [P, 3]
 
+                # squared distances [P, P]
+                # (Xa[:,None,:] - Xb[None,:,:])^2 sum
+                diff = Xa[:, None, :] - Xb[None, :, :]
+                dist2 = (diff * diff).sum(dim=-1)  # [P, P]
+                logit_geo = -dist2 / (2.0 * (geo_sigma ** 2))
+
+                logit_fwd = logit_app_fwd + (logit_geo / tau_geo)
+                logit_bwd = logit_app_bwd + (logit_geo.T / tau_geo)
+
+                # mask invalid patches (rows/cols)
+                if valid_patch is not None:
+                    va = valid_patch[step]     # [P]
+                    vb = valid_patch[step + 1] # [P]
+                    # invalid source rows -> forbid transitions
+                    logit_fwd = logit_fwd.masked_fill(~va[:, None], float("-inf"))
+                    logit_bwd = logit_bwd.masked_fill(~vb[:, None], float("-inf"))
+                    # invalid target cols -> forbid transitions
+                    logit_fwd = logit_fwd.masked_fill(~vb[None, :], float("-inf"))
+                    logit_bwd = logit_bwd.masked_fill(~va[None, :], float("-inf"))
+            else:
+                logit_fwd = logit_app_fwd
+                logit_bwd = logit_app_bwd
+
+            # top-k sparsification (helps prevent uniform collapse early)
+            if (topk is not None) and (topk < P):
+                v, idx = torch.topk(logit_fwd, k=topk, dim=-1)
+                sparse = torch.full_like(logit_fwd, float("-inf"))
+                sparse.scatter_(-1, idx, v)
+                logit_fwd = sparse
+
+                v, idx = torch.topk(logit_bwd, k=topk, dim=-1)
+                sparse = torch.full_like(logit_bwd, float("-inf"))
+                sparse.scatter_(-1, idx, v)
+                logit_bwd = sparse
+
+            A_fwd.append(F.softmax(logit_fwd, dim=-1))
+            A_bwd.append(F.softmax(logit_bwd, dim=-1))
+
+        # ---- 6) Compose forward then backward
+        A_fw = A_fwd[0]
+        for k in range(1, S - 1):
+            A_fw = A_fw @ A_fwd[k]   # [P, P]
+
+        A_bw = A_bwd[-1]
+        for k in range(S - 3, -1, -1):
+            A_bw = A_bw @ A_bwd[k]   # [P, P]
+
+        M = A_fw @ A_bw  # [P, P]
+
+        diag = torch.diagonal(M, dim1=-2, dim2=-1)  # [P]
+
+        # if valid_patch exists, only score patches valid in the first selected frame
+        if valid_patch is not None:
+            v0 = valid_patch[0]
+            if v0.any():
+                diag = diag[v0]
+            else:
+                return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
+
+        loss = -torch.log(diag + eps).mean()
         return loss
+
 
 @dataclass
 class CausalLMOutputWithPastRoss(ModelOutput):

@@ -42,6 +42,10 @@ class Ross3DQwenConfig(Qwen2Config):
         self.cycle_consist = kwargs.get("cycle_consist", False)
         self.cycle_consist_weight = kwargs.get("cycle_consist_weight", 1.0)
         self.cycle_num_walks = kwargs.get("cycle_num_walks", None)
+        self.cycle_geo_temp = kwargs.get("cycle_geo_temp", 0.10)
+        self.cycle_geo_sigma = kwargs.get("cycle_geo_sigma", None)
+        self.cycle_topk = kwargs.get("cycle_topk", 32)
+
 
 class Ross3DQwenModel(Ross3DMetaModel, Qwen2Model):
     config_class = Ross3DQwenConfig
@@ -359,10 +363,15 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
                 boi_ids=boi_ids,
                 eoi_ids=eoi_ids,
                 newline_ids=newline_ids,
+                video_dict=video_dict,  # <-- IMPORTANT
                 mask=None,
                 num_walks=getattr(self.config, "cycle_num_walks", None),
-                temperature=getattr(self.config, "cycle_temp", 0.07),
+                temperature_app=getattr(self.config, "cycle_temp", 0.07),
+                temperature_geo=getattr(self.config, "cycle_geo_temp", 0.10),
+                geo_sigma=getattr(self.config, "cycle_geo_sigma", None),  # auto if None
+                topk=getattr(self.config, "cycle_topk", 32),
             )
+
             loss = loss + getattr(self.config, "cycle_consist_weight", 1.0) * cycle_loss
 
         if not return_dict:
