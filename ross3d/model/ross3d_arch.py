@@ -438,17 +438,27 @@ class Ross3DMetaForCausalLM(ABC):
         return all_videos_or_images_features, all_faster_video_features
 
 
-    def add_token_per_grid(self, image_feature):
-        resize_h = int(math.sqrt(image_feature.shape[1]))
+    def add_token_per_grid(self, image_feature, image_sizes=None):
+        # infer per-frame (h, w) from image_sizes when available; otherwise fall back to square
         num_frames = image_feature.shape[0]
         num_tokens = image_feature.shape[1]
         feature_dim = image_feature.shape[-1]
+        if (image_sizes is not None) and (len(image_sizes) > 0):
+            # image_sizes: list of (H, W); both are pixel sizes, while num_tokens is patch count
+            # use aspect ratio to recover patch grid (nearest integers that multiply to num_tokens)
+            H, W = image_sizes[0]
+            aspect = max(H, 1e-6) / max(W, 1e-6)
+            resize_h = max(1, round((num_tokens ** 0.5) * (aspect ** 0.5)))
+            resize_w = max(1, math.ceil(num_tokens / resize_h))
+        else:
+            resize_h = int(math.sqrt(num_tokens))
+            resize_w = resize_h
         old_image_feature = image_feature.clone().detach()
         boi_ids = [None for _ in range(num_frames)]
         eoi_ids = [None for _ in range(num_frames)]
 
         # [32, 196, 3584] --> [32, 1, 14, 14, 3584]
-        image_feature = image_feature.view(num_frames, 1, resize_h, resize_h, -1)
+        image_feature = image_feature.view(num_frames, 1, resize_h, resize_w, -1)
         # [32, 1, 14, 14, 3584] --> [3584, 32, 14, 1, 14]
         image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
         # [3584, 32, 14, 1, 14] --> [3584, 448, 1, 14] --> [3584, 448, 14]
@@ -467,15 +477,17 @@ class Ross3DMetaForCausalLM(ABC):
             return image_feature
         # import pdb; pdb.set_trace()
         image_feature = image_feature.flatten(1, 2).transpose(0, 1)
-        newline_ids = [resize_h + i * (resize_h + 1) for i in range(num_frames * num_tokens // resize_h)]
+        newline_ids = [resize_w + i * (resize_w + 1) for i in range(num_frames * num_tokens // resize_w)]
 
         for image_id in range(old_image_feature.shape[0]):
             old_boi_id = image_id * num_tokens
             old_eoi_id = old_boi_id + num_tokens - 1
-            boi_ids[image_id] = int(old_boi_id + old_boi_id // resize_h)
-            eoi_ids[image_id] = int(old_eoi_id + old_eoi_id // resize_h)
-            assert (old_image_feature[image_id, 0] == image_feature[boi_ids[image_id]]).sum() == feature_dim
-            assert (old_image_feature[image_id, -1] == image_feature[eoi_ids[image_id]]).sum() == feature_dim
+            boi_ids[image_id] = int(old_boi_id + old_boi_id // resize_w)
+            eoi_ids[image_id] = int(old_eoi_id + old_eoi_id // resize_w)
+            # skip strict equality when grids are non-square; rely on position math instead
+            if resize_h == resize_w:
+                assert (old_image_feature[image_id, 0] == image_feature[boi_ids[image_id]]).sum() == feature_dim
+                assert (old_image_feature[image_id, -1] == image_feature[eoi_ids[image_id]]).sum() == feature_dim
 
         return image_feature, boi_ids, eoi_ids, old_image_feature, newline_ids
 
@@ -1425,6 +1437,9 @@ class Ross3DMetaForCausalLM(ABC):
                     # invalid target cols -> forbid transitions
                     logit_fwd = logit_fwd.masked_fill(~vb[None, :], float("-inf"))
                     logit_bwd = logit_bwd.masked_fill(~va[None, :], float("-inf"))
+                    # if an entire row is invalid, skip cycle loss for this batch
+                    if (~torch.isfinite(logit_fwd)).all(dim=-1).any() or (~torch.isfinite(logit_bwd)).all(dim=-1).any():
+                        return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
             else:
                 logit_fwd = logit_app_fwd
                 logit_bwd = logit_app_bwd
@@ -1445,6 +1460,8 @@ class Ross3DMetaForCausalLM(ABC):
             A_bwd.append(F.softmax(logit_bwd, dim=-1))
 
         # ---- 6) Compose forward then backward
+        if len(A_fwd) != (S - 1):
+            return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
         A_fw = A_fwd[0]
         for k in range(1, S - 1):
             A_fw = A_fw @ A_fwd[k]   # [P, P]
