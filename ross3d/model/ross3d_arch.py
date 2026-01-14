@@ -1425,6 +1425,9 @@ class Ross3DMetaForCausalLM(ABC):
                     # invalid target cols -> forbid transitions
                     logit_fwd = logit_fwd.masked_fill(~vb[None, :], float("-inf"))
                     logit_bwd = logit_bwd.masked_fill(~va[None, :], float("-inf"))
+                    # if an entire row is invalid, skip cycle loss for this batch
+                    if (~torch.isfinite(logit_fwd)).all(dim=-1).any() or (~torch.isfinite(logit_bwd)).all(dim=-1).any():
+                        return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
             else:
                 logit_fwd = logit_app_fwd
                 logit_bwd = logit_app_bwd
@@ -1445,6 +1448,8 @@ class Ross3DMetaForCausalLM(ABC):
             A_bwd.append(F.softmax(logit_bwd, dim=-1))
 
         # ---- 6) Compose forward then backward
+        if len(A_fwd) != (S - 1):
+            return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
         A_fw = A_fwd[0]
         for k in range(1, S - 1):
             A_fw = A_fw @ A_fwd[k]   # [P, P]
