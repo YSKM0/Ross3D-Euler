@@ -1353,6 +1353,10 @@ class Ross3DMetaForCausalLM(ABC):
         visible_idx = frame_mask.nonzero(as_tuple=False).flatten()
 
         if visible_idx.numel() < 2:
+            rank0_print(
+                "[cycle_consistency_loss] Disabled: fewer than 2 visible frames. "
+                f"visible_idx={visible_idx.tolist()}, T={T}, mask_present={mask is not None}."
+            )
             return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
 
         if (num_walks is None) or (num_walks >= visible_idx.numel()):
@@ -1365,9 +1369,33 @@ class Ross3DMetaForCausalLM(ABC):
         feats = feats[sel]  # [S, P, D]
         S = feats.shape[0]
         if S < 2:
+            rank0_print(
+                "[cycle_consistency_loss] Disabled: selected frames < 2. "
+                f"S={S}, visible_count={visible_idx.numel()}, num_walks={num_walks}."
+            )
             return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
 
-        # ---- 3) Normalize appearance features
+        # ---- 3) Feature source selection + normalization
+        feature_source = getattr(self.config, "cycle_feature_source", "llm")
+        if feature_source == "inv_projector":
+            inv_projector = getattr(self.model, "mm_inv_projector", None)
+            if (
+                inv_projector is None
+                or not hasattr(inv_projector, "ln_pre")
+                or not hasattr(inv_projector, "net")
+                or not hasattr(inv_projector.net, "z_embedder_view")
+            ):
+                rank0_print(
+                    "[cycle_consistency_loss] Requested inv_projector features, "
+                    "but mm_inv_projector.z_embedder_view is unavailable. Falling back to LLM features."
+                )
+            else:
+                feats = inv_projector.ln_pre(feats)
+                h = w = int(feats.shape[1] ** 0.5)
+                feats = rearrange(feats, "b (h w) c -> b c h w", h=h, w=w).contiguous()
+                feats = rearrange(feats, "b c h w -> b (h w) c").contiguous()
+                feats = inv_projector.net.z_embedder_view(feats)
+        # Normalize appearance features
         feats = F.normalize(feats, dim=-1)
 
         # ---- 4) Build per-patch 3D coords [S, P, 3]
@@ -1439,6 +1467,13 @@ class Ross3DMetaForCausalLM(ABC):
                     logit_bwd = logit_bwd.masked_fill(~va[None, :], float("-inf"))
                     # if an entire row is invalid, skip cycle loss for this batch
                     if (~torch.isfinite(logit_fwd)).all(dim=-1).any() or (~torch.isfinite(logit_bwd)).all(dim=-1).any():
+                        invalid_rows_fwd = (~torch.isfinite(logit_fwd)).all(dim=-1).sum().item()
+                        invalid_rows_bwd = (~torch.isfinite(logit_bwd)).all(dim=-1).sum().item()
+                        rank0_print(
+                            "[cycle_consistency_loss] Disabled: invalid transition rows after masking. "
+                            f"step={step}, invalid_rows_fwd={invalid_rows_fwd}, invalid_rows_bwd={invalid_rows_bwd}, "
+                            f"valid_patch_ratio={(valid_patch.float().mean().item() if valid_patch is not None else 'n/a')}."
+                        )
                         return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
             else:
                 logit_fwd = logit_app_fwd
@@ -1461,6 +1496,10 @@ class Ross3DMetaForCausalLM(ABC):
 
         # ---- 6) Compose forward then backward
         if len(A_fwd) != (S - 1):
+            rank0_print(
+                "[cycle_consistency_loss] Disabled: transition list length mismatch. "
+                f"len(A_fwd)={len(A_fwd)}, expected={S - 1}, S={S}."
+            )
             return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
         A_fw = A_fwd[0]
         for k in range(1, S - 1):
@@ -1480,6 +1519,10 @@ class Ross3DMetaForCausalLM(ABC):
             if v0.any():
                 diag = diag[v0]
             else:
+                rank0_print(
+                    "[cycle_consistency_loss] Disabled: no valid patches in first selected frame. "
+                    f"valid_patch_shape={valid_patch.shape}, selected_frames={sel.tolist()}."
+                )
                 return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
 
         loss = -torch.log(diag + eps).mean()

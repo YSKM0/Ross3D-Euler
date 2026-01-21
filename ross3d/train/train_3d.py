@@ -145,6 +145,13 @@ class ModelArguments:
         default=None,
         metadata={"help": "Number of frames in random walk (None = use all visible frames)."},
     )
+    cycle_feature_source: str = field(
+        default="llm",
+        metadata={
+            "help": "Feature source for cycle consistency loss. "
+            "Use 'llm' for raw LLM hidden states or 'inv_projector' for inverse-projector features."
+        },
+    )
 
 @dataclass
 class DataArguments:
@@ -1537,6 +1544,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
     setattr(model.config, "cycle_consist", model_args.cycle_consist)
     setattr(model.config, "cycle_consist_weight", model_args.cycle_consist_weight)
     setattr(model.config, "cycle_num_walks", model_args.cycle_num_walks)
+    setattr(model.config, "cycle_feature_source", model_args.cycle_feature_source)
     
     return model
 
