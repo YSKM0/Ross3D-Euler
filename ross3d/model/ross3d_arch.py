@@ -1411,6 +1411,11 @@ class Ross3DMetaForCausalLM(ABC):
 
             # invalid depth in your pipeline becomes (0,0,0) often; treat z<=0 as invalid
             valid_patch = (coords[..., 2] > 0.0)  # [S, P]
+            if (~valid_patch).any():
+                rank0_print(
+                    "[cycle_consistency_loss] Detected non-positive depth patches; "
+                    f"invalid_count={(~valid_patch).sum().item()}."
+                )
 
         # if no coords, fall back to appearance-only (still works)
         use_geo = coords is not None
@@ -1449,8 +1454,19 @@ class Ross3DMetaForCausalLM(ABC):
                 # squared distances [P, P]
                 # (Xa[:,None,:] - Xb[None,:,:])^2 sum
                 diff = Xa[:, None, :] - Xb[None, :, :]
-                dist2 = (diff * diff).sum(dim=-1)  # [P, P]
-                logit_geo = -dist2 / (2.0 * (geo_sigma ** 2))
+                geo_mode = getattr(self.config, "cycle_geo_mode", "raw")
+                if geo_mode == "clamped":
+                    min_xyz = torch.tensor(self.config.min_xyz_range, device=diff.device, dtype=diff.dtype)
+                    max_xyz = torch.tensor(self.config.max_xyz_range, device=diff.device, dtype=diff.dtype)
+                    Xa_c = torch.clamp(Xa, min=min_xyz, max=max_xyz)
+                    Xb_c = torch.clamp(Xb, min=min_xyz, max=max_xyz)
+                    diff = Xa_c[:, None, :] - Xb_c[None, :, :]
+                    dist = torch.linalg.norm(diff, dim=-1)
+                    d_max = torch.linalg.norm(max_xyz - min_xyz).clamp_min(1e-6)
+                    logit_geo = 1.0 - (2.0 * dist / d_max)
+                else:
+                    dist2 = (diff * diff).sum(dim=-1)  # [P, P]
+                    logit_geo = -dist2 / (2.0 * (geo_sigma ** 2))
 
                 logit_fwd = logit_app_fwd + (logit_geo / tau_geo)
                 logit_bwd = logit_app_bwd + (logit_geo.T / tau_geo)

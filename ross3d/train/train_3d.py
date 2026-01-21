@@ -152,6 +152,13 @@ class ModelArguments:
             "Use 'llm' for raw LLM hidden states or 'inv_projector' for inverse-projector features."
         },
     )
+    cycle_geo_mode: str = field(
+        default="raw",
+        metadata={
+            "help": "Geometry logit mode for cycle consistency loss. "
+            "Use 'raw' for Gaussian on raw world coords or 'clamped' for bounded similarity on clamped coords."
+        },
+    )
 
 @dataclass
 class DataArguments:
@@ -1544,7 +1551,9 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
     setattr(model.config, "cycle_consist", model_args.cycle_consist)
     setattr(model.config, "cycle_consist_weight", model_args.cycle_consist_weight)
     setattr(model.config, "cycle_num_walks", model_args.cycle_num_walks)
+    # Hanwliu
     setattr(model.config, "cycle_feature_source", model_args.cycle_feature_source)
+    setattr(model.config, "cycle_geo_mode", model_args.cycle_geo_mode)
     
     return model
 
