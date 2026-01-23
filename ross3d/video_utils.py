@@ -45,7 +45,7 @@ def unproject(intrinsics, poses, depths):
     V, H, W = depths.shape
     y = torch.arange(0, H).to(depths.device)
     x = torch.arange(0, W).to(depths.device)
-    y, x = torch.meshgrid(y, x)
+    y, x = torch.meshgrid(y, x, indexing="ij")
 
     x = x.unsqueeze(0).repeat(V, 1, 1).view(V, H*W)     # (V, H*W)
     y = y.unsqueeze(0).repeat(V, 1, 1).view(V, H*W)     # (V, H*W)
