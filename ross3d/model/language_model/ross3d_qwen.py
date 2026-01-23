@@ -346,7 +346,10 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             lm_loss = loss.detach().clone()
 
         vm_loss, bev_loss = None, None
-        if self.training and getattr(self.config, 'ross_enable', False):
+        if self.training and getattr(self.config, 'ross_enable', False) and (
+            getattr(self.config, "view_mask_prob", 0.0) > 0.0
+            or getattr(self.config, "view_mask_ratio", 0.0) > 0.0
+        ):
             # vm_loss = self.compute_vm_loss_v2(images, hidden_states, boi_ids, eoi_ids, newline_ids, mask)
             vm_loss = self.compute_vm_loss(images, hidden_states, boi_ids, eoi_ids, newline_ids, mask)
             loss += vm_loss
