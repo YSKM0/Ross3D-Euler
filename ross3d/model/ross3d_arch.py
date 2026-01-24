@@ -870,6 +870,7 @@ class Ross3DMetaForCausalLM(ABC):
         new_labels = []
         new_world_coords = []
         cur_image_idx = 0
+        tokenizer_model_max_length = getattr(self.config, "tokenizer_model_max_length", None)
         # rank_print("Inserting Images embedding")
         for batch_idx, cur_input_ids in enumerate(input_ids):
             num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
@@ -943,6 +944,14 @@ class Ross3DMetaForCausalLM(ABC):
                         newline_ids = list(map(lambda x: x + text_len, newline_ids))
                     except IndexError:
                         cur_image_features = image_features[cur_image_idx - 1]
+
+                    rank0_print(
+                        "[token_count] "
+                        f"text={text_len}, "
+                        f"image={cur_image_features.shape[0]}, "
+                        f"total={text_len + cur_image_features.shape[0]}, "
+                        f"model_max_length={tokenizer_model_max_length}"
+                    )
                     
                     if use_mrope_position_embedding:
                         coords = world_coords_discrete[batch_idx]
@@ -978,7 +987,6 @@ class Ross3DMetaForCausalLM(ABC):
                 new_world_coords.append(cur_new_world_coords)
 
         # Truncate sequences to max length as image embeddings can make the sequence longer
-        tokenizer_model_max_length = getattr(self.config, "tokenizer_model_max_length", None)
         # rank_print("Finishing Inserting")
 
         new_input_embeds = [x[:tokenizer_model_max_length] for x, modality in zip(new_input_embeds, modalities)]
