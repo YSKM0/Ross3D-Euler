@@ -1359,6 +1359,14 @@ class Ross3DMetaForCausalLM(ABC):
         if mask is not None:
             frame_mask = frame_mask & (~mask.bool())
         visible_idx = frame_mask.nonzero(as_tuple=False).flatten()
+        rank0_print(
+            "[cycle_consistency_loss] frame_selection "
+            f"T={T}, "
+            f"mask_present={mask is not None}, "
+            f"mask_shape={(tuple(mask.shape) if mask is not None else None)}, "
+            f"mask_true_count={(int(mask.sum().item()) if mask is not None else None)}, "
+            f"visible_idx={visible_idx.tolist()}"
+        )
 
         if visible_idx.numel() < 2:
             rank0_print(
@@ -1373,6 +1381,12 @@ class Ross3DMetaForCausalLM(ABC):
             perm = torch.randperm(visible_idx.numel(), device=hidden_states.device)
             sel = visible_idx[perm[:num_walks]]
             sel, _ = torch.sort(sel)
+        rank0_print(
+            "[cycle_consistency_loss] frame_selection_after "
+            f"S={sel.numel()}, "
+            f"num_walks={num_walks}, "
+            f"sel={sel.tolist()}"
+        )
 
         feats = feats[sel]  # [S, P, D]
         S = feats.shape[0]
