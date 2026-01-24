@@ -1423,6 +1423,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
     overwrite_config = {}
     if any(
         [
+            model_args.vision_tower is not None,
             model_args.rope_scaling_factor is not None,
             model_args.rope_scaling_type is not None,
             model_args.mm_spatial_pool_stride is not None,
@@ -1459,6 +1460,9 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
 
     if model_args.mm_spatial_pool_mode is not None:
         overwrite_config["mm_spatial_pool_mode"] = model_args.mm_spatial_pool_mode
+
+    if model_args.vision_tower is not None:
+        overwrite_config["mm_vision_tower"] = model_args.vision_tower
     
     # configs for 3d tasks
     if model_args.object_feature_type is not None:

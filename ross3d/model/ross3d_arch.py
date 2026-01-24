@@ -313,7 +313,9 @@ class Ross3DMetaForCausalLM(ABC):
     def get_vision_tower(self):
         return self.get_model().get_vision_tower()
 
-    def get_2dPool(self, image_feature, stride=2):
+    def get_2dPool(self, image_feature, stride=None):
+        if stride is None:
+            stride = self.config.mm_spatial_pool_stride
         height = width = self.get_vision_tower().num_patches_per_side
         num_frames, num_tokens, num_dim = image_feature.shape
         image_feature = image_feature.view(num_frames, height, width, -1)
@@ -656,7 +658,7 @@ class Ross3DMetaForCausalLM(ABC):
             image_features = []
             for idx, image_feat in enumerate(encoded_image_features):
                 if idx in video_idx_in_batch:
-                    image_features.append(self.get_2dPool(image_feat))
+                    image_features.append(self.get_2dPool(image_feat, self.config.mm_spatial_pool_stride))
                 else:
                     image_features.append(image_feat)
             assert len(image_features) == 1 # only support batch_size=1
