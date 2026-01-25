@@ -40,6 +40,7 @@ class Ross3DQwenConfig(Qwen2Config):
         super().__init__(**kwargs)
 
         self.cycle_consist = kwargs.get("cycle_consist", False)
+        self.cycle_consist_v2 = kwargs.get("cycle_consist_v2", False)
         self.cycle_consist_weight = kwargs.get("cycle_consist_weight", 1.0)
         self.cycle_num_walks = kwargs.get("cycle_num_walks", None)
         self.cycle_geo_temp = kwargs.get("cycle_geo_temp", 0.10)
@@ -361,8 +362,11 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
 
         # Hanwliu
         cycle_loss = None
-        if self.training and getattr(self.config, "cycle_consist", False):
-            cycle_loss = self.compute_cycle_consistency_loss(
+        if self.training and (
+            getattr(self.config, "cycle_consist_v2", False)
+            or getattr(self.config, "cycle_consist", False)
+        ):
+            cycle_kwargs = dict(
                 hidden_states=hidden_states,
                 boi_ids=boi_ids,
                 eoi_ids=eoi_ids,
@@ -375,6 +379,10 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
                 geo_sigma=getattr(self.config, "cycle_geo_sigma", None),  # auto if None
                 topk=getattr(self.config, "cycle_topk", 32),
             )
+            if getattr(self.config, "cycle_consist_v2", False):
+                cycle_loss = self.compute_cycle_consistency_loss_v2(**cycle_kwargs)
+            else:
+                cycle_loss = self.compute_cycle_consistency_loss(**cycle_kwargs)
 
             loss = loss + getattr(self.config, "cycle_consist_weight", 1.0) * cycle_loss
 

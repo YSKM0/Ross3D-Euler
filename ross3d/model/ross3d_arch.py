@@ -1635,11 +1635,6 @@ class Ross3DMetaForCausalLM(ABC):
         - guidance loss: KL( q_geo || p_app ) row-wise + column-wise (symmetry)
         """
 
-        import math
-        import torch
-        import torch.nn.functional as F
-        from einops import rearrange
-
         B = hidden_states.shape[0]
         assert B == 1, "Cycle consistency implemented for batch_size==1"
 
@@ -1870,10 +1865,22 @@ class Ross3DMetaForCausalLM(ABC):
                 Xb = coords[step + 1]    # [P, 3]
 
                 diff = Xa[:, None, :] - Xb[None, :, :]   # [P, P, 3]
-                dist2 = (diff * diff).sum(dim=-1)        # [P, P]
-                logit_geo = -dist2 / (2.0 * (geo_sigma ** 2))  # [P, P]
-                logit_geo_fwd = logit_geo
-                logit_geo_bwd = logit_geo.T
+                geo_mode = getattr(self.config, "cycle_geo_mode", "raw")
+                if geo_mode == "clamped":
+                    min_xyz = torch.tensor(self.config.min_xyz_range, device=diff.device, dtype=diff.dtype)
+                    max_xyz = torch.tensor(self.config.max_xyz_range, device=diff.device, dtype=diff.dtype)
+                    Xa_c = torch.clamp(Xa, min=min_xyz, max=max_xyz)
+                    Xb_c = torch.clamp(Xb, min=min_xyz, max=max_xyz)
+                    diff = Xa_c[:, None, :] - Xb_c[None, :, :]
+                    dist = torch.linalg.norm(diff, dim=-1)
+                    d_max = torch.linalg.norm(max_xyz - min_xyz).clamp_min(1e-6)
+                    logit_geo_fwd = 1.0 - (2.0 * dist / d_max)
+                    logit_geo_bwd = logit_geo_fwd.T
+                else:
+                    dist2 = (diff * diff).sum(dim=-1)        # [P, P]
+                    logit_geo = -dist2 / (2.0 * (geo_sigma ** 2))  # [P, P]
+                    logit_geo_fwd = logit_geo
+                    logit_geo_bwd = logit_geo.T
 
                 # mask invalid patches (rows/cols)
                 if valid_patch is not None:
@@ -1881,16 +1888,14 @@ class Ross3DMetaForCausalLM(ABC):
                     vb = valid_patch[step + 1] # [P]
 
                     # apply the same masking to app & geo (so z-score/softmax ignore invalid)
-                    for xname in ["logit_app_fwd", "logit_geo_fwd"]:
-                        x = locals()[xname]
-                        x = x.masked_fill(~va[:, None], float("-inf"))
-                        x = x.masked_fill(~vb[None, :], float("-inf"))
-                        locals()[xname] = x
-                    for xname in ["logit_app_bwd", "logit_geo_bwd"]:
-                        x = locals()[xname]
-                        x = x.masked_fill(~vb[:, None], float("-inf"))
-                        x = x.masked_fill(~va[None, :], float("-inf"))
-                        locals()[xname] = x
+                    logit_app_fwd = logit_app_fwd.masked_fill(~va[:, None], float("-inf"))
+                    logit_geo_fwd = logit_geo_fwd.masked_fill(~va[:, None], float("-inf"))
+                    logit_app_fwd = logit_app_fwd.masked_fill(~vb[None, :], float("-inf"))
+                    logit_geo_fwd = logit_geo_fwd.masked_fill(~vb[None, :], float("-inf"))
+                    logit_app_bwd = logit_app_bwd.masked_fill(~vb[:, None], float("-inf"))
+                    logit_geo_bwd = logit_geo_bwd.masked_fill(~vb[:, None], float("-inf"))
+                    logit_app_bwd = logit_app_bwd.masked_fill(~va[None, :], float("-inf"))
+                    logit_geo_bwd = logit_geo_bwd.masked_fill(~va[None, :], float("-inf"))
 
                     # if an entire row is invalid, skip
                     if (

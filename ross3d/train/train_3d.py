@@ -137,6 +137,10 @@ class ModelArguments:
         default=False,
         metadata={"help": "Enable cycle-consistency loss over frame tokens."},
     )
+    cycle_consist_v2: bool = field(
+        default=False,
+        metadata={"help": "Enable v2 cycle-consistency loss over frame tokens."},
+    )
     cycle_consist_weight: float = field(
         default=1.0,
         metadata={"help": "Weight for the cycle-consistency loss term."},
@@ -1559,6 +1563,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         )
 
     setattr(model.config, "cycle_consist", model_args.cycle_consist)
+    setattr(model.config, "cycle_consist_v2", model_args.cycle_consist_v2)
     setattr(model.config, "cycle_consist_weight", model_args.cycle_consist_weight)
     setattr(model.config, "cycle_num_walks", model_args.cycle_num_walks)
     # Hanwliu
