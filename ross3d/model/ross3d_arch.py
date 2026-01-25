@@ -1610,6 +1610,403 @@ class Ross3DMetaForCausalLM(ABC):
         loss = -torch.log(diag + eps).mean()
         return loss
 
+    def compute_cycle_consistency_loss_v2(
+        self,
+        hidden_states: torch.Tensor,
+        boi_ids: List[int],
+        eoi_ids: List[int],
+        newline_ids: torch.Tensor,
+        video_dict: Optional[Dict[str, torch.Tensor]] = None,
+        mask: Optional[torch.Tensor] = None,
+        num_walks: Optional[int] = None,
+        temperature_app: float = 0.07,
+        temperature_geo: float = 0.10,
+        geo_sigma: Optional[float] = None,
+        topk: Optional[int] = 32,
+        eps: float = 1e-8,
+    ) -> torch.Tensor:
+        """
+        v2: 3D-aware CRW cycle-consistency loss with *geometry-guided distillation*.
+
+        - appearance logits: (Fa @ Fb^T)  (cosine sim since feats normalized)
+        - geometry logits:   -||Xa - Xb||^2 / (2*sigma^2)
+        - normalization: masked z-score for app and geo logits so neither dominates
+        - transitions for CRW: softmax( app_z/tau_app + lambda * geo_z/tau_geo )
+        - guidance loss: KL( q_geo || p_app ) row-wise + column-wise (symmetry)
+        """
+
+        import math
+        import torch
+        import torch.nn.functional as F
+        from einops import rearrange
+
+        B = hidden_states.shape[0]
+        assert B == 1, "Cycle consistency implemented for batch_size==1"
+
+        # ---- 1) Reconstruct per-frame patch features [T, P, D]
+        boi_ids = torch.LongTensor(boi_ids)
+        eoi_ids = torch.LongTensor(eoi_ids)
+
+        T = boi_ids.shape[0]
+        P = self.model.image_embed_len
+        D = hidden_states.shape[-1]
+        patch_h = math.ceil(math.sqrt(P))  # should be 14
+
+        feats = torch.zeros((T, P, D), dtype=hidden_states.dtype, device=hidden_states.device)
+
+        for t, (cur_boi, cur_eoi) in enumerate(zip(boi_ids, eoi_ids)):
+            if (cur_boi is None) or (cur_eoi is None):
+                continue
+
+            # remove newline tokens exactly like compute_vm_loss
+            cur_rows = [hidden_states[0][cur_boi: newline_ids[t * patch_h]]]
+            for k in range(t * patch_h + 1, (t + 1) * patch_h):
+                cur_rows.append(hidden_states[0][newline_ids[k - 1] + 1: newline_ids[k]])
+            cur_rows.append(hidden_states[0][newline_ids[(t + 1) * patch_h - 1] + 1: cur_eoi])
+
+            feats[t] = torch.cat(cur_rows, dim=0)
+
+        # ---- 2) Visible frames selection
+        frame_mask = torch.ones(T, dtype=torch.bool, device=hidden_states.device)
+        if mask is not None:
+            frame_mask = frame_mask & (~mask.bool())
+        visible_idx = frame_mask.nonzero(as_tuple=False).flatten()
+        rank0_print(
+            "[cycle_consistency_loss_v2] frame_selection "
+            f"T={T}, "
+            f"mask_present={mask is not None}, "
+            f"mask_shape={(tuple(mask.shape) if mask is not None else None)}, "
+            f"mask_true_count={(int(mask.sum().item()) if mask is not None else None)}, "
+            f"visible_idx={visible_idx.tolist()}"
+        )
+
+        if visible_idx.numel() < 2:
+            rank0_print(
+                "[cycle_consistency_loss_v2] Disabled: fewer than 2 visible frames. "
+                f"visible_idx={visible_idx.tolist()}, T={T}, mask_present={mask is not None}."
+            )
+            return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
+
+        if (num_walks is None) or (num_walks >= visible_idx.numel()):
+            sel = visible_idx
+        else:
+            perm = torch.randperm(visible_idx.numel(), device=hidden_states.device)
+            sel = visible_idx[perm[:num_walks]]
+            sel, _ = torch.sort(sel)
+        rank0_print(
+            "[cycle_consistency_loss_v2] frame_selection_after "
+            f"S={sel.numel()}, "
+            f"num_walks={num_walks}, "
+            f"sel={sel.tolist()}"
+        )
+
+        feats = feats[sel]  # [S, P, D]
+        S = feats.shape[0]
+        if S < 2:
+            rank0_print(
+                "[cycle_consistency_loss_v2] Disabled: selected frames < 2. "
+                f"S={S}, visible_count={visible_idx.numel()}, num_walks={num_walks}."
+            )
+            return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
+
+        # ---- 3) Feature source selection + normalization
+        feature_source = getattr(self.config, "cycle_feature_source", "llm")
+        if feature_source == "inv_projector":
+            inv_projector = getattr(self.model, "mm_inv_projector", None)
+            if (
+                inv_projector is None
+                or not hasattr(inv_projector, "ln_pre")
+                or not hasattr(inv_projector, "net")
+                or not hasattr(inv_projector.net, "z_embedder_view")
+            ):
+                rank0_print(
+                    "[cycle_consistency_loss_v2] Requested inv_projector features, "
+                    "but mm_inv_projector.z_embedder_view is unavailable. Falling back to LLM features."
+                )
+            else:
+                feats = inv_projector.ln_pre(feats)
+                h = w = int(feats.shape[1] ** 0.5)
+                feats = rearrange(feats, "b (h w) c -> b c h w", h=h, w=w).contiguous()
+                feats = rearrange(feats, "b c h w -> b (h w) c").contiguous()
+                feats = inv_projector.net.z_embedder_view(feats)
+        feats = F.normalize(feats, dim=-1)  # [S, P, D]
+
+        # ---- 4) Build per-patch 3D coords [S, P, 3] (WORLD coords)
+        coords = None
+        valid_patch = None
+        if (video_dict is not None) and ("world_coords" in video_dict):
+            wc = video_dict["world_coords"][0]           # [V, H, W, 3]
+            wc_p = self.average_coordinate_in_patch(wc)  # [V, 14, 14, 3]
+            wc_p = wc_p.reshape(wc_p.shape[0], -1, 3)    # [V, 196, 3]
+            coords = wc_p[sel].to(device=hidden_states.device, dtype=torch.float32)
+
+            if getattr(self.config, "cycle_filter_positive_depth", True):
+                valid_patch = (coords[..., 2] > 0.0)  # [S, P]
+
+        use_geo = coords is not None
+
+        # choose sigma automatically if not provided (your existing robust heuristic)
+        if use_geo and (geo_sigma is None):
+            with torch.no_grad():
+                d = coords[1:] - coords[:-1]               # [S-1, P, 3]
+                dist = torch.linalg.norm(d, dim=-1)        # [S-1, P]
+                if valid_patch is not None:
+                    vm = valid_patch[1:] & valid_patch[:-1]
+                    dist = dist[vm]
+                if dist.numel() > 0:
+                    geo_sigma = torch.quantile(dist, 0.5).clamp(min=1e-3).item()
+                else:
+                    geo_sigma = 0.10
+
+        # -------------------------------------------------------------------------
+        # v2 core: masked z-score normalization + KL guidance
+        # -------------------------------------------------------------------------
+        def _masked_zscore(x: torch.Tensor, dim: int, eps_: float) -> torch.Tensor:
+            """
+            x: [P, P] with possible -inf entries.
+            returns z: [P, P] where finite entries are z-scored along `dim`,
+            and non-finite entries remain -inf.
+            """
+            finite = torch.isfinite(x)
+            x0 = torch.where(finite, x, torch.zeros_like(x))
+            cnt = finite.sum(dim=dim, keepdim=True).clamp_min(1)
+            mu = x0.sum(dim=dim, keepdim=True) / cnt
+            diff = x0 - mu
+            var = torch.where(finite, diff * diff, torch.zeros_like(diff)).sum(dim=dim, keepdim=True) / cnt
+            std = torch.sqrt(var + eps_)
+            z = diff / std
+            z = z.masked_fill(~finite, float("-inf"))
+            return z
+
+        def _kl_rowcol(app_logits: torch.Tensor,
+                    geo_logits: torch.Tensor,
+                    src_valid: Optional[torch.Tensor],
+                    tgt_valid: Optional[torch.Tensor],
+                    tau_a: float,
+                    tau_g: float,
+                    eps_: float) -> torch.Tensor:
+            """
+            app_logits, geo_logits: [P, P] (masked with -inf where invalid)
+            src_valid, tgt_valid: [P] boolean or None
+            returns scalar KL(row) + KL(col)
+            """
+            la = app_logits
+            lg = geo_logits
+
+            if src_valid is not None:
+                la = la.masked_fill(~src_valid[:, None], float("-inf"))
+                lg = lg.masked_fill(~src_valid[:, None], float("-inf"))
+            if tgt_valid is not None:
+                la = la.masked_fill(~tgt_valid[None, :], float("-inf"))
+                lg = lg.masked_fill(~tgt_valid[None, :], float("-inf"))
+
+            # If any row is entirely invalid => avoid NaNs in softmax
+            if (~torch.isfinite(la)).all(dim=-1).any() or (~torch.isfinite(lg)).all(dim=-1).any():
+                return torch.zeros((), device=la.device, dtype=la.dtype)
+
+            # Row distributions
+            la_r = _masked_zscore(la, dim=-1, eps_=eps_)
+            lg_r = _masked_zscore(lg, dim=-1, eps_=eps_)
+
+            p_row = F.softmax(la_r / tau_a, dim=-1)                 # [P, P]
+            q_row = F.softmax(lg_r / tau_g, dim=-1).detach()        # [P, P]
+
+            kl_row = (q_row * (torch.log(q_row + eps_) - torch.log(p_row + eps_))).sum(dim=-1)  # [P]
+
+            row_mask = torch.ones((P,), device=la.device, dtype=torch.bool)
+            if src_valid is not None:
+                row_mask = row_mask & src_valid
+            # also require at least one finite target in both
+            row_mask = row_mask & torch.isfinite(la).any(dim=-1) & torch.isfinite(lg).any(dim=-1)
+            if row_mask.any():
+                kl_row = kl_row[row_mask].mean()
+            else:
+                kl_row = torch.zeros((), device=la.device, dtype=la.dtype)
+
+            # Column distributions (symmetry)
+            if (~torch.isfinite(la)).all(dim=0).any() or (~torch.isfinite(lg)).all(dim=0).any():
+                kl_col = torch.zeros((), device=la.device, dtype=la.dtype)
+            else:
+                la_c = _masked_zscore(la, dim=0, eps_=eps_)
+                lg_c = _masked_zscore(lg, dim=0, eps_=eps_)
+
+                p_col = F.softmax(la_c / tau_a, dim=0)              # [P, P]
+                q_col = F.softmax(lg_c / tau_g, dim=0).detach()     # [P, P]
+
+                kl_col_vec = (q_col * (torch.log(q_col + eps_) - torch.log(p_col + eps_))).sum(dim=0)  # [P]
+
+                col_mask = torch.ones((P,), device=la.device, dtype=torch.bool)
+                if tgt_valid is not None:
+                    col_mask = col_mask & tgt_valid
+                col_mask = col_mask & torch.isfinite(la).any(dim=0) & torch.isfinite(lg).any(dim=0)
+                if col_mask.any():
+                    kl_col = kl_col_vec[col_mask].mean()
+                else:
+                    kl_col = torch.zeros((), device=la.device, dtype=la.dtype)
+
+            return kl_row + kl_col
+
+        # ---- 5) Build neighbor transitions (CRW) + guidance loss
+        A_fwd, A_bwd = [], []
+        tau_app = float(temperature_app)
+        tau_geo = float(temperature_geo)
+
+        # weight for KL guidance and weight for geo in fused transition logits
+        kl_w = float(getattr(self.config, "cycle_geo_kl_weight", 1.0))
+        geo_w = float(getattr(self.config, "cycle_geo_fuse_weight", 1.0))
+
+        guidance_loss = torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
+
+        for step in range(S - 1):
+            Fa = feats[step]     # [P, D]
+            Fb = feats[step + 1] # [P, D]
+
+            # appearance logits (NOT yet divided by tau; we z-score first)
+            logit_app_fwd = (Fa @ Fb.T)  # [P, P]
+            logit_app_bwd = (Fb @ Fa.T)  # [P, P]
+
+            if use_geo:
+                Xa = coords[step]        # [P, 3]
+                Xb = coords[step + 1]    # [P, 3]
+
+                diff = Xa[:, None, :] - Xb[None, :, :]   # [P, P, 3]
+                dist2 = (diff * diff).sum(dim=-1)        # [P, P]
+                logit_geo = -dist2 / (2.0 * (geo_sigma ** 2))  # [P, P]
+                logit_geo_fwd = logit_geo
+                logit_geo_bwd = logit_geo.T
+
+                # mask invalid patches (rows/cols)
+                if valid_patch is not None:
+                    va = valid_patch[step]     # [P]
+                    vb = valid_patch[step + 1] # [P]
+
+                    # apply the same masking to app & geo (so z-score/softmax ignore invalid)
+                    for xname in ["logit_app_fwd", "logit_geo_fwd"]:
+                        x = locals()[xname]
+                        x = x.masked_fill(~va[:, None], float("-inf"))
+                        x = x.masked_fill(~vb[None, :], float("-inf"))
+                        locals()[xname] = x
+                    for xname in ["logit_app_bwd", "logit_geo_bwd"]:
+                        x = locals()[xname]
+                        x = x.masked_fill(~vb[:, None], float("-inf"))
+                        x = x.masked_fill(~va[None, :], float("-inf"))
+                        locals()[xname] = x
+
+                    # if an entire row is invalid, skip
+                    if (
+                        (~torch.isfinite(logit_app_fwd)).all(dim=-1).any()
+                        or (~torch.isfinite(logit_geo_fwd)).all(dim=-1).any()
+                        or (~torch.isfinite(logit_app_bwd)).all(dim=-1).any()
+                        or (~torch.isfinite(logit_geo_bwd)).all(dim=-1).any()
+                    ):
+                        rank0_print(
+                            "[cycle_consistency_loss_v2] Disabled: invalid transition rows after masking. "
+                            f"step={step}, valid_patch_ratio={valid_patch.float().mean().item():.4f}."
+                        )
+                        return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
+
+                # ---- v2 guidance term: KL( q_geo || p_app ) row + col, forward + backward
+                if kl_w > 0.0:
+                    if valid_patch is not None:
+                        va = valid_patch[step]
+                        vb = valid_patch[step + 1]
+                    else:
+                        va = vb = None
+
+                    g_f = _kl_rowcol(
+                        app_logits=logit_app_fwd,
+                        geo_logits=logit_geo_fwd,
+                        src_valid=va,
+                        tgt_valid=vb,
+                        tau_a=tau_app,
+                        tau_g=tau_geo,
+                        eps_=eps,
+                    )
+                    g_b = _kl_rowcol(
+                        app_logits=logit_app_bwd,
+                        geo_logits=logit_geo_bwd,
+                        src_valid=vb,
+                        tgt_valid=va,
+                        tau_a=tau_app,
+                        tau_g=tau_geo,
+                        eps_=eps,
+                    )
+                    guidance_loss = guidance_loss + 0.5 * (g_f + g_b)
+
+                # ---- v2 fused transition logits for CRW (z-score each, then combine)
+                app_f = _masked_zscore(logit_app_fwd, dim=-1, eps_=eps)
+                geo_f = _masked_zscore(logit_geo_fwd, dim=-1, eps_=eps)
+                logit_fwd = (app_f / tau_app) + geo_w * (geo_f / tau_geo)
+
+                app_b = _masked_zscore(logit_app_bwd, dim=-1, eps_=eps)
+                geo_b = _masked_zscore(logit_geo_bwd, dim=-1, eps_=eps)
+                logit_bwd = (app_b / tau_app) + geo_w * (geo_b / tau_geo)
+
+            else:
+                # appearance-only (still z-score + temperature for stability)
+                app_f = _masked_zscore(logit_app_fwd, dim=-1, eps_=eps)
+                app_b = _masked_zscore(logit_app_bwd, dim=-1, eps_=eps)
+                logit_fwd = app_f / tau_app
+                logit_bwd = app_b / tau_app
+
+            # top-k sparsification (same behavior as your original)
+            if (topk is not None) and (topk < P):
+                v, idx = torch.topk(logit_fwd, k=topk, dim=-1)
+                sparse = torch.full_like(logit_fwd, float("-inf"))
+                sparse.scatter_(-1, idx, v)
+                logit_fwd = sparse
+
+                v, idx = torch.topk(logit_bwd, k=topk, dim=-1)
+                sparse = torch.full_like(logit_bwd, float("-inf"))
+                sparse.scatter_(-1, idx, v)
+                logit_bwd = sparse
+
+            A_fwd.append(F.softmax(logit_fwd, dim=-1))
+            A_bwd.append(F.softmax(logit_bwd, dim=-1))
+
+        # average guidance loss over steps
+        if use_geo and (S > 1) and (kl_w > 0.0):
+            guidance_loss = guidance_loss / float(S - 1)
+        else:
+            guidance_loss = torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
+
+        # ---- 6) Compose forward then backward (same as your original)
+        if len(A_fwd) != (S - 1):
+            rank0_print(
+                "[cycle_consistency_loss_v2] Disabled: transition list length mismatch. "
+                f"len(A_fwd)={len(A_fwd)}, expected={S - 1}, S={S}."
+            )
+            return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
+
+        A_fw = A_fwd[0]
+        for k in range(1, S - 1):
+            A_fw = A_fw @ A_fwd[k]   # [P, P]
+
+        A_bw = A_bwd[-1]
+        for k in range(S - 3, -1, -1):
+            A_bw = A_bw @ A_bwd[k]   # [P, P]
+
+        M = A_fw @ A_bw  # [P, P]
+        diag = torch.diagonal(M, dim1=-2, dim2=-1)  # [P]
+
+        # if valid_patch exists, only score patches valid in the first selected frame
+        if valid_patch is not None:
+            v0 = valid_patch[0]
+            if v0.any():
+                diag = diag[v0]
+            else:
+                rank0_print(
+                    "[cycle_consistency_loss_v2] Disabled: no valid patches in first selected frame. "
+                    f"valid_patch_shape={valid_patch.shape}, selected_frames={sel.tolist()}."
+                )
+                return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
+
+        cycle_loss = -torch.log(diag + eps).mean()
+
+        # total loss = CRW cycle loss + KL guidance (weight from config)
+        loss = cycle_loss + kl_w * guidance_loss
+        return loss
+
 
 @dataclass
 class CausalLMOutputWithPastRoss(ModelOutput):
