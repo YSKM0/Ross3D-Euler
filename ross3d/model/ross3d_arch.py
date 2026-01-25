@@ -341,49 +341,90 @@ class Ross3DMetaForCausalLM(ABC):
         return image_feature
 
 
-    def average_coordinate_in_patch(self, world_coords, patch_size=27):
+    def _world_coords_pool_params(self, world_coords, stride):
+        num_patches = self.get_vision_tower().num_patches_per_side
+        target_grid = math.ceil(num_patches / float(stride))
+        _, height, width, _ = world_coords.size()
+        patch_h = max(1, height // target_grid)
+        patch_w = max(1, width // target_grid)
+        crop_h = patch_h * target_grid
+        crop_w = patch_w * target_grid
+        return target_grid, patch_h, patch_w, crop_h, crop_w
+
+    def average_coordinate_in_patch(self, world_coords, stride=None):
+        if stride is None:
+            stride = self.config.mm_spatial_pool_stride
 
         V, H, W, D = world_coords.size() # D = 3
+        target_grid, patch_h, patch_w, crop_h, crop_w = self._world_coords_pool_params(world_coords, stride)
 
-        world_coords = world_coords.view(V, H, W, D)[:, :-6, :-6, :]    # [32, 378, 378, 3]
-        world_coords = world_coords.permute(0, 3, 1, 2)   # [V, D, 378, 378]
-        world_coords_avg = torch.nn.functional.avg_pool2d(world_coords, kernel_size=patch_size, stride=patch_size)  # [32, 3, 14,  14]
-        patch_num = world_coords_avg.shape[-1]
-        world_coords_avg = world_coords_avg.permute(0, 2, 3, 1)     # [32, 14, 14, 3]
+        world_coords = world_coords.view(V, H, W, D)[:, :crop_h, :crop_w, :]
+        world_coords = world_coords.permute(0, 3, 1, 2)
+        world_coords_avg = torch.nn.functional.avg_pool2d(
+            world_coords,
+            kernel_size=(patch_h, patch_w),
+            stride=(patch_h, patch_w),
+        )
+        world_coords_avg = world_coords_avg.permute(0, 2, 3, 1)
 
         return world_coords_avg
 
 
-    def minmax_coordinate_in_patch(self, world_coords, patch_size=27):
+    def minmax_coordinate_in_patch(self, world_coords, stride=None):
+        if stride is None:
+            stride = self.config.mm_spatial_pool_stride
 
         V, H, W, D = world_coords.size() # D = 3
 
-        world_coords = world_coords.view(V, H, W, D)[:, :-6, :-6, :]    # [32, 378, 378, 3]
-        world_coords = world_coords.permute(0, 3, 1, 2)   # [V, D, 378, 378]
+        target_grid, patch_h, patch_w, crop_h, crop_w = self._world_coords_pool_params(world_coords, stride)
+        world_coords = world_coords.view(V, H, W, D)[:, :crop_h, :crop_w, :]
+        world_coords = world_coords.permute(0, 3, 1, 2)
 
-        world_coords_max = torch.nn.functional.max_pool2d(world_coords, kernel_size=patch_size, stride=patch_size)  # [32, 3, 14,  14]
-        world_coords_max = world_coords_max.permute(0, 2, 3, 1)     # [32, 14, 14, 3]
+        world_coords_max = torch.nn.functional.max_pool2d(
+            world_coords,
+            kernel_size=(patch_h, patch_w),
+            stride=(patch_h, patch_w),
+        )
+        world_coords_max = world_coords_max.permute(0, 2, 3, 1)
 
-        world_coords_min = - torch.nn.functional.max_pool2d(-world_coords, kernel_size=patch_size, stride=patch_size)  # [32, 3, 14,  14]
-        world_coords_min = world_coords_min.permute(0, 2, 3, 1)     # [32, 14, 14, 3]
-        world_coords = torch.stack([world_coords_min, world_coords_max], dim=3) # [32, 14, 14, 2, 3]
+        world_coords_min = -torch.nn.functional.max_pool2d(
+            -world_coords,
+            kernel_size=(patch_h, patch_w),
+            stride=(patch_h, patch_w),
+        )
+        world_coords_min = world_coords_min.permute(0, 2, 3, 1)
+        world_coords = torch.stack([world_coords_min, world_coords_max], dim=3)
 
         return world_coords
 
 
-    def sample_n_points(self, world_coords, n_points=9):
+    def sample_n_points(self, world_coords, n_points=9, stride=None):
+        if stride is None:
+            stride = self.config.mm_spatial_pool_stride
 
         V, H, W, D = world_coords.size() # D = 3
-        world_coords = world_coords.view(V, H, W, D)[:, :-6, :-6, :] 
-        world_coords = world_coords.view(-1, 14, 27, 14, 27, 3).permute(0, 1, 3, 2, 4, 5)
+        target_grid, patch_h, patch_w, crop_h, crop_w = self._world_coords_pool_params(world_coords, stride)
+        world_coords = world_coords.view(V, H, W, D)[:, :crop_h, :crop_w, :]
+        world_coords = world_coords.view(
+            V,
+            target_grid,
+            patch_h,
+            target_grid,
+            patch_w,
+            3,
+        ).permute(0, 1, 3, 2, 4, 5)
+        y_positions = ((torch.arange(3, device=world_coords.device) + 0.5) * (patch_h / 3) - 0.5).round().long()
+        x_positions = ((torch.arange(3, device=world_coords.device) + 0.5) * (patch_w / 3) - 0.5).round().long()
+        y_positions = torch.clamp(y_positions, 0, patch_h - 1)
+        x_positions = torch.clamp(x_positions, 0, patch_w - 1)
+        sampled = world_coords[:, :, :, y_positions][:, :, :, :, x_positions]
+        sampled = sampled.reshape(V, target_grid, target_grid, 9, 3)
         if n_points == 9:
-            world_coords_sample = world_coords[:, :, :, 4::9, 4::9, :].reshape(V, 14, 14, 9, 3)
+            world_coords_sample = sampled
         elif n_points == 5:
-            world_coords_sample = world_coords[:, :, :, 4::9, 4::9, :].reshape(V, 14, 14, 9, 3)
-            world_coords_sample = world_coords_sample[:, :, :, 0::2, :].reshape(V, 14, 14, 5, 3)
+            world_coords_sample = sampled[:, :, :, [0, 2, 4, 6, 8], :]
         elif n_points == 1:
-            world_coords_sample = world_coords[:, :, :, 4::9, 4::9, :].reshape(V, 14, 14, 9, 3)
-            world_coords_sample = world_coords_sample[:, :, :, 4, :].reshape(V, 14, 14, 3)
+            world_coords_sample = sampled[:, :, :, 4, :].reshape(V, target_grid, target_grid, 3)
         else:
             raise NotImplementedError
         
@@ -1433,13 +1474,14 @@ class Ross3DMetaForCausalLM(ABC):
             wc_p = wc_p.reshape(wc_p.shape[0], -1, 3)    # [V, 196, 3]
             coords = wc_p[sel].to(device=hidden_states.device, dtype=torch.float32)
 
-            # invalid depth in your pipeline becomes (0,0,0) often; treat z<=0 as invalid
-            valid_patch = (coords[..., 2] > 0.0)  # [S, P]
-            if (~valid_patch).any():
-                rank0_print(
-                    "[cycle_consistency_loss] Detected non-positive depth patches; "
-                    f"invalid_count={(~valid_patch).sum().item()}."
-                )
+            if getattr(self.config, "cycle_filter_positive_depth", True):
+                # invalid depth in your pipeline becomes (0,0,0) often; treat z<=0 as invalid
+                valid_patch = (coords[..., 2] > 0.0)  # [S, P]
+                if (~valid_patch).any():
+                    rank0_print(
+                        "[cycle_consistency_loss] Detected non-positive depth patches; "
+                        f"invalid_count={(~valid_patch).sum().item()}."
+                    )
 
         # if no coords, fall back to appearance-only (still works)
         use_geo = coords is not None

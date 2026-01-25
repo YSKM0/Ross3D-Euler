@@ -159,6 +159,12 @@ class ModelArguments:
             "Use 'raw' for Gaussian on raw world coords or 'clamped' for bounded similarity on clamped coords."
         },
     )
+    cycle_filter_positive_depth: bool = field(
+        default=True,
+        metadata={
+            "help": "Filter cycle-consistency patches by positive depth (z > 0).",
+        },
+    )
 
 @dataclass
 class DataArguments:
@@ -1558,6 +1564,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
     # Hanwliu
     setattr(model.config, "cycle_feature_source", model_args.cycle_feature_source)
     setattr(model.config, "cycle_geo_mode", model_args.cycle_geo_mode)
+    setattr(model.config, "cycle_filter_positive_depth", model_args.cycle_filter_positive_depth)
     
     return model
 
