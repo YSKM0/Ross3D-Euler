@@ -67,7 +67,7 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
 
         # Hanwliu temperature
         init_tau = getattr(config, "cycle_temp", 0.07)
-        self.cycle_log_temp = nn.Parameter(torch.log(torch.tensor(1.0 / init_tau)))
+        self.temperature_app = nn.Parameter(torch.tensor(init_tau))
 
         self.model = Ross3DQwenModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -374,7 +374,7 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
                 video_dict=video_dict,  # <-- IMPORTANT
                 mask=None,
                 num_walks=getattr(self.config, "cycle_num_walks", None),
-                temperature_app=getattr(self.config, "cycle_temp", 0.07),
+                temperature_app=self.temperature_app,
                 temperature_geo=getattr(self.config, "cycle_geo_temp", 0.10),
                 geo_sigma=getattr(self.config, "cycle_geo_sigma", None),  # auto if None
                 topk=getattr(self.config, "cycle_topk", 32),

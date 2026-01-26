@@ -1357,7 +1357,7 @@ class Ross3DMetaForCausalLM(ABC):
         video_dict: Optional[Dict[str, torch.Tensor]] = None,
         mask: Optional[torch.Tensor] = None,
         num_walks: Optional[int] = None,
-        temperature_app: float = 0.07,
+        temperature_app: Union[float, torch.Tensor] = 0.07,
         temperature_geo: float = 0.10,
         geo_sigma: Optional[float] = None,
         topk: Optional[int] = 32,
@@ -1502,7 +1502,14 @@ class Ross3DMetaForCausalLM(ABC):
 
         # ---- 5) Build neighbor transitions
         A_fwd, A_bwd = [], []
-        tau_app = float(temperature_app)
+        if torch.is_tensor(temperature_app):
+            tau_app = temperature_app
+        else:
+            tau_app = torch.tensor(
+                temperature_app,
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
         tau_geo = float(temperature_geo)
 
         for step in range(S - 1):
@@ -1619,7 +1626,7 @@ class Ross3DMetaForCausalLM(ABC):
         video_dict: Optional[Dict[str, torch.Tensor]] = None,
         mask: Optional[torch.Tensor] = None,
         num_walks: Optional[int] = None,
-        temperature_app: float = 0.07,
+        temperature_app: Union[float, torch.Tensor] = 0.07,
         temperature_geo: float = 0.10,
         geo_sigma: Optional[float] = None,
         topk: Optional[int] = 32,
@@ -1843,7 +1850,14 @@ class Ross3DMetaForCausalLM(ABC):
 
         # ---- 5) Build neighbor transitions (CRW) + guidance loss
         A_fwd, A_bwd = [], []
-        tau_app = float(temperature_app)
+        if torch.is_tensor(temperature_app):
+            tau_app = temperature_app
+        else:
+            tau_app = torch.tensor(
+                temperature_app,
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
         tau_geo = float(temperature_geo)
 
         # weight for KL guidance and weight for geo in fused transition logits
@@ -2006,10 +2020,11 @@ class Ross3DMetaForCausalLM(ABC):
                 )
                 return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
 
-        cycle_loss = -torch.log(diag + eps).mean()
+        _ = diag # cycle_loss = -torch.log(diag + eps).mean()
 
         # total loss = CRW cycle loss + KL guidance (weight from config)
-        loss = cycle_loss + kl_w * guidance_loss
+        # loss = cycle_loss + kl_w * guidance_loss
+        loss = kl_w * guidance_loss
         return loss
 
 
