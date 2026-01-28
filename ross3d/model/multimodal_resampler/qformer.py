@@ -11,6 +11,7 @@
 import math
 import os
 import warnings
+import inspect
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, Any
 
@@ -469,6 +470,17 @@ class BertEncoder(nn.Module):
                 if use_cache:
                     logger.warn("`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`...")
                     use_cache = False
+
+                if os.getenv("ROSS3D_DEBUG_CHECKPOINT") == "1":
+                    supports_reentrant = "unknown"
+                    try:
+                        supports_reentrant = "use_reentrant" in inspect.signature(torch.utils.checkpoint.checkpoint).parameters
+                    except (TypeError, ValueError):
+                        pass
+                    logger.warning_once(
+                        "[checkpoint-debug][qformer] using torch.utils.checkpoint.checkpoint "
+                        f"(supports use_reentrant={supports_reentrant})"
+                    )
 
                 def create_custom_forward(module):
                     def custom_forward(*inputs):

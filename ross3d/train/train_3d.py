@@ -16,6 +16,10 @@
 
 import ast
 import io
+import functools
+import inspect
+import warnings
+import traceback
 import os
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -1651,11 +1655,144 @@ def train(attn_implementation=None):
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=training_args.gradient_checkpointing)
 
     if training_args.gradient_checkpointing:
+        debug_calls_env = os.getenv("ROSS3D_DEBUG_CHECKPOINT_CALLS")
+        debug_calls_enabled = debug_calls_env == "1" or (training_args.verbose_logging and debug_calls_env is None)
+        base_checkpoint = torch.utils.checkpoint.checkpoint
+        if debug_calls_enabled:
+            debug_limit = int(os.getenv("ROSS3D_DEBUG_CHECKPOINT_CALLS_LIMIT", "10"))
+            debug_count = {"count": 0}
+
+            def _checkpoint_debug_wrapper(function, *args, **kwargs):
+                if "use_reentrant" not in kwargs:
+                    kwargs["use_reentrant"] = False
+                    if debug_count["count"] < debug_limit:
+                        rank0_print(
+                            "[checkpoint-debug] checkpoint() injected use_reentrant=False"
+                        )
+                if debug_count["count"] < debug_limit:
+                    stack = inspect.stack()
+                    caller = stack[1] if len(stack) > 1 else None
+                    location = f"{caller.filename}:{caller.lineno}" if caller else "unknown"
+                    use_reentrant = kwargs.get("use_reentrant", "missing")
+                    rank0_print(
+                        "[checkpoint-debug] checkpoint() call; "
+                        f"use_reentrant={use_reentrant}, caller={location}"
+                    )
+                    debug_count["count"] += 1
+                return base_checkpoint(function, *args, **kwargs)
+
+            def _patch_module_checkpoint(module_name):
+                module = sys.modules.get(module_name)
+                if module is not None and hasattr(module, "checkpoint"):
+                    module.checkpoint = _checkpoint_debug_wrapper
+
+            torch.utils.checkpoint.checkpoint = _checkpoint_debug_wrapper
+            _patch_module_checkpoint("ross3d.model.multimodal_encoder.eva_clip.eva_vit")
+            _patch_module_checkpoint("ross3d.model.multimodal_encoder.dev_eva_clip.eva_clip.eva_vit_model")
+            _patch_module_checkpoint("ross3d.model.multimodal_encoder.dev_eva_clip.eva_clip.transformer")
+            if training_args.verbose_logging:
+                rank0_print(
+                    "[checkpoint-debug] ROSS3D_DEBUG_CHECKPOINT_CALLS enabled; "
+                    f"limit={debug_limit}"
+                )
+                rank0_print(
+                    "[checkpoint-debug] checkpoint wrapper installed; "
+                    f"original_id={id(base_checkpoint)}, wrapped_id={id(torch.utils.checkpoint.checkpoint)}"
+                )
+            original_showwarning = warnings.showwarning
+
+            def _checkpoint_warning_wrapper(message, category, filename, lineno, file=None, line=None):
+                try:
+                    if "use_reentrant" in str(message):
+                        import traceback as _traceback
+
+                        stack = "".join(_traceback.format_stack(limit=6))
+                        rank0_print(
+                            "[checkpoint-debug] checkpoint warning observed; "
+                            f"message={message} stack={stack}"
+                        )
+                except Exception as exc:
+                    rank0_print(f"[checkpoint-debug] warning hook failed: {exc}")
+                return original_showwarning(message, category, filename, lineno, file, line)
+
+            warnings.showwarning = _checkpoint_warning_wrapper
+        elif training_args.verbose_logging:
+            rank0_print(
+                "[checkpoint-debug] ROSS3D_DEBUG_CHECKPOINT_CALLS disabled "
+                "(set to 1 to log checkpoint callsites)"
+            )
+
+        def _build_checkpoint_func():
+            checkpoint_func = base_checkpoint
+            try:
+                if "use_reentrant" in inspect.signature(checkpoint_func).parameters:
+                    return functools.partial(checkpoint_func, use_reentrant=False)
+            except (TypeError, ValueError):
+                pass
+            return checkpoint_func
+
+        def _set_checkpoint_func(module):
+            if hasattr(module, "_gradient_checkpointing_func"):
+                module._gradient_checkpointing_func = _build_checkpoint_func()
+                if training_args.verbose_logging:
+                    rank0_print(
+                        f"[checkpoint-debug] set _gradient_checkpointing_func on {module.__class__.__name__} "
+                        f"to {_describe_checkpoint_func(module._gradient_checkpointing_func)}"
+                    )
+
+        def _describe_checkpoint_func(func):
+            if isinstance(func, functools.partial):
+                use_reentrant = func.keywords.get("use_reentrant", "unknown")
+                return f"partial(use_reentrant={use_reentrant})"
+            return "checkpoint(default)"
+
+        if training_args.verbose_logging:
+            supports_reentrant = "unknown"
+            try:
+                supports_reentrant = "use_reentrant" in inspect.signature(torch.utils.checkpoint.checkpoint).parameters
+            except (TypeError, ValueError):
+                pass
+            rank0_print(
+                "[checkpoint-debug] gradient_checkpointing enabled; "
+                f"torch.checkpoint supports use_reentrant={supports_reentrant}"
+            )
+            rank0_print(
+                "[checkpoint-debug] ROSS3D_DEBUG_CHECKPOINT="
+                f"{os.getenv('ROSS3D_DEBUG_CHECKPOINT', '0')}"
+            )
+
         if hasattr(model, "gradient_checkpointing_enable"):
             try:
-                model.gradient_checkpointing_enable()
+                model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
             except TypeError:
                 model.gradient_checkpointing_enable()
+                model.apply(_set_checkpoint_func)
+            else:
+                if training_args.verbose_logging:
+                    rank0_print("[checkpoint-debug] model.gradient_checkpointing_enable used use_reentrant=False")
+        if training_args.verbose_logging:
+            modules_with_gc = []
+            modules_with_checkpoint_func = []
+            for name, module in model.named_modules():
+                if getattr(module, "gradient_checkpointing", False):
+                    modules_with_gc.append(name)
+                if hasattr(module, "_gradient_checkpointing_func"):
+                    modules_with_checkpoint_func.append(name)
+            rank0_print(
+                "[checkpoint-debug] modules with gradient_checkpointing=True: "
+                f"{len(modules_with_gc)}"
+            )
+            if modules_with_gc:
+                rank0_print("[checkpoint-debug] gc modules: " + ", ".join(modules_with_gc))
+            rank0_print(
+                "[checkpoint-debug] modules with _gradient_checkpointing_func: "
+                f"{len(modules_with_checkpoint_func)}"
+            )
+            if modules_with_checkpoint_func:
+                rank0_print(
+                    "[checkpoint-debug] checkpoint_func modules: "
+                    + ", ".join(modules_with_checkpoint_func)
+                )
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
         else:

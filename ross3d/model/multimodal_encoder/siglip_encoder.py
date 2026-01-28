@@ -8,6 +8,7 @@ from functools import partial, reduce
 from PIL import Image
 import torch
 import torch.utils.checkpoint
+import inspect
 from torch import nn
 import os
 from transformers.image_processing_utils import BatchFeature, get_size_dict
@@ -379,11 +380,19 @@ class SigLipEncoder(nn.Module):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
             if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
+                checkpoint_func = getattr(self, "_gradient_checkpointing_func", torch.utils.checkpoint.checkpoint)
+                checkpoint_kwargs = {}
+                try:
+                    if "use_reentrant" in inspect.signature(checkpoint_func).parameters:
+                        checkpoint_kwargs["use_reentrant"] = False
+                except (TypeError, ValueError):
+                    pass
+                layer_outputs = checkpoint_func(
                     encoder_layer.__call__,
                     hidden_states,
                     attention_mask,
                     output_attentions,
+                    **checkpoint_kwargs,
                 )
             else:
                 layer_outputs = encoder_layer(

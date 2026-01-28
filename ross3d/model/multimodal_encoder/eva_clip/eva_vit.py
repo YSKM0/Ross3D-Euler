@@ -3,9 +3,11 @@
 """
 
 from math import pi
+import os
 import torch
 from torch import nn
 from einops import rearrange, repeat
+import inspect
 import logging
 from ross3d.utils import rank0_print
 
@@ -691,6 +693,16 @@ class EVAVisionTransformer(nn.Module):
             if i == len(self.blocks) - 1:
                 continue
             if self.grad_checkpointing:
+                if os.getenv("ROSS3D_DEBUG_CHECKPOINT") == "1":
+                    supports_reentrant = "unknown"
+                    try:
+                        supports_reentrant = "use_reentrant" in inspect.signature(checkpoint).parameters
+                    except (TypeError, ValueError):
+                        pass
+                    rank0_print(
+                        "[checkpoint-debug][eva_vit] using checkpoint(blk, ...) "
+                        f"(supports use_reentrant={supports_reentrant})"
+                    )
                 x = checkpoint(blk, x, (rel_pos_bias,))
             else:
                 x = blk(x, rel_pos_bias=rel_pos_bias)

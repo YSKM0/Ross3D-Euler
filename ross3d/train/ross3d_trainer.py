@@ -318,6 +318,46 @@ class LengthGroupedSampler(Sampler):
 
 
 class Ross3DTrainer(Trainer):
+    def _maybe_init_param_ready_debug(self):
+        if not getattr(self.args, "verbose_logging", False):
+            return
+        if os.getenv("ROSS3D_DEBUG_PARAM_READY") != "1":
+            return
+        if hasattr(self, "_param_ready_handles"):
+            return
+        self._param_ready_counts = {}
+        self._param_ready_handles = []
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            self._param_ready_counts[name] = 0
+
+            def _make_hook(param_name):
+                def _hook(*_):
+                    self._param_ready_counts[param_name] += 1
+                return _hook
+
+            self._param_ready_handles.append(param.register_hook(_make_hook(name)))
+        rank0_print(
+            "[checkpoint-debug] ROSS3D_DEBUG_PARAM_READY enabled; "
+            f"tracking {len(self._param_ready_counts)} trainable params"
+        )
+
+    def training_step(self, model, inputs):
+        self._maybe_init_param_ready_debug()
+        if hasattr(self, "_param_ready_counts"):
+            for name in self._param_ready_counts:
+                self._param_ready_counts[name] = 0
+        loss = super().training_step(model, inputs)
+        if hasattr(self, "_param_ready_counts") and self._param_ready_counts:
+            repeated = [name for name, count in self._param_ready_counts.items() if count > 1]
+            if repeated:
+                repeated_preview = ", ".join(repeated[:5])
+                rank0_print(
+                    "[checkpoint-debug] parameters with multiple grad hooks in step "
+                    f"{self.state.global_step}: {repeated_preview}"
+                )
+        return loss
     def _wrap_model(self, model, training=True, dataloader=None):
         model = super()._wrap_model(model, training=training, dataloader=dataloader)
         if not training:
@@ -325,10 +365,17 @@ class Ross3DTrainer(Trainer):
         if not getattr(self.args, "gradient_checkpointing", False):
             return model
         if self.is_fsdp_enabled or self.is_deepspeed_enabled:
+            if getattr(self.args, "verbose_logging", False):
+                rank0_print(
+                    "[checkpoint-debug] skipping DDP static graph; "
+                    f"fsdp={self.is_fsdp_enabled}, deepspeed={self.is_deepspeed_enabled}"
+                )
             return model
         if isinstance(model, torch.nn.parallel.DistributedDataParallel) and hasattr(model, "_set_static_graph"):
             rank0_print("[trainer] Enabling DDP static graph to avoid checkpoint re-entrancy issues.")
             model._set_static_graph()
+            if getattr(self.args, "verbose_logging", False):
+                rank0_print("[checkpoint-debug] DDP static graph enabled")
         return model
 
     def _log_optimizer_state(self, tag: str) -> None:
