@@ -589,8 +589,6 @@ class Ross3DTrainer(Trainer):
                 ]
 
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
-            if optimizer_cls is torch.optim.AdamW:
-                optimizer_kwargs["foreach"] = self.args.adamw_use_foreach
 
             self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
             if optimizer_cls.__name__ == "Adam8bit":

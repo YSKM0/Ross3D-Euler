@@ -239,20 +239,12 @@ class TrainingArguments(transformers.TrainingArguments):
     group_by_modality_length_auto: bool = field(default=False)
     auto_find_batch_size: bool = field(default=False)
     gradient_checkpointing: bool = field(default=True)
-    gradient_checkpointing_use_reentrant: bool = field(
-        default=False,
-        metadata={"help": "Use reentrant gradient checkpointing (set False to avoid DDP re-entrant errors)."},
-    )
     ddp_find_unused_parameters: Optional[bool] = field(
         default=True,
         metadata={"help": "Enable DDP unused parameter detection (useful for conditional losses)."},
     )
     verbose_logging: bool = field(default=False)
     attn_implementation: str = field(default="flash_attention_2", metadata={"help": "Use transformers attention implementation."})
-    adamw_use_foreach: bool = field(
-        default=True,
-        metadata={"help": "Use foreach multi-tensor ops in AdamW (can increase peak memory)."},
-    )
 
 
 # @dataclass
@@ -1661,9 +1653,7 @@ def train(attn_implementation=None):
     if training_args.gradient_checkpointing:
         if hasattr(model, "gradient_checkpointing_enable"):
             try:
-                model.gradient_checkpointing_enable(
-                    gradient_checkpointing_kwargs={"use_reentrant": training_args.gradient_checkpointing_use_reentrant}
-                )
+                model.gradient_checkpointing_enable()
             except TypeError:
                 model.gradient_checkpointing_enable()
         if hasattr(model, "enable_input_require_grads"):
