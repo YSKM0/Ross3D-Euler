@@ -47,6 +47,8 @@ class Ross3DQwenConfig(Qwen2Config):
         self.cycle_geo_sigma = kwargs.get("cycle_geo_sigma", None)
         self.cycle_topk = kwargs.get("cycle_topk", 32)
         self.cycle_filter_positive_depth = kwargs.get("cycle_filter_positive_depth", True)
+        self.cycle_debug_memory = kwargs.get("cycle_debug_memory", False)
+        self.use_3d_coordinate = kwargs.get("use_3d_coordinate", True)
 
 
 class Ross3DQwenModel(Ross3DMetaModel, Qwen2Model):

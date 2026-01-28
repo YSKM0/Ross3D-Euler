@@ -169,6 +169,18 @@ class ModelArguments:
             "help": "Filter cycle-consistency patches by positive depth (z > 0).",
         },
     )
+    cycle_debug_memory: bool = field(
+        default=False,
+        metadata={
+            "help": "Log CUDA memory stats at key points in cycle-consistency losses.",
+        },
+    )
+    use_3d_coordinate: bool = field(
+        default=True,
+        metadata={
+            "help": "Enable 3D coordinate usage in cycle-consistency losses when world coordinates are available.",
+        },
+    )
 
 @dataclass
 class DataArguments:
@@ -227,8 +239,20 @@ class TrainingArguments(transformers.TrainingArguments):
     group_by_modality_length_auto: bool = field(default=False)
     auto_find_batch_size: bool = field(default=False)
     gradient_checkpointing: bool = field(default=True)
+    gradient_checkpointing_use_reentrant: bool = field(
+        default=False,
+        metadata={"help": "Use reentrant gradient checkpointing (set False to avoid DDP re-entrant errors)."},
+    )
+    ddp_find_unused_parameters: Optional[bool] = field(
+        default=True,
+        metadata={"help": "Enable DDP unused parameter detection (useful for conditional losses)."},
+    )
     verbose_logging: bool = field(default=False)
     attn_implementation: str = field(default="flash_attention_2", metadata={"help": "Use transformers attention implementation."})
+    adamw_use_foreach: bool = field(
+        default=True,
+        metadata={"help": "Use foreach multi-tensor ops in AdamW (can increase peak memory)."},
+    )
 
 
 # @dataclass
@@ -1570,6 +1594,8 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
     setattr(model.config, "cycle_feature_source", model_args.cycle_feature_source)
     setattr(model.config, "cycle_geo_mode", model_args.cycle_geo_mode)
     setattr(model.config, "cycle_filter_positive_depth", model_args.cycle_filter_positive_depth)
+    setattr(model.config, "cycle_debug_memory", model_args.cycle_debug_memory)
+    setattr(model.config, "use_3d_coordinate", model_args.use_3d_coordinate)
     
     return model
 
@@ -1633,6 +1659,13 @@ def train(attn_implementation=None):
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=training_args.gradient_checkpointing)
 
     if training_args.gradient_checkpointing:
+        if hasattr(model, "gradient_checkpointing_enable"):
+            try:
+                model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": training_args.gradient_checkpointing_use_reentrant}
+                )
+            except TypeError:
+                model.gradient_checkpointing_enable()
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
         else:

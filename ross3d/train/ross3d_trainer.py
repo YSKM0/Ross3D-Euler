@@ -318,6 +318,89 @@ class LengthGroupedSampler(Sampler):
 
 
 class Ross3DTrainer(Trainer):
+    def _wrap_model(self, model, training=True, dataloader=None):
+        model = super()._wrap_model(model, training=training, dataloader=dataloader)
+        if not training:
+            return model
+        if not getattr(self.args, "gradient_checkpointing", False):
+            return model
+        if self.is_fsdp_enabled or self.is_deepspeed_enabled:
+            return model
+        if isinstance(model, torch.nn.parallel.DistributedDataParallel) and hasattr(model, "_set_static_graph"):
+            rank0_print("[trainer] Enabling DDP static graph to avoid checkpoint re-entrancy issues.")
+            model._set_static_graph()
+        return model
+
+    def _log_optimizer_state(self, tag: str) -> None:
+        model = getattr(self, "model", None)
+        if model is None:
+            return
+        if not getattr(getattr(model, "config", None), "cycle_debug_memory", False):
+            return
+        optimizer = getattr(self, "optimizer", None)
+        if optimizer is None:
+            return
+        grad_numel = 0
+        grad_bytes = 0
+        param_numel = 0
+        param_bytes = 0
+        for param in model.parameters():
+            if not param.requires_grad:
+                continue
+            param_numel += param.numel()
+            param_bytes += param.numel() * param.element_size()
+            if param.grad is not None:
+                grad_numel += param.grad.numel()
+                grad_bytes += param.grad.numel() * param.grad.element_size()
+        state_numel = 0
+        state_bytes = 0
+        state_tensors = 0
+        for state in optimizer.state.values():
+            if isinstance(state, dict):
+                values = state.values()
+            else:
+                values = [state]
+            for value in values:
+                if torch.is_tensor(value):
+                    state_tensors += 1
+                    state_numel += value.numel()
+                    state_bytes += value.numel() * value.element_size()
+        rank0_print(
+            "[trainer][optimizer_state] "
+            f"{tag}: params={param_numel:,} "
+            f"({param_bytes / 1024 ** 3:.2f}GB), "
+            f"grads={grad_numel:,} "
+            f"({grad_bytes / 1024 ** 3:.2f}GB), "
+            f"state_tensors={state_tensors:,}, "
+            f"state_numel={state_numel:,} "
+            f"({state_bytes / 1024 ** 3:.2f}GB)"
+        )
+
+    def _log_cuda_memory(self, tag: str) -> None:
+        if not torch.cuda.is_available():
+            return
+        model = getattr(self, "model", None)
+        if model is None:
+            return
+        if not getattr(getattr(model, "config", None), "cycle_debug_memory", False):
+            return
+        allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+        reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+        max_alloc = torch.cuda.max_memory_allocated() / (1024 ** 3)
+        rank0_print(
+            "[trainer][cuda_mem] "
+            f"{tag}: allocated={allocated:.2f}GB, "
+            f"reserved={reserved:.2f}GB, "
+            f"max_allocated={max_alloc:.2f}GB"
+        )
+
+    def optimizer_step(self, *args, **kwargs):
+        self._log_cuda_memory("before_optimizer_step")
+        self._log_optimizer_state("before_optimizer_step")
+        result = super().optimizer_step(*args, **kwargs)
+        self._log_cuda_memory("after_optimizer_step")
+        self._log_optimizer_state("after_optimizer_step")
+        return result
 
     def create_accelerator_and_postprocess(self):
         grad_acc_kwargs = {"num_steps": self.args.gradient_accumulation_steps}
@@ -506,6 +589,8 @@ class Ross3DTrainer(Trainer):
                 ]
 
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
+            if optimizer_cls is torch.optim.AdamW:
+                optimizer_kwargs["foreach"] = self.args.adamw_use_foreach
 
             self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
             if optimizer_cls.__name__ == "Adam8bit":

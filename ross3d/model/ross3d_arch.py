@@ -1370,6 +1370,20 @@ class Ross3DMetaForCausalLM(ABC):
         - geometry similarity:  -||x_t - x_{t+1}||^2 / (2*sigma^2)
         - optional top-k sparsification per row for stability
         """
+        def _log_cycle_cuda_memory(tag: str) -> None:
+            if not getattr(self.config, "cycle_debug_memory", False):
+                return
+            if not torch.cuda.is_available():
+                return
+            allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+            reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+            max_alloc = torch.cuda.max_memory_allocated() / (1024 ** 3)
+            rank0_print(
+                "[cycle_consistency_loss][cuda_mem] "
+                f"{tag}: allocated={allocated:.2f}GB, "
+                f"reserved={reserved:.2f}GB, "
+                f"max_allocated={max_alloc:.2f}GB"
+            )
 
         B = hidden_states.shape[0]
         assert B == 1, "Cycle consistency implemented for batch_size==1"
@@ -1440,6 +1454,13 @@ class Ross3DMetaForCausalLM(ABC):
             )
             return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
 
+        _log_cycle_cuda_memory("after_frame_selection")
+
+        rank0_print(
+            "[cycle_consistency_loss] transition_matrix_info "
+            f"P={P}, transition_matrix_size=({P}, {P}), selected_frames={S}"
+        )
+
         # ---- 3) Feature source selection + normalization
         feature_source = getattr(self.config, "cycle_feature_source", "llm")
         if feature_source == "inv_projector":
@@ -1466,25 +1487,31 @@ class Ross3DMetaForCausalLM(ABC):
         # ---- 4) Build per-patch 3D coords [S, P, 3]
         coords = None
         valid_patch = None
-        if (video_dict is not None) and ("world_coords" in video_dict):
+        if (
+            (video_dict is not None)
+            and ("world_coords" in video_dict)
+            and getattr(self.config, "use_3d_coordinate", True)
+        ):
             # video_dict["world_coords"] shape is [B, V, H, W, 3] after merge_video_dict
-            wc = video_dict["world_coords"][0]  # [V, H, W, 3]
-            # average_coordinate_in_patch gives [V, 14, 14, 3]
-            wc_p = self.average_coordinate_in_patch(wc)  # [V, 14, 14, 3]
-            wc_p = wc_p.reshape(wc_p.shape[0], -1, 3)    # [V, 196, 3]
-            coords = wc_p[sel].to(device=hidden_states.device, dtype=torch.float32)
+            with torch.no_grad():
+                wc = video_dict["world_coords"][0]  # [V, H, W, 3]
+                # average_coordinate_in_patch gives [V, 14, 14, 3]
+                wc_p = self.average_coordinate_in_patch(wc)  # [V, 14, 14, 3]
+                wc_p = wc_p.reshape(wc_p.shape[0], -1, 3)    # [V, 196, 3]
+                coords = wc_p[sel].to(device=hidden_states.device, dtype=torch.float32)
 
-            if getattr(self.config, "cycle_filter_positive_depth", True):
-                # invalid depth in your pipeline becomes (0,0,0) often; treat z<=0 as invalid
-                valid_patch = (coords[..., 2] > 0.0)  # [S, P]
-                if (~valid_patch).any():
-                    rank0_print(
-                        "[cycle_consistency_loss] Detected non-positive depth patches; "
-                        f"invalid_count={(~valid_patch).sum().item()}."
-                    )
+                if getattr(self.config, "cycle_filter_positive_depth", True):
+                    # invalid depth in your pipeline becomes (0,0,0) often; treat z<=0 as invalid
+                    valid_patch = (coords[..., 2] > 0.0)  # [S, P]
+                    if (~valid_patch).any():
+                        rank0_print(
+                            "[cycle_consistency_loss] Detected non-positive depth patches; "
+                            f"invalid_count={(~valid_patch).sum().item()}."
+                        )
 
         # if no coords, fall back to appearance-only (still works)
         use_geo = coords is not None
+        _log_cycle_cuda_memory(f"after_coords_build use_geo={use_geo}")
 
         # choose sigma automatically if not provided
         if use_geo and (geo_sigma is None):
@@ -1519,27 +1546,30 @@ class Ross3DMetaForCausalLM(ABC):
             # appearance logits
             logit_app_fwd = (Fa @ Fb.T) / tau_app
             logit_app_bwd = (Fb @ Fa.T) / tau_app
+            if step == 0:
+                _log_cycle_cuda_memory("after_first_logit_app")
 
             if use_geo:
-                Xa = coords[step]     # [P, 3]
-                Xb = coords[step + 1] # [P, 3]
+                with torch.no_grad():
+                    Xa = coords[step]     # [P, 3]
+                    Xb = coords[step + 1] # [P, 3]
 
-                # squared distances [P, P]
-                # (Xa[:,None,:] - Xb[None,:,:])^2 sum
-                diff = Xa[:, None, :] - Xb[None, :, :]
-                geo_mode = getattr(self.config, "cycle_geo_mode", "raw")
-                if geo_mode == "clamped":
-                    min_xyz = torch.tensor(self.config.min_xyz_range, device=diff.device, dtype=diff.dtype)
-                    max_xyz = torch.tensor(self.config.max_xyz_range, device=diff.device, dtype=diff.dtype)
-                    Xa_c = torch.clamp(Xa, min=min_xyz, max=max_xyz)
-                    Xb_c = torch.clamp(Xb, min=min_xyz, max=max_xyz)
-                    diff = Xa_c[:, None, :] - Xb_c[None, :, :]
-                    dist = torch.linalg.norm(diff, dim=-1)
-                    d_max = torch.linalg.norm(max_xyz - min_xyz).clamp_min(1e-6)
-                    logit_geo = 1.0 - (2.0 * dist / d_max)
-                else:
-                    dist2 = (diff * diff).sum(dim=-1)  # [P, P]
-                    logit_geo = -dist2 / (2.0 * (geo_sigma ** 2))
+                    # squared distances [P, P]
+                    # (Xa[:,None,:] - Xb[None,:,:])^2 sum
+                    diff = Xa[:, None, :] - Xb[None, :, :]
+                    geo_mode = getattr(self.config, "cycle_geo_mode", "raw")
+                    if geo_mode == "clamped":
+                        min_xyz = torch.tensor(self.config.min_xyz_range, device=diff.device, dtype=diff.dtype)
+                        max_xyz = torch.tensor(self.config.max_xyz_range, device=diff.device, dtype=diff.dtype)
+                        Xa_c = torch.clamp(Xa, min=min_xyz, max=max_xyz)
+                        Xb_c = torch.clamp(Xb, min=min_xyz, max=max_xyz)
+                        diff = Xa_c[:, None, :] - Xb_c[None, :, :]
+                        dist = torch.linalg.norm(diff, dim=-1)
+                        d_max = torch.linalg.norm(max_xyz - min_xyz).clamp_min(1e-6)
+                        logit_geo = 1.0 - (2.0 * dist / d_max)
+                    else:
+                        dist2 = (diff * diff).sum(dim=-1)  # [P, P]
+                        logit_geo = -dist2 / (2.0 * (geo_sigma ** 2))
 
                 logit_fwd = logit_app_fwd + (logit_geo / tau_geo)
                 logit_bwd = logit_app_bwd + (logit_geo.T / tau_geo)
@@ -1582,6 +1612,8 @@ class Ross3DMetaForCausalLM(ABC):
 
             A_fwd.append(F.softmax(logit_fwd, dim=-1))
             A_bwd.append(F.softmax(logit_bwd, dim=-1))
+            if step == 0:
+                _log_cycle_cuda_memory("after_first_transition")
 
         # ---- 6) Compose forward then backward
         if len(A_fwd) != (S - 1):
@@ -1599,6 +1631,7 @@ class Ross3DMetaForCausalLM(ABC):
             A_bw = A_bw @ A_bwd[k]   # [P, P]
 
         M = A_fw @ A_bw  # [P, P]
+        _log_cycle_cuda_memory("after_cycle_matrix")
 
         diag = torch.diagonal(M, dim1=-2, dim2=-1)  # [P]
 
@@ -1638,9 +1671,22 @@ class Ross3DMetaForCausalLM(ABC):
         - appearance logits: (Fa @ Fb^T)  (cosine sim since feats normalized)
         - geometry logits:   -||Xa - Xb||^2 / (2*sigma^2)
         - normalization: masked z-score for app and geo logits so neither dominates
-        - transitions for CRW: softmax( app_z/tau_app + lambda * geo_z/tau_geo )
         - guidance loss: KL( q_geo || p_app ) row-wise + column-wise (symmetry)
         """
+        def _log_cycle_cuda_memory(tag: str) -> None:
+            if not getattr(self.config, "cycle_debug_memory", False):
+                return
+            if not torch.cuda.is_available():
+                return
+            allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+            reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+            max_alloc = torch.cuda.max_memory_allocated() / (1024 ** 3)
+            rank0_print(
+                "[cycle_consistency_loss_v2][cuda_mem] "
+                f"{tag}: allocated={allocated:.2f}GB, "
+                f"reserved={reserved:.2f}GB, "
+                f"max_allocated={max_alloc:.2f}GB"
+            )
 
         B = hidden_states.shape[0]
         assert B == 1, "Cycle consistency implemented for batch_size==1"
@@ -1711,6 +1757,8 @@ class Ross3DMetaForCausalLM(ABC):
             )
             return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
 
+        _log_cycle_cuda_memory("after_frame_selection")
+
         # ---- 3) Feature source selection + normalization
         feature_source = getattr(self.config, "cycle_feature_source", "llm")
         if feature_source == "inv_projector":
@@ -1736,16 +1784,22 @@ class Ross3DMetaForCausalLM(ABC):
         # ---- 4) Build per-patch 3D coords [S, P, 3] (WORLD coords)
         coords = None
         valid_patch = None
-        if (video_dict is not None) and ("world_coords" in video_dict):
-            wc = video_dict["world_coords"][0]           # [V, H, W, 3]
-            wc_p = self.average_coordinate_in_patch(wc)  # [V, 14, 14, 3]
-            wc_p = wc_p.reshape(wc_p.shape[0], -1, 3)    # [V, 196, 3]
-            coords = wc_p[sel].to(device=hidden_states.device, dtype=torch.float32)
+        if (
+            (video_dict is not None)
+            and ("world_coords" in video_dict)
+            and getattr(self.config, "use_3d_coordinate", True)
+        ):
+            with torch.no_grad():
+                wc = video_dict["world_coords"][0]           # [V, H, W, 3]
+                wc_p = self.average_coordinate_in_patch(wc)  # [V, 14, 14, 3]
+                wc_p = wc_p.reshape(wc_p.shape[0], -1, 3)    # [V, 196, 3]
+                coords = wc_p[sel].to(device=hidden_states.device, dtype=torch.float32)
 
-            if getattr(self.config, "cycle_filter_positive_depth", True):
-                valid_patch = (coords[..., 2] > 0.0)  # [S, P]
+                if getattr(self.config, "cycle_filter_positive_depth", True):
+                    valid_patch = (coords[..., 2] > 0.0)  # [S, P]
 
         use_geo = coords is not None
+        _log_cycle_cuda_memory(f"after_coords_build use_geo={use_geo}")
 
         # choose sigma automatically if not provided (your existing robust heuristic)
         if use_geo and (geo_sigma is None):
@@ -1848,8 +1902,7 @@ class Ross3DMetaForCausalLM(ABC):
 
             return kl_row + kl_col
 
-        # ---- 5) Build neighbor transitions (CRW) + guidance loss
-        A_fwd, A_bwd = [], []
+        # ---- 5) Guidance loss
         if torch.is_tensor(temperature_app):
             tau_app = temperature_app
         else:
@@ -1860,9 +1913,8 @@ class Ross3DMetaForCausalLM(ABC):
             )
         tau_geo = float(temperature_geo)
 
-        # weight for KL guidance and weight for geo in fused transition logits
+        # weight for KL guidance
         kl_w = float(getattr(self.config, "cycle_geo_kl_weight", 1.0))
-        geo_w = float(getattr(self.config, "cycle_geo_fuse_weight", 1.0))
 
         guidance_loss = torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
 
@@ -1873,28 +1925,31 @@ class Ross3DMetaForCausalLM(ABC):
             # appearance logits (NOT yet divided by tau; we z-score first)
             logit_app_fwd = (Fa @ Fb.T)  # [P, P]
             logit_app_bwd = (Fb @ Fa.T)  # [P, P]
+            if step == 0:
+                _log_cycle_cuda_memory("after_first_logit_app")
 
             if use_geo:
-                Xa = coords[step]        # [P, 3]
-                Xb = coords[step + 1]    # [P, 3]
+                with torch.no_grad():
+                    Xa = coords[step]        # [P, 3]
+                    Xb = coords[step + 1]    # [P, 3]
 
-                diff = Xa[:, None, :] - Xb[None, :, :]   # [P, P, 3]
-                geo_mode = getattr(self.config, "cycle_geo_mode", "raw")
-                if geo_mode == "clamped":
-                    min_xyz = torch.tensor(self.config.min_xyz_range, device=diff.device, dtype=diff.dtype)
-                    max_xyz = torch.tensor(self.config.max_xyz_range, device=diff.device, dtype=diff.dtype)
-                    Xa_c = torch.clamp(Xa, min=min_xyz, max=max_xyz)
-                    Xb_c = torch.clamp(Xb, min=min_xyz, max=max_xyz)
-                    diff = Xa_c[:, None, :] - Xb_c[None, :, :]
-                    dist = torch.linalg.norm(diff, dim=-1)
-                    d_max = torch.linalg.norm(max_xyz - min_xyz).clamp_min(1e-6)
-                    logit_geo_fwd = 1.0 - (2.0 * dist / d_max)
-                    logit_geo_bwd = logit_geo_fwd.T
-                else:
-                    dist2 = (diff * diff).sum(dim=-1)        # [P, P]
-                    logit_geo = -dist2 / (2.0 * (geo_sigma ** 2))  # [P, P]
-                    logit_geo_fwd = logit_geo
-                    logit_geo_bwd = logit_geo.T
+                    diff = Xa[:, None, :] - Xb[None, :, :]   # [P, P, 3]
+                    geo_mode = getattr(self.config, "cycle_geo_mode", "raw")
+                    if geo_mode == "clamped":
+                        min_xyz = torch.tensor(self.config.min_xyz_range, device=diff.device, dtype=diff.dtype)
+                        max_xyz = torch.tensor(self.config.max_xyz_range, device=diff.device, dtype=diff.dtype)
+                        Xa_c = torch.clamp(Xa, min=min_xyz, max=max_xyz)
+                        Xb_c = torch.clamp(Xb, min=min_xyz, max=max_xyz)
+                        diff = Xa_c[:, None, :] - Xb_c[None, :, :]
+                        dist = torch.linalg.norm(diff, dim=-1)
+                        d_max = torch.linalg.norm(max_xyz - min_xyz).clamp_min(1e-6)
+                        logit_geo_fwd = 1.0 - (2.0 * dist / d_max)
+                        logit_geo_bwd = logit_geo_fwd.T
+                    else:
+                        dist2 = (diff * diff).sum(dim=-1)        # [P, P]
+                        logit_geo = -dist2 / (2.0 * (geo_sigma ** 2))  # [P, P]
+                        logit_geo_fwd = logit_geo
+                        logit_geo_bwd = logit_geo.T
 
                 # mask invalid patches (rows/cols)
                 if valid_patch is not None:
@@ -1952,75 +2007,11 @@ class Ross3DMetaForCausalLM(ABC):
                     )
                     guidance_loss = guidance_loss + 0.5 * (g_f + g_b)
 
-                # ---- v2 fused transition logits for CRW (z-score each, then combine)
-                app_f = _masked_zscore(logit_app_fwd, dim=-1, eps_=eps)
-                geo_f = _masked_zscore(logit_geo_fwd, dim=-1, eps_=eps)
-                logit_fwd = (app_f / tau_app) + geo_w * (geo_f / tau_geo)
-
-                app_b = _masked_zscore(logit_app_bwd, dim=-1, eps_=eps)
-                geo_b = _masked_zscore(logit_geo_bwd, dim=-1, eps_=eps)
-                logit_bwd = (app_b / tau_app) + geo_w * (geo_b / tau_geo)
-
-            else:
-                # appearance-only (still z-score + temperature for stability)
-                app_f = _masked_zscore(logit_app_fwd, dim=-1, eps_=eps)
-                app_b = _masked_zscore(logit_app_bwd, dim=-1, eps_=eps)
-                logit_fwd = app_f / tau_app
-                logit_bwd = app_b / tau_app
-
-            # top-k sparsification (same behavior as your original)
-            if (topk is not None) and (topk < P):
-                v, idx = torch.topk(logit_fwd, k=topk, dim=-1)
-                sparse = torch.full_like(logit_fwd, float("-inf"))
-                sparse.scatter_(-1, idx, v)
-                logit_fwd = sparse
-
-                v, idx = torch.topk(logit_bwd, k=topk, dim=-1)
-                sparse = torch.full_like(logit_bwd, float("-inf"))
-                sparse.scatter_(-1, idx, v)
-                logit_bwd = sparse
-
-            A_fwd.append(F.softmax(logit_fwd, dim=-1))
-            A_bwd.append(F.softmax(logit_bwd, dim=-1))
-
         # average guidance loss over steps
         if use_geo and (S > 1) and (kl_w > 0.0):
             guidance_loss = guidance_loss / float(S - 1)
         else:
             guidance_loss = torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
-
-        # ---- 6) Compose forward then backward (same as your original)
-        if len(A_fwd) != (S - 1):
-            rank0_print(
-                "[cycle_consistency_loss_v2] Disabled: transition list length mismatch. "
-                f"len(A_fwd)={len(A_fwd)}, expected={S - 1}, S={S}."
-            )
-            return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
-
-        A_fw = A_fwd[0]
-        for k in range(1, S - 1):
-            A_fw = A_fw @ A_fwd[k]   # [P, P]
-
-        A_bw = A_bwd[-1]
-        for k in range(S - 3, -1, -1):
-            A_bw = A_bw @ A_bwd[k]   # [P, P]
-
-        M = A_fw @ A_bw  # [P, P]
-        diag = torch.diagonal(M, dim1=-2, dim2=-1)  # [P]
-
-        # if valid_patch exists, only score patches valid in the first selected frame
-        if valid_patch is not None:
-            v0 = valid_patch[0]
-            if v0.any():
-                diag = diag[v0]
-            else:
-                rank0_print(
-                    "[cycle_consistency_loss_v2] Disabled: no valid patches in first selected frame. "
-                    f"valid_patch_shape={valid_patch.shape}, selected_frames={sel.tolist()}."
-                )
-                return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
-
-        _ = diag # cycle_loss = -torch.log(diag + eps).mean()
 
         # total loss = CRW cycle loss + KL guidance (weight from config)
         # loss = cycle_loss + kl_w * guidance_loss
