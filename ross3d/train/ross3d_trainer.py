@@ -348,7 +348,9 @@ class Ross3DTrainer(Trainer):
         if hasattr(self, "_param_ready_counts"):
             for name in self._param_ready_counts:
                 self._param_ready_counts[name] = 0
+        self._log_cuda_memory("before_training_step")
         loss = super().training_step(model, inputs)
+        self._log_cuda_memory("after_training_step")
         if hasattr(self, "_param_ready_counts") and self._param_ready_counts:
             repeated = [name for name, count in self._param_ready_counts.items() if count > 1]
             if repeated:

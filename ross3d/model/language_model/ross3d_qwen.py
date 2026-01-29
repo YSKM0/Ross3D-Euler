@@ -48,6 +48,7 @@ class Ross3DQwenConfig(Qwen2Config):
         self.cycle_topk = kwargs.get("cycle_topk", 32)
         self.cycle_filter_positive_depth = kwargs.get("cycle_filter_positive_depth", True)
         self.cycle_debug_memory = kwargs.get("cycle_debug_memory", False)
+        self.cycle_detach_hidden_states = kwargs.get("cycle_detach_hidden_states", True)
         self.use_3d_coordinate = kwargs.get("use_3d_coordinate", True)
 
 
@@ -368,8 +369,19 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             getattr(self.config, "cycle_consist_v2", False)
             or getattr(self.config, "cycle_consist", False)
         ):
+            cycle_hidden_states = hidden_states
+            grad_anchor = None
+            if getattr(self.config, "cycle_detach_hidden_states", False):
+                cycle_hidden_states = hidden_states.detach()
+                grad_anchor = hidden_states.float().mean()
+                if getattr(self.config, "verbose_logging", False):
+                    rank_print(
+                        "[cycle_consistency_loss] using detached hidden_states with scalar grad anchor; "
+                        f"hidden_states_requires_grad={hidden_states.requires_grad}, "
+                        f"detached_requires_grad={cycle_hidden_states.requires_grad}"
+                    )
             cycle_kwargs = dict(
-                hidden_states=hidden_states,
+                hidden_states=cycle_hidden_states,
                 boi_ids=boi_ids,
                 eoi_ids=eoi_ids,
                 newline_ids=newline_ids,
@@ -385,6 +397,8 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
                 cycle_loss = self.compute_cycle_consistency_loss_v2(**cycle_kwargs)
             else:
                 cycle_loss = self.compute_cycle_consistency_loss(**cycle_kwargs)
+            if grad_anchor is not None:
+                cycle_loss = cycle_loss * (grad_anchor / grad_anchor.detach())
 
             loss = loss + getattr(self.config, "cycle_consist_weight", 1.0) * cycle_loss
 

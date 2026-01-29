@@ -1155,6 +1155,21 @@ class Ross3DMetaForCausalLM(ABC):
         newline_ids: torch.Tensor,
         mask: torch.Tensor,
     ):
+        def _log_vm_cuda_memory(tag: str) -> None:
+            if not getattr(self.config, "cycle_debug_memory", False):
+                return
+            if not torch.cuda.is_available():
+                return
+            allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+            reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+            max_alloc = torch.cuda.max_memory_allocated() / (1024 ** 3)
+            rank0_print(
+                "[vm_loss][cuda_mem] "
+                f"{tag}: allocated={allocated:.2f}GB, "
+                f"reserved={reserved:.2f}GB, "
+                f"max_allocated={max_alloc:.2f}GB"
+            )
+
         batch_size = hidden_states.shape[0]
         assert batch_size == 1 and len(images) == 1
         images = images[0]
@@ -1180,6 +1195,8 @@ class Ross3DMetaForCausalLM(ABC):
                 cur_hidden_states.append(hidden_states[0][newline_ids[(frame_index + 1) * patch_h - 1] + 1 : cur_eoi_id])
                 image_hidden_states[frame_index] = torch.cat(cur_hidden_states)
 
+        _log_vm_cuda_memory("after_hidden_states")
+
         images_std = torch.tensor(self.config.image_std, device=images.device, dtype=images.dtype).view(1, -1, 1, 1)
         images_mean = torch.tensor(self.config.image_mean, device=images.device, dtype=images.dtype).view(1, -1, 1, 1)
         images_vae = ((images * images_std + images_mean - 0.5) / 0.5).clamp(-1., 1.)
@@ -1202,6 +1219,8 @@ class Ross3DMetaForCausalLM(ABC):
             z_q = z_q.unfold(2, 2, 2).unfold(3, 2, 2)
             z_q = rearrange(z_q, 'b c h w p1 p2 -> b (c p1 p2) h w').contiguous()
 
+        _log_vm_cuda_memory("after_latents")
+
         with torch.amp.autocast('cuda', dtype=torch.float32):
             # image_hidden_states = self.model.mm_inv_projector.ln_pre(
             #     image_hidden_states) + self.model.mm_inv_projector.pos_embed
@@ -1214,6 +1233,7 @@ class Ross3DMetaForCausalLM(ABC):
                 bev=False,
             )
         vm_loss = vm_loss.float().mean()
+        _log_vm_cuda_memory("after_vm_loss")
         return vm_loss
 
 
@@ -1288,6 +1308,21 @@ class Ross3DMetaForCausalLM(ABC):
         bev_image: torch.Tensor,
         mask: torch.Tensor,
     ):
+        def _log_bev_cuda_memory(tag: str) -> None:
+            if not getattr(self.config, "cycle_debug_memory", False):
+                return
+            if not torch.cuda.is_available():
+                return
+            allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+            reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+            max_alloc = torch.cuda.max_memory_allocated() / (1024 ** 3)
+            rank0_print(
+                "[bev_loss][cuda_mem] "
+                f"{tag}: allocated={allocated:.2f}GB, "
+                f"reserved={reserved:.2f}GB, "
+                f"max_allocated={max_alloc:.2f}GB"
+            )
+
         batch_size = hidden_states.shape[0]
         assert batch_size == 1 and len(images) == 1
         images = images[0]
@@ -1313,6 +1348,8 @@ class Ross3DMetaForCausalLM(ABC):
                 cur_hidden_states.append(hidden_states[0][newline_ids[(frame_index + 1) * patch_h - 1] + 1 : cur_eoi_id])
                 image_hidden_states[frame_index] = torch.cat(cur_hidden_states)
 
+        _log_bev_cuda_memory("after_hidden_states")
+
         images_vae = ((bev_image - 0.5) / 0.5).clamp(-1., 1.)
 
         if mask.sum() > 0:
@@ -1331,6 +1368,8 @@ class Ross3DMetaForCausalLM(ABC):
             bev_downsample = torch.nn.functional.interpolate(bev_image, size=(z_q.shape[-2], z_q.shape[-1]), mode='bilinear').mean(dim=1)
             loss_mask = (bev_downsample.unsqueeze(1) > 0).bool().repeat(1, z_q.shape[1], 1, 1)
 
+        _log_bev_cuda_memory("after_latents")
+
         with torch.amp.autocast('cuda', dtype=torch.float32):
             # image_hidden_states = self.model.mm_inv_projector.ln_pre(
             #     image_hidden_states) + self.model.mm_inv_projector.pos_embed
@@ -1344,6 +1383,7 @@ class Ross3DMetaForCausalLM(ABC):
             )
         vm_loss = (vm_loss.float() * loss_mask).sum() / loss_mask.sum()
         # vm_loss = vm_loss.float().mean()
+        _log_bev_cuda_memory("after_bev_loss")
         return vm_loss
 
 

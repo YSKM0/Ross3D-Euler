@@ -179,6 +179,13 @@ class ModelArguments:
             "help": "Log CUDA memory stats at key points in cycle-consistency losses.",
         },
     )
+    cycle_detach_hidden_states: bool = field(
+        default=True,
+        metadata={
+            "help": "Detach LLM hidden states before cycle-consistency loss to avoid DDP re-entrancy; "
+            "re-attach a single gradient path via a scalar anchor. Default: true.",
+        },
+    )
     use_3d_coordinate: bool = field(
         default=True,
         metadata={
@@ -1591,7 +1598,21 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
     setattr(model.config, "cycle_geo_mode", model_args.cycle_geo_mode)
     setattr(model.config, "cycle_filter_positive_depth", model_args.cycle_filter_positive_depth)
     setattr(model.config, "cycle_debug_memory", model_args.cycle_debug_memory)
+    setattr(model.config, "cycle_detach_hidden_states", model_args.cycle_detach_hidden_states)
     setattr(model.config, "use_3d_coordinate", model_args.use_3d_coordinate)
+
+    if training_args.gradient_checkpointing and (model_args.cycle_consist or model_args.cycle_consist_v2):
+        rank0_print(
+            "[trainer] Disabling gradient checkpointing due to cycle-consistency loss to avoid "
+            "DDP re-entrancy errors."
+        )
+        training_args.gradient_checkpointing = False
+        if hasattr(model, "gradient_checkpointing_disable"):
+            model.gradient_checkpointing_disable()
+        else:
+            setattr(model, "gradient_checkpointing", False)
+            if hasattr(model, "config"):
+                model.config.gradient_checkpointing = False
     
     return model
 
@@ -1658,17 +1679,31 @@ def train(attn_implementation=None):
         debug_calls_env = os.getenv("ROSS3D_DEBUG_CHECKPOINT_CALLS")
         debug_calls_enabled = debug_calls_env == "1" or (training_args.verbose_logging and debug_calls_env is None)
         base_checkpoint = torch.utils.checkpoint.checkpoint
+        supports_use_reentrant = False
+        try:
+            supports_use_reentrant = "use_reentrant" in inspect.signature(base_checkpoint).parameters
+        except (TypeError, ValueError):
+            supports_use_reentrant = False
+
+        def _non_reentrant_checkpoint(function, *args, **kwargs):
+            if supports_use_reentrant and "use_reentrant" not in kwargs:
+                kwargs["use_reentrant"] = False
+            return base_checkpoint(function, *args, **kwargs)
+
+        def _patch_module_checkpoint(module_name, wrapper):
+            module = sys.modules.get(module_name)
+            if module is not None and hasattr(module, "checkpoint"):
+                module.checkpoint = wrapper
+
         if debug_calls_enabled:
             debug_limit = int(os.getenv("ROSS3D_DEBUG_CHECKPOINT_CALLS_LIMIT", "10"))
             debug_count = {"count": 0}
 
             def _checkpoint_debug_wrapper(function, *args, **kwargs):
-                if "use_reentrant" not in kwargs:
+                if supports_use_reentrant and "use_reentrant" not in kwargs:
                     kwargs["use_reentrant"] = False
                     if debug_count["count"] < debug_limit:
-                        rank0_print(
-                            "[checkpoint-debug] checkpoint() injected use_reentrant=False"
-                        )
+                        rank0_print("[checkpoint-debug] checkpoint() injected use_reentrant=False")
                 if debug_count["count"] < debug_limit:
                     stack = inspect.stack()
                     caller = stack[1] if len(stack) > 1 else None
@@ -1681,15 +1716,10 @@ def train(attn_implementation=None):
                     debug_count["count"] += 1
                 return base_checkpoint(function, *args, **kwargs)
 
-            def _patch_module_checkpoint(module_name):
-                module = sys.modules.get(module_name)
-                if module is not None and hasattr(module, "checkpoint"):
-                    module.checkpoint = _checkpoint_debug_wrapper
-
             torch.utils.checkpoint.checkpoint = _checkpoint_debug_wrapper
-            _patch_module_checkpoint("ross3d.model.multimodal_encoder.eva_clip.eva_vit")
-            _patch_module_checkpoint("ross3d.model.multimodal_encoder.dev_eva_clip.eva_clip.eva_vit_model")
-            _patch_module_checkpoint("ross3d.model.multimodal_encoder.dev_eva_clip.eva_clip.transformer")
+            _patch_module_checkpoint("ross3d.model.multimodal_encoder.eva_clip.eva_vit", _checkpoint_debug_wrapper)
+            _patch_module_checkpoint("ross3d.model.multimodal_encoder.dev_eva_clip.eva_clip.eva_vit_model", _checkpoint_debug_wrapper)
+            _patch_module_checkpoint("ross3d.model.multimodal_encoder.dev_eva_clip.eva_clip.transformer", _checkpoint_debug_wrapper)
             if training_args.verbose_logging:
                 rank0_print(
                     "[checkpoint-debug] ROSS3D_DEBUG_CHECKPOINT_CALLS enabled; "
@@ -1721,6 +1751,11 @@ def train(attn_implementation=None):
                 "[checkpoint-debug] ROSS3D_DEBUG_CHECKPOINT_CALLS disabled "
                 "(set to 1 to log checkpoint callsites)"
             )
+        if supports_use_reentrant and not debug_calls_enabled:
+            torch.utils.checkpoint.checkpoint = _non_reentrant_checkpoint
+            _patch_module_checkpoint("ross3d.model.multimodal_encoder.eva_clip.eva_vit", _non_reentrant_checkpoint)
+            _patch_module_checkpoint("ross3d.model.multimodal_encoder.dev_eva_clip.eva_clip.eva_vit_model", _non_reentrant_checkpoint)
+            _patch_module_checkpoint("ross3d.model.multimodal_encoder.dev_eva_clip.eva_clip.transformer", _non_reentrant_checkpoint)
 
         def _build_checkpoint_func():
             checkpoint_func = base_checkpoint
@@ -1747,14 +1782,9 @@ def train(attn_implementation=None):
             return "checkpoint(default)"
 
         if training_args.verbose_logging:
-            supports_reentrant = "unknown"
-            try:
-                supports_reentrant = "use_reentrant" in inspect.signature(torch.utils.checkpoint.checkpoint).parameters
-            except (TypeError, ValueError):
-                pass
             rank0_print(
                 "[checkpoint-debug] gradient_checkpointing enabled; "
-                f"torch.checkpoint supports use_reentrant={supports_reentrant}"
+                f"torch.checkpoint supports use_reentrant={supports_use_reentrant}"
             )
             rank0_print(
                 "[checkpoint-debug] ROSS3D_DEBUG_CHECKPOINT="
