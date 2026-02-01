@@ -179,6 +179,18 @@ class ModelArguments:
             "help": "Log CUDA memory stats at key points in cycle-consistency losses.",
         },
     )
+    cycle_debug_grad: bool = field(
+        default=False,
+        metadata={
+            "help": "Log cycle-consistency gradient hooks and gradient participation stats.",
+        },
+    )
+    cycle_debug_optimizer: bool = field(
+        default=False,
+        metadata={
+            "help": "Log optimizer parameter counts to detect unexpected parameter registration.",
+        },
+    )
     cycle_detach_hidden_states: bool = field(
         default=True,
         metadata={
@@ -256,6 +268,12 @@ class TrainingArguments(transformers.TrainingArguments):
     )
     verbose_logging: bool = field(default=False)
     attn_implementation: str = field(default="flash_attention_2", metadata={"help": "Use transformers attention implementation."})
+    adamw_use_foreach: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": "Override torch.optim.AdamW foreach setting. Set False to reduce optimizer-step memory spikes.",
+        },
+    )
 
 
 # @dataclass
@@ -1598,8 +1616,11 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
     setattr(model.config, "cycle_geo_mode", model_args.cycle_geo_mode)
     setattr(model.config, "cycle_filter_positive_depth", model_args.cycle_filter_positive_depth)
     setattr(model.config, "cycle_debug_memory", model_args.cycle_debug_memory)
+    setattr(model.config, "cycle_debug_grad", model_args.cycle_debug_grad)
+    setattr(model.config, "cycle_debug_optimizer", model_args.cycle_debug_optimizer)
     setattr(model.config, "cycle_detach_hidden_states", model_args.cycle_detach_hidden_states)
     setattr(model.config, "use_3d_coordinate", model_args.use_3d_coordinate)
+    setattr(model.config, "verbose_logging", training_args.verbose_logging)
 
     if training_args.gradient_checkpointing and (model_args.cycle_consist or model_args.cycle_consist_v2):
         rank0_print(

@@ -7,30 +7,30 @@ echo "MID_RUN_NAME: ${MID_RUN_NAME}"
 set -x
 
 # gradient_accumulation_steps x per_device_train_batch_size x nproc_per_node = 256
-torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
+torchrun --nproc_per_node=4 --nnodes=1 --node_rank=0 \
     --master_addr="localhost" --master_port=20409 \
     \
     ross3d/train/train_3d.py \
     \
     --per_device_train_batch_size 1 \
-    --gradient_accumulation_steps 32 \
+    --gradient_accumulation_steps 64 \
     --learning_rate 1e-5 \
     --warmup_ratio 0.03 \
     --view_mask_ratio 0.25 \
     --view_mask_prob 0.25 \
     \
     --deepspeed scripts/3d/zero3.json \
-    --model_name_or_path /cluster/scratch/hanwliu/projects/ross3d/models/llava-video-qwen2-7b-ross3d \
+    --model_name_or_path ./models/llava-video-qwen2-7b-ross3d \
     --pretrain_mm_inv_adapter ./checkpoints/mm_inv_projector.bin \
     --version qwen_1_5 \
-    --data_path scripts/3d/train/video3dllm_223k.yaml \
+    --data_path ./scripts/3d/train/video3dllm_223k.yaml \
     --image_folder data \
     --video_folder data \
-    --embodiedscan_folder data/embodiedscan/ \
+    --embodiedscan_folder ./data/embodiedscan/ \
     --mm_tunable_parts "mm_mlp_adapter,mm_language_model,mm_inv_adapter" \
-    --vision_tower /models/siglip-so400m-patch14-384 \
+    --vision_tower ./models/siglip-so400m-patch14-384 \
     --ross_multi_task True \
-    --mm_pixel_decoder ./checkpoints/FLUX.1-dev \
+    --mm_pixel_decoder ./checkpoints/FLUX.1-dev/vae \
     --mm_projector_type mlp2x_gelu \
     --mm_inv_projector_type denoiser_vit3x \
     --mm_vision_select_layer -2 \
@@ -70,4 +70,8 @@ torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
     --group_by_task_length True \
     --frame_sampling_strategy uniform \
     --frames_upbound 32 \
+    --cycle_debug_memory True \
+    --cycle_debug_grad True \
+    --cycle_debug_optimizer True \
+    --cycle_debug_grad_stats True \
     --report_to wandb --run_name $MID_RUN_NAME

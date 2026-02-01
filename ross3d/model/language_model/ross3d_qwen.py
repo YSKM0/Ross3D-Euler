@@ -48,7 +48,10 @@ class Ross3DQwenConfig(Qwen2Config):
         self.cycle_topk = kwargs.get("cycle_topk", 32)
         self.cycle_filter_positive_depth = kwargs.get("cycle_filter_positive_depth", True)
         self.cycle_debug_memory = kwargs.get("cycle_debug_memory", False)
+        self.cycle_debug_grad = kwargs.get("cycle_debug_grad", False)
+        self.cycle_debug_optimizer = kwargs.get("cycle_debug_optimizer", False)
         self.cycle_detach_hidden_states = kwargs.get("cycle_detach_hidden_states", True)
+        self.cycle_anchor_grad = kwargs.get("cycle_anchor_grad", False)
         self.use_3d_coordinate = kwargs.get("use_3d_coordinate", True)
 
 
@@ -370,13 +373,11 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             or getattr(self.config, "cycle_consist", False)
         ):
             cycle_hidden_states = hidden_states
-            grad_anchor = None
             if getattr(self.config, "cycle_detach_hidden_states", False):
                 cycle_hidden_states = hidden_states.detach()
-                grad_anchor = hidden_states.float().mean()
                 if getattr(self.config, "verbose_logging", False):
                     rank_print(
-                        "[cycle_consistency_loss] using detached hidden_states with scalar grad anchor; "
+                        "[cycle_consistency_loss] using detached hidden_states; "
                         f"hidden_states_requires_grad={hidden_states.requires_grad}, "
                         f"detached_requires_grad={cycle_hidden_states.requires_grad}"
                     )
@@ -397,9 +398,6 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
                 cycle_loss = self.compute_cycle_consistency_loss_v2(**cycle_kwargs)
             else:
                 cycle_loss = self.compute_cycle_consistency_loss(**cycle_kwargs)
-            if grad_anchor is not None:
-                cycle_loss = cycle_loss * (grad_anchor / grad_anchor.detach())
-
             loss = loss + getattr(self.config, "cycle_consist_weight", 1.0) * cycle_loss
 
         if not return_dict:

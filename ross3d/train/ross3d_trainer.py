@@ -318,6 +318,84 @@ class LengthGroupedSampler(Sampler):
 
 
 class Ross3DTrainer(Trainer):
+    def _maybe_init_cycle_grad_debug(self):
+        model = getattr(self, "model", None)
+        if model is None:
+            return
+        if not getattr(getattr(model, "config", None), "cycle_debug_grad", False):
+            return
+        if hasattr(self, "_cycle_grad_hook"):
+            return
+        self._cycle_grad_seen = False
+        self._cycle_grad_param = None
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "model." in name or "lm_head" in name:
+                self._cycle_grad_param = name
+                self._cycle_grad_hook = param.register_hook(lambda *_: setattr(self, "_cycle_grad_seen", True))
+                break
+        if self._cycle_grad_param is None:
+            for name, param in model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                self._cycle_grad_param = name
+                self._cycle_grad_hook = param.register_hook(lambda *_: setattr(self, "_cycle_grad_seen", True))
+                break
+        if self._cycle_grad_param is not None:
+            rank0_print(
+                "[cycle_debug] registered grad hook on "
+                f"{self._cycle_grad_param}"
+            )
+
+    def _log_grad_stats(self, tag: str) -> None:
+        model = getattr(self, "model", None)
+        if model is None:
+            return
+        if not getattr(getattr(model, "config", None), "cycle_debug_grad", False):
+            return
+        total_params = 0
+        total_numel = 0
+        grad_params = 0
+        grad_numel = 0
+        groups = {
+            "llm": {"params": 0, "numel": 0},
+            "mm_inv_projector": {"params": 0, "numel": 0},
+            "mm_projector": {"params": 0, "numel": 0},
+            "vision_tower": {"params": 0, "numel": 0},
+            "vision_resampler": {"params": 0, "numel": 0},
+            "other": {"params": 0, "numel": 0},
+        }
+        for name, param in model.named_parameters():
+            total_params += 1
+            total_numel += param.numel()
+            has_grad = param.grad is not None
+            if has_grad:
+                grad_params += 1
+                grad_numel += param.numel()
+            if "mm_inv_projector" in name:
+                key = "mm_inv_projector"
+            elif "mm_projector" in name:
+                key = "mm_projector"
+            elif "vision_tower" in name:
+                key = "vision_tower"
+            elif "vision_resampler" in name:
+                key = "vision_resampler"
+            elif "model." in name or "lm_head" in name:
+                key = "llm"
+            else:
+                key = "other"
+            if has_grad:
+                groups[key]["params"] += 1
+                groups[key]["numel"] += param.numel()
+        rank0_print(
+            "[cycle_debug][grad_stats] "
+            f"{tag}: "
+            f"params_with_grad={grad_params:,}/{total_params:,} "
+            f"numel_with_grad={grad_numel:,}/{total_numel:,} "
+            f"groups={groups}"
+        )
+
     def _maybe_init_param_ready_debug(self):
         if not getattr(self.args, "verbose_logging", False):
             return
@@ -345,12 +423,16 @@ class Ross3DTrainer(Trainer):
 
     def training_step(self, model, inputs):
         self._maybe_init_param_ready_debug()
+        self._maybe_init_cycle_grad_debug()
         if hasattr(self, "_param_ready_counts"):
             for name in self._param_ready_counts:
                 self._param_ready_counts[name] = 0
+        if hasattr(self, "_cycle_grad_seen"):
+            self._cycle_grad_seen = False
         self._log_cuda_memory("before_training_step")
         loss = super().training_step(model, inputs)
         self._log_cuda_memory("after_training_step")
+        self._log_grad_stats("after_training_step")
         if hasattr(self, "_param_ready_counts") and self._param_ready_counts:
             repeated = [name for name, count in self._param_ready_counts.items() if count > 1]
             if repeated:
@@ -359,6 +441,17 @@ class Ross3DTrainer(Trainer):
                     "[checkpoint-debug] parameters with multiple grad hooks in step "
                     f"{self.state.global_step}: {repeated_preview}"
                 )
+        if (
+            hasattr(self, "_cycle_grad_seen")
+            and getattr(getattr(self.model, "config", None), "cycle_debug_grad", False)
+        ):
+            rank0_print(
+                "[cycle_debug] "
+                f"step={self.state.global_step} "
+                f"cycle_loss_active={getattr(self, '_cycle_loss_active', False)} "
+                f"llm_grad_seen={self._cycle_grad_seen} "
+                f"param={getattr(self, '_cycle_grad_param', 'n/a')}"
+            )
         return loss
     def _wrap_model(self, model, training=True, dataloader=None):
         model = super()._wrap_model(model, training=training, dataloader=dataloader)
@@ -425,6 +518,33 @@ class Ross3DTrainer(Trainer):
             f"({state_bytes / 1024 ** 3:.2f}GB)"
         )
 
+    def _log_optimizer_param_counts(self, tag: str) -> None:
+        model = getattr(self, "model", None)
+        if model is None:
+            return
+        if not getattr(getattr(model, "config", None), "cycle_debug_optimizer", False):
+            return
+        optimizer = getattr(self, "optimizer", None)
+        if optimizer is None:
+            return
+        total_numel = 0
+        unique_params = set()
+        group_counts = []
+        for group in optimizer.param_groups:
+            group_numel = 0
+            for param in group["params"]:
+                group_numel += param.numel()
+                unique_params.add(param)
+            group_counts.append(group_numel)
+            total_numel += group_numel
+        unique_numel = sum(param.numel() for param in unique_params)
+        rank0_print(
+            "[trainer][optimizer_param_counts] "
+            f"{tag}: total_numel={total_numel:,}, "
+            f"unique_numel={unique_numel:,}, "
+            f"group_numel={group_counts}"
+        )
+
     def _log_cuda_memory(self, tag: str) -> None:
         if not torch.cuda.is_available():
             return
@@ -446,9 +566,11 @@ class Ross3DTrainer(Trainer):
     def optimizer_step(self, *args, **kwargs):
         self._log_cuda_memory("before_optimizer_step")
         self._log_optimizer_state("before_optimizer_step")
+        self._log_optimizer_param_counts("before_optimizer_step")
         result = super().optimizer_step(*args, **kwargs)
         self._log_cuda_memory("after_optimizer_step")
         self._log_optimizer_state("after_optimizer_step")
+        self._log_optimizer_param_counts("after_optimizer_step")
         return result
 
     def create_accelerator_and_postprocess(self):
@@ -639,6 +761,13 @@ class Ross3DTrainer(Trainer):
 
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
 
+            if (
+                optimizer_cls.__name__ == "AdamW"
+                and hasattr(self.args, "adamw_use_foreach")
+                and self.args.adamw_use_foreach is not None
+            ):
+                optimizer_kwargs["foreach"] = self.args.adamw_use_foreach
+
             self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
             if optimizer_cls.__name__ == "Adam8bit":
                 import bitsandbytes
@@ -717,6 +846,7 @@ class Ross3DTrainer(Trainer):
         loss, outputs = self._compute_loss_with_global_step(model, inputs, return_outputs=True)
 
         log_dict = {}
+        self._cycle_loss_active = outputs.get("cycle_loss", None) is not None
 
         if outputs.get('vm_loss', None) is not None:
             assert outputs.get('lm_loss', None) is not None
