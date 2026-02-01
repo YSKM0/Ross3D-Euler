@@ -51,7 +51,6 @@ class Ross3DQwenConfig(Qwen2Config):
         self.cycle_debug_grad = kwargs.get("cycle_debug_grad", False)
         self.cycle_debug_optimizer = kwargs.get("cycle_debug_optimizer", False)
         self.cycle_detach_hidden_states = kwargs.get("cycle_detach_hidden_states", True)
-        self.cycle_anchor_grad = kwargs.get("cycle_anchor_grad", False)
         self.use_3d_coordinate = kwargs.get("use_3d_coordinate", True)
 
 

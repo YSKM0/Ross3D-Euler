@@ -1607,11 +1607,11 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
             **customized_kwargs,
         )
 
+    # Hanwliu
     setattr(model.config, "cycle_consist", model_args.cycle_consist)
     setattr(model.config, "cycle_consist_v2", model_args.cycle_consist_v2)
     setattr(model.config, "cycle_consist_weight", model_args.cycle_consist_weight)
     setattr(model.config, "cycle_num_walks", model_args.cycle_num_walks)
-    # Hanwliu
     setattr(model.config, "cycle_feature_source", model_args.cycle_feature_source)
     setattr(model.config, "cycle_geo_mode", model_args.cycle_geo_mode)
     setattr(model.config, "cycle_filter_positive_depth", model_args.cycle_filter_positive_depth)
