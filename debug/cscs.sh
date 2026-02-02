@@ -1,6 +1,6 @@
 #!/bin/bash
 
-MID_RUN_NAME="qwen2-7b-ross3d-train-cyclev1-debug"
+MID_RUN_NAME="llava-video-qwen2-7b-ross3d-debug"
 echo "MID_RUN_NAME: ${MID_RUN_NAME}"
 # we have ./debug/video3dllm_debug.yaml
 # --mm_pixel_decoder ./checkpoints/FLUX.1-dev/vae \
@@ -14,12 +14,10 @@ export ROSS3D_DEBUG_PARAM_READY=1
 export ROSS3D_DEBUG_CHECKPOINT=1
 export ROSS3D_DEBUG_MEMORY_SUMMARY=1
 
-# mm_mlp_adapter in mm_tunable_parts
 torchrun --nproc_per_node=4 --nnodes=1 --node_rank=0 \
     --master_addr="localhost" --master_port=20409 \
     \
     ross3d/train/train_3d.py \
-    \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 64 \
     --learning_rate 1e-5 \
@@ -38,7 +36,7 @@ torchrun --nproc_per_node=4 --nnodes=1 --node_rank=0 \
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
-    --image_aspect_ratio anyres_max_9 \
+    --image_aspect_ratio anyres_max_4 \
     --image_grid_pinpoints "(1x1),...,(6x6)" \
     --mm_patch_merge_type spatial_unpad \
     --bf16 True \
@@ -47,22 +45,21 @@ torchrun --nproc_per_node=4 --nnodes=1 --node_rank=0 \
     --num_train_epochs 1 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 1000 \
+    --save_steps 50 \
     --save_total_limit 1 \
     --save_only_model \
-    --weight_decay 0. \
+    --weight_decay 0.0 \
     --lr_scheduler_type "cosine" \
     --logging_steps 1 \
-    --tf32 True \
-    --model_max_length 32768 \
+    --model_max_length 660 \
     --gradient_checkpointing True \
-    --dataloader_num_workers 2 \
+    --dataloader_num_workers 0 \
     --lazy_preprocess True \
     --dataloader_drop_last True \
     --mm_newline_position grid \
     --add_spatial_instruction True \
     --force_sample True \
-    --mm_spatial_pool_stride 2 \
+    --mm_spatial_pool_stride 14 \
     --world_position_embedding_type avg-discrete-sin3d \
     --object_feature_type patch14-pe \
     --ground_head_type infonce \
@@ -78,7 +75,6 @@ torchrun --nproc_per_node=4 --nnodes=1 --node_rank=0 \
     --cycle_detach_hidden_states True \
     --cycle_debug_grad False \
     --cycle_debug_optimizer False \
-    --adamw_use_foreach False \
+    --adamw_use_foreach True \
     --cycle_filter_positive_depth False \
-    --model_name_or_path ./models/llava-video-qwen2-7b-ross3d \
-    --report_to wandb --run_name $MID_RUN_NAME
+    --model_name_or_path ./models/llava-video-qwen2-7b-ross3d

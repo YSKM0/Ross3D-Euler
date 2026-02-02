@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+#SBATCH --account=a144                    # same as: srun -A a144
+#SBATCH --partition=normal                # Bristen has only 'normal' for production workloads :contentReference[oaicite:5]{index=5}
+#SBATCH --job-name=cycle-train
+#SBATCH --time=24:00:00                   # same as your interactive test
+
+#SBATCH --nodes=1                         # your interactive test used one allocation; keep 1 node
+#SBATCH --ntasks-per-node=1               # one task launching your script on the node (common CSCS pattern)
+#SBATCH --gpus-per-node=4                 # Bristen A100 nodes provide 4 GPUs per node :contentReference[oaicite:6]{index=6}
+#SBATCH --cpus-per-task=64                # Bristen A100 nodes have one 64-core CPU per node :contentReference[oaicite:7]{index=7}
+
+#SBATCH --output=logs/slurm-%x-%j.out
+#SBATCH --error=logs/slurm-%x-%j.err
+
+set -euo pipefail
+set -x
+
+mkdir -p logs
+
+cd /iopsstor/scratch/cscs/hanwliu/project/Ross3D-Euler
+
+export WANDB_API_KEY="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"
+
+srun -u --environment=./ngc-pytorch-py310.toml bash -lc "
+  source ross3d/bin/activate
+  bash train_original.sh
+"

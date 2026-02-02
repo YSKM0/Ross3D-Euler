@@ -1,11 +1,21 @@
 #!/bin/bash
 
-MID_RUN_NAME="llava-video-qwen2-7b-ross3d"
+MID_RUN_NAME="train-cyclev1"
 echo "MID_RUN_NAME: ${MID_RUN_NAME}"
+# we have ./debug/video3dllm_debug.yaml
+# --mm_pixel_decoder ./checkpoints/FLUX.1-dev/vae \
+# --cycle_filter_positive_depth
+#     --pretrain_mm_inv_adapter ./checkpoints/mm_inv_projector.bin \
+# --mm_inv_projector_type denoiser_vit3x \
 
-# bs=256, lr=1e-5
 set -x
 
+# export ROSS3D_DEBUG_PARAM_READY=1
+# export ROSS3D_DEBUG_CHECKPOINT=1
+# export ROSS3D_DEBUG_MEMORY_SUMMARY=1
+
+# mm_mlp_adapter in mm_tunable_parts
+#     --model_name_or_path lmms-lab/LLaVA-Video-7B-Qwen2 \
 torchrun --nproc_per_node=4 --nnodes=1 --node_rank=0 \
     --master_addr="localhost" --master_port=20409 \
     \
@@ -15,34 +25,29 @@ torchrun --nproc_per_node=4 --nnodes=1 --node_rank=0 \
     --gradient_accumulation_steps 64 \
     --learning_rate 1e-5 \
     --warmup_ratio 0.03 \
-    --view_mask_ratio 0.25 \
-    --view_mask_prob 0.25 \
+    --view_mask_ratio 0.0 \
+    --view_mask_prob 0.0 \
     \
     --deepspeed ./scripts/3d/zero3.json \
-    --model_name_or_path lmms-lab/LLaVA-Video-7B-Qwen2 \
-    --pretrain_mm_inv_adapter ./checkpoints/mm_inv_projector.bin \
+    --model_name_or_path ./models/llava-video-qwen2-7b-ross3d \
     --version qwen_1_5 \
     --data_path ./scripts/3d/train/video3dllm_223k.yaml \
     --image_folder data \
     --video_folder data \
     --embodiedscan_folder ./data/embodiedscan/ \
-    --mm_tunable_parts "mm_mlp_adapter,mm_language_model,mm_inv_adapter" \
+    --mm_tunable_parts "mm_language_model" \
     --vision_tower ./models/siglip-so400m-patch14-384 \
-    --ross_multi_task True \
-    --mm_pixel_decoder ./checkpoints/FLUX.1-dev/vae \
     --mm_projector_type mlp2x_gelu \
-    --mm_inv_projector_type denoiser_vit3x \
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
     --image_aspect_ratio anyres_max_9 \
-    --image_grid_pinpoints  "(1x1),...,(6x6)" \
+    --image_grid_pinpoints "(1x1),...,(6x6)" \
     --mm_patch_merge_type spatial_unpad \
     --bf16 True \
-    --run_name $MID_RUN_NAME \
+    --run_name ${MID_RUN_NAME} \
     --output_dir "./checkpoints/${MID_RUN_NAME}" \
     --num_train_epochs 1 \
-    --per_device_eval_batch_size 4 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
     --save_steps 1000 \
@@ -56,8 +61,6 @@ torchrun --nproc_per_node=4 --nnodes=1 --node_rank=0 \
     --gradient_checkpointing True \
     --dataloader_num_workers 2 \
     --lazy_preprocess True \
-    --torch_compile True \
-    --torch_compile_backend "inductor" \
     --dataloader_drop_last True \
     --mm_newline_position grid \
     --add_spatial_instruction True \
@@ -69,7 +72,15 @@ torchrun --nproc_per_node=4 --nnodes=1 --node_rank=0 \
     --group_by_task_length True \
     --frame_sampling_strategy uniform \
     --frames_upbound 32 \
-    --verbose_logging True \
-    --cycle_debug_grad True \
-    --cycle_debug_optimizer True \
+    --cycle_consist True \
+    --cycle_feature_source llm \
+    --cycle_geo_mode clamped \
+    --use_3d_coordinate True \
+    --cycle_debug_memory False \
+    --verbose_logging False \
+    --cycle_detach_hidden_states False \
+    --cycle_debug_grad False \
+    --cycle_debug_optimizer False \
+    --adamw_use_foreach True \
+    --cycle_filter_positive_depth False \
     --report_to wandb --run_name $MID_RUN_NAME
