@@ -192,7 +192,7 @@ class ModelArguments:
         },
     )
     cycle_detach_hidden_states: bool = field(
-        default=True,
+        default=False,
         metadata={
             "help": "Detach LLM hidden states before cycle-consistency loss to avoid DDP re-entrancy; "
             "re-attach a single gradient path via a scalar anchor. Default: true.",
@@ -1624,16 +1624,9 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
 
     if training_args.gradient_checkpointing and (model_args.cycle_consist or model_args.cycle_consist_v2):
         rank0_print(
-            "[trainer] Disabling gradient checkpointing due to cycle-consistency loss to avoid "
-            "DDP re-entrancy errors."
+            "[trainer] Cycle-consistency loss enabled with gradient checkpointing; "
+            "using non-reentrant checkpointing to avoid DDP re-entrancy errors."
         )
-        training_args.gradient_checkpointing = False
-        if hasattr(model, "gradient_checkpointing_disable"):
-            model.gradient_checkpointing_disable()
-        else:
-            setattr(model, "gradient_checkpointing", False)
-            if hasattr(model, "config"):
-                model.config.gradient_checkpointing = False
     
     return model
 

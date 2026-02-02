@@ -988,13 +988,14 @@ class Ross3DMetaForCausalLM(ABC):
                     except IndexError:
                         cur_image_features = image_features[cur_image_idx - 1]
 
-                    rank0_print(
-                        "[token_count] "
-                        f"text={text_len}, "
-                        f"image={cur_image_features.shape[0]}, "
-                        f"total={text_len + cur_image_features.shape[0]}, "
-                        f"model_max_length={tokenizer_model_max_length}"
-                    )
+                    if getattr(self.config, "verbose_logging", False):
+                        rank0_print(
+                            "[token_count] "
+                            f"text={text_len}, "
+                            f"image={cur_image_features.shape[0]}, "
+                            f"total={text_len + cur_image_features.shape[0]}, "
+                            f"model_max_length={tokenizer_model_max_length}"
+                        )
                     
                     if use_mrope_position_embedding:
                         coords = world_coords_discrete[batch_idx]
@@ -1411,6 +1412,8 @@ class Ross3DMetaForCausalLM(ABC):
         - optional top-k sparsification per row for stability
         """
         def _log_cycle_cuda_memory(tag: str) -> None:
+            if not getattr(self.config, "verbose_logging", False):
+                return
             if not getattr(self.config, "cycle_debug_memory", False):
                 return
             if not torch.cuda.is_available():
@@ -1456,20 +1459,22 @@ class Ross3DMetaForCausalLM(ABC):
         if mask is not None:
             frame_mask = frame_mask & (~mask.bool())
         visible_idx = frame_mask.nonzero(as_tuple=False).flatten()
-        rank0_print(
-            "[cycle_consistency_loss] frame_selection "
-            f"T={T}, "
-            f"mask_present={mask is not None}, "
-            f"mask_shape={(tuple(mask.shape) if mask is not None else None)}, "
-            f"mask_true_count={(int(mask.sum().item()) if mask is not None else None)}, "
-            f"visible_idx={visible_idx.tolist()}"
-        )
+        if getattr(self.config, "verbose_logging", False):
+            rank0_print(
+                "[cycle_consistency_loss] frame_selection "
+                f"T={T}, "
+                f"mask_present={mask is not None}, "
+                f"mask_shape={(tuple(mask.shape) if mask is not None else None)}, "
+                f"mask_true_count={(int(mask.sum().item()) if mask is not None else None)}, "
+                f"visible_idx={visible_idx.tolist()}"
+            )
 
         if visible_idx.numel() < 2:
-            rank0_print(
-                "[cycle_consistency_loss] Disabled: fewer than 2 visible frames. "
-                f"visible_idx={visible_idx.tolist()}, T={T}, mask_present={mask is not None}."
-            )
+            if getattr(self.config, "verbose_logging", False):
+                rank0_print(
+                    "[cycle_consistency_loss] Disabled: fewer than 2 visible frames. "
+                    f"visible_idx={visible_idx.tolist()}, T={T}, mask_present={mask is not None}."
+                )
             return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
 
         if (num_walks is None) or (num_walks >= visible_idx.numel()):
@@ -1478,28 +1483,31 @@ class Ross3DMetaForCausalLM(ABC):
             perm = torch.randperm(visible_idx.numel(), device=hidden_states.device)
             sel = visible_idx[perm[:num_walks]]
             sel, _ = torch.sort(sel)
-        rank0_print(
-            "[cycle_consistency_loss] frame_selection_after "
-            f"S={sel.numel()}, "
-            f"num_walks={num_walks}, "
-            f"sel={sel.tolist()}"
-        )
+        if getattr(self.config, "verbose_logging", False):
+            rank0_print(
+                "[cycle_consistency_loss] frame_selection_after "
+                f"S={sel.numel()}, "
+                f"num_walks={num_walks}, "
+                f"sel={sel.tolist()}"
+            )
 
         feats = feats[sel]  # [S, P, D]
         S = feats.shape[0]
         if S < 2:
-            rank0_print(
-                "[cycle_consistency_loss] Disabled: selected frames < 2. "
-                f"S={S}, visible_count={visible_idx.numel()}, num_walks={num_walks}."
-            )
+            if getattr(self.config, "verbose_logging", False):
+                rank0_print(
+                    "[cycle_consistency_loss] Disabled: selected frames < 2. "
+                    f"S={S}, visible_count={visible_idx.numel()}, num_walks={num_walks}."
+                )
             return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
 
         _log_cycle_cuda_memory("after_frame_selection")
 
-        rank0_print(
-            "[cycle_consistency_loss] transition_matrix_info "
-            f"P={P}, transition_matrix_size=({P}, {P}), selected_frames={S}"
-        )
+        if getattr(self.config, "verbose_logging", False):
+            rank0_print(
+                "[cycle_consistency_loss] transition_matrix_info "
+                f"P={P}, transition_matrix_size=({P}, {P}), selected_frames={S}"
+            )
 
         # ---- 3) Feature source selection + normalization
         feature_source = getattr(self.config, "cycle_feature_source", "llm")
@@ -1511,10 +1519,11 @@ class Ross3DMetaForCausalLM(ABC):
                 or not hasattr(inv_projector, "net")
                 or not hasattr(inv_projector.net, "z_embedder_view")
             ):
-                rank0_print(
-                    "[cycle_consistency_loss] Requested inv_projector features, "
-                    "but mm_inv_projector.z_embedder_view is unavailable. Falling back to LLM features."
-                )
+                if getattr(self.config, "verbose_logging", False):
+                    rank0_print(
+                        "[cycle_consistency_loss] Requested inv_projector features, "
+                        "but mm_inv_projector.z_embedder_view is unavailable. Falling back to LLM features."
+                    )
             else:
                 feats = inv_projector.ln_pre(feats)
                 h = w = int(feats.shape[1] ** 0.5)
@@ -1544,10 +1553,11 @@ class Ross3DMetaForCausalLM(ABC):
                     # invalid depth in your pipeline becomes (0,0,0) often; treat z<=0 as invalid
                     valid_patch = (coords[..., 2] > 0.0)  # [S, P]
                     if (~valid_patch).any():
-                        rank0_print(
-                            "[cycle_consistency_loss] Detected non-positive depth patches; "
-                            f"invalid_count={(~valid_patch).sum().item()}."
-                        )
+                        if getattr(self.config, "verbose_logging", False):
+                            rank0_print(
+                                "[cycle_consistency_loss] Detected non-positive depth patches; "
+                                f"invalid_count={(~valid_patch).sum().item()}."
+                            )
 
         # if no coords, fall back to appearance-only (still works)
         use_geo = coords is not None
@@ -1628,11 +1638,12 @@ class Ross3DMetaForCausalLM(ABC):
                     if (~torch.isfinite(logit_fwd)).all(dim=-1).any() or (~torch.isfinite(logit_bwd)).all(dim=-1).any():
                         invalid_rows_fwd = (~torch.isfinite(logit_fwd)).all(dim=-1).sum().item()
                         invalid_rows_bwd = (~torch.isfinite(logit_bwd)).all(dim=-1).sum().item()
-                        rank0_print(
-                            "[cycle_consistency_loss] Disabled: invalid transition rows after masking. "
-                            f"step={step}, invalid_rows_fwd={invalid_rows_fwd}, invalid_rows_bwd={invalid_rows_bwd}, "
-                            f"valid_patch_ratio={(valid_patch.float().mean().item() if valid_patch is not None else 'n/a')}."
-                        )
+                        if getattr(self.config, "verbose_logging", False):
+                            rank0_print(
+                                "[cycle_consistency_loss] Disabled: invalid transition rows after masking. "
+                                f"step={step}, invalid_rows_fwd={invalid_rows_fwd}, invalid_rows_bwd={invalid_rows_bwd}, "
+                                f"valid_patch_ratio={(valid_patch.float().mean().item() if valid_patch is not None else 'n/a')}."
+                            )
                         return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
             else:
                 logit_fwd = logit_app_fwd
@@ -1657,10 +1668,11 @@ class Ross3DMetaForCausalLM(ABC):
 
         # ---- 6) Compose forward then backward
         if len(A_fwd) != (S - 1):
-            rank0_print(
-                "[cycle_consistency_loss] Disabled: transition list length mismatch. "
-                f"len(A_fwd)={len(A_fwd)}, expected={S - 1}, S={S}."
-            )
+            if getattr(self.config, "verbose_logging", False):
+                rank0_print(
+                    "[cycle_consistency_loss] Disabled: transition list length mismatch. "
+                    f"len(A_fwd)={len(A_fwd)}, expected={S - 1}, S={S}."
+                )
             return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
         A_fw = A_fwd[0]
         for k in range(1, S - 1):
@@ -1681,10 +1693,11 @@ class Ross3DMetaForCausalLM(ABC):
             if v0.any():
                 diag = diag[v0]
             else:
-                rank0_print(
-                    "[cycle_consistency_loss] Disabled: no valid patches in first selected frame. "
-                    f"valid_patch_shape={valid_patch.shape}, selected_frames={sel.tolist()}."
-                )
+                if getattr(self.config, "verbose_logging", False):
+                    rank0_print(
+                        "[cycle_consistency_loss] Disabled: no valid patches in first selected frame. "
+                        f"valid_patch_shape={valid_patch.shape}, selected_frames={sel.tolist()}."
+                    )
                 return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
 
         loss = -torch.log(diag + eps).mean()
@@ -1714,6 +1727,8 @@ class Ross3DMetaForCausalLM(ABC):
         - guidance loss: KL( q_geo || p_app ) row-wise + column-wise (symmetry)
         """
         def _log_cycle_cuda_memory(tag: str) -> None:
+            if not getattr(self.config, "verbose_logging", False):
+                return
             if not getattr(self.config, "cycle_debug_memory", False):
                 return
             if not torch.cuda.is_available():
@@ -1759,20 +1774,22 @@ class Ross3DMetaForCausalLM(ABC):
         if mask is not None:
             frame_mask = frame_mask & (~mask.bool())
         visible_idx = frame_mask.nonzero(as_tuple=False).flatten()
-        rank0_print(
-            "[cycle_consistency_loss_v2] frame_selection "
-            f"T={T}, "
-            f"mask_present={mask is not None}, "
-            f"mask_shape={(tuple(mask.shape) if mask is not None else None)}, "
-            f"mask_true_count={(int(mask.sum().item()) if mask is not None else None)}, "
-            f"visible_idx={visible_idx.tolist()}"
-        )
+        if getattr(self.config, "verbose_logging", False):
+            rank0_print(
+                "[cycle_consistency_loss_v2] frame_selection "
+                f"T={T}, "
+                f"mask_present={mask is not None}, "
+                f"mask_shape={(tuple(mask.shape) if mask is not None else None)}, "
+                f"mask_true_count={(int(mask.sum().item()) if mask is not None else None)}, "
+                f"visible_idx={visible_idx.tolist()}"
+            )
 
         if visible_idx.numel() < 2:
-            rank0_print(
-                "[cycle_consistency_loss_v2] Disabled: fewer than 2 visible frames. "
-                f"visible_idx={visible_idx.tolist()}, T={T}, mask_present={mask is not None}."
-            )
+            if getattr(self.config, "verbose_logging", False):
+                rank0_print(
+                    "[cycle_consistency_loss_v2] Disabled: fewer than 2 visible frames. "
+                    f"visible_idx={visible_idx.tolist()}, T={T}, mask_present={mask is not None}."
+                )
             return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
 
         if (num_walks is None) or (num_walks >= visible_idx.numel()):
@@ -1781,20 +1798,22 @@ class Ross3DMetaForCausalLM(ABC):
             perm = torch.randperm(visible_idx.numel(), device=hidden_states.device)
             sel = visible_idx[perm[:num_walks]]
             sel, _ = torch.sort(sel)
-        rank0_print(
-            "[cycle_consistency_loss_v2] frame_selection_after "
-            f"S={sel.numel()}, "
-            f"num_walks={num_walks}, "
-            f"sel={sel.tolist()}"
-        )
+        if getattr(self.config, "verbose_logging", False):
+            rank0_print(
+                "[cycle_consistency_loss_v2] frame_selection_after "
+                f"S={sel.numel()}, "
+                f"num_walks={num_walks}, "
+                f"sel={sel.tolist()}"
+            )
 
         feats = feats[sel]  # [S, P, D]
         S = feats.shape[0]
         if S < 2:
-            rank0_print(
-                "[cycle_consistency_loss_v2] Disabled: selected frames < 2. "
-                f"S={S}, visible_count={visible_idx.numel()}, num_walks={num_walks}."
-            )
+            if getattr(self.config, "verbose_logging", False):
+                rank0_print(
+                    "[cycle_consistency_loss_v2] Disabled: selected frames < 2. "
+                    f"S={S}, visible_count={visible_idx.numel()}, num_walks={num_walks}."
+                )
             return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
 
         _log_cycle_cuda_memory("after_frame_selection")
@@ -1809,10 +1828,11 @@ class Ross3DMetaForCausalLM(ABC):
                 or not hasattr(inv_projector, "net")
                 or not hasattr(inv_projector.net, "z_embedder_view")
             ):
-                rank0_print(
-                    "[cycle_consistency_loss_v2] Requested inv_projector features, "
-                    "but mm_inv_projector.z_embedder_view is unavailable. Falling back to LLM features."
-                )
+                if getattr(self.config, "verbose_logging", False):
+                    rank0_print(
+                        "[cycle_consistency_loss_v2] Requested inv_projector features, "
+                        "but mm_inv_projector.z_embedder_view is unavailable. Falling back to LLM features."
+                    )
             else:
                 feats = inv_projector.ln_pre(feats)
                 h = w = int(feats.shape[1] ** 0.5)
@@ -2013,10 +2033,11 @@ class Ross3DMetaForCausalLM(ABC):
                         or (~torch.isfinite(logit_app_bwd)).all(dim=-1).any()
                         or (~torch.isfinite(logit_geo_bwd)).all(dim=-1).any()
                     ):
-                        rank0_print(
-                            "[cycle_consistency_loss_v2] Disabled: invalid transition rows after masking. "
-                            f"step={step}, valid_patch_ratio={valid_patch.float().mean().item():.4f}."
-                        )
+                        if getattr(self.config, "verbose_logging", False):
+                            rank0_print(
+                                "[cycle_consistency_loss_v2] Disabled: invalid transition rows after masking. "
+                                f"step={step}, valid_patch_ratio={valid_patch.float().mean().item():.4f}."
+                            )
                         return torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
 
                 # ---- v2 guidance term: KL( q_geo || p_app ) row + col, forward + backward
