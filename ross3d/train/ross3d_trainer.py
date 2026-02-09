@@ -1,4 +1,5 @@
 import os
+import inspect
 import torch
 import torch.nn as nn
 import datetime
@@ -582,9 +583,15 @@ class Ross3DTrainer(Trainer):
         rank0_print("Setting NCCL timeout to INF to avoid running errors.")
 
         # create accelerator object
-        self.accelerator = Accelerator(
-            dispatch_batches=self.args.dispatch_batches, split_batches=self.args.split_batches, deepspeed_plugin=self.args.deepspeed_plugin, gradient_accumulation_plugin=gradient_accumulation_plugin, kwargs_handlers=[accelerator_kwargs]
-        )
+        accelerator_init_kwargs = {
+            "split_batches": self.args.split_batches,
+            "deepspeed_plugin": self.args.deepspeed_plugin,
+            "gradient_accumulation_plugin": gradient_accumulation_plugin,
+            "kwargs_handlers": [accelerator_kwargs],
+        }
+        if "dispatch_batches" in inspect.signature(Accelerator).parameters:
+            accelerator_init_kwargs["dispatch_batches"] = self.args.dispatch_batches
+        self.accelerator = Accelerator(**accelerator_init_kwargs)
         # some Trainer classes need to use `gather` instead of `gather_for_metrics`, thus we store a flag
         self.gather_function = self.accelerator.gather_for_metrics
 
