@@ -1,0 +1,45 @@
+#!/bin/bash
+#SBATCH --account=a144                  # CSCS project/account to charge
+#SBATCH --partition=normal              # Clariden production partition ("normal") :contentReference[oaicite:1]{index=1}
+#SBATCH --job-name=rt1         # short, descriptive job name
+#SBATCH --time=12:00:00                # matches your interactive --time=1:30:00
+
+#SBATCH --nodes=1                       # interactive srun defaults to a single allocation unless requested otherwise
+#SBATCH --ntasks-per-node=1             # run one launcher task; your script handles any internal parallelism
+#SBATCH --gpus-per-node=1               # Clariden GH200 nodes provide 4 GPUs; request GPUs explicitly :contentReference[oaicite:2]{index=2}
+#SBATCH --cpus-per-task=288             # map full node CPU resources to the single task (CSCS tutorial pattern) :contentReference[oaicite:3]{index=3}
+
+#SBATCH --output=logs/slurm-%x-%j.out   # stdout (and stderr unless --error is set) :contentReference[oaicite:4]{index=4}
+#SBATC H --error=logs/slurm-%x-%j.err   # (optional) separate stderr if you prefer
+
+set -euo pipefail
+set -x
+
+ulimit -c 0                              # recommended to avoid large core dumps on crashes :contentReference[oaicite:5]{index=5}
+
+# Ensure log directory exists (done on the first node of the allocation)
+mkdir -p logs
+
+cd /iopsstor/scratch/cscs/hanwliu/project/Ross3D-Euler
+
+export WANDB_API_KEY="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"
+
+# Run inside the CSCS Container Engine EDF environment.
+# CSCS recommends using --environment with srun in batch scripts (and discourages #SBATCH --environment). :contentReference[oaicite:6]{index=6}
+
+srun -ul --environment=./clariden-ngc-pytorch-24.10-ffmpeg.toml bash -lc "
+  #export TORCH_COMPILE_DISABLE=1
+  #export TORCHDYNAMO_DISABLE=1
+  #export DISABLE_TORCHDYNAMO=1
+
+  cd /iopsstor/scratch/cscs/hanwliu/project/Ross3D-Euler
+
+  # Activate your venv exactly like in the interactive session
+  source ross3d-clariden/bin/activate
+
+  # Match your test env var setup
+  export WANDB_API_KEY="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"
+
+  # Launch training
+  bash /iopsstor/scratch/cscs/hanwliu/project/Ross3D-Euler/scripts/3d/train/train_ross3d.sh
+"
