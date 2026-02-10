@@ -337,7 +337,8 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
         logits = self.lm_head(hidden_states)
         logits = logits.float()
 
-        loss, lm_loss = torch.tensor(0.).cuda(), torch.tensor(0.).cuda()
+        loss = hidden_states.new_zeros(())
+        lm_loss = hidden_states.new_zeros(())
         if labels is not None:
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
@@ -353,17 +354,19 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             lm_loss = loss.detach().clone()
 
         vm_loss, bev_loss = None, None
-        if self.training and getattr(self.config, 'ross_enable', False) and (
+        vm_enabled = getattr(self.config, "enable_vm_loss", True)
+        bev_enabled = getattr(self.config, "enable_bev_loss", True)
+        if self.training and getattr(self.config, 'ross_enable', False) and vm_enabled and (
             getattr(self.config, "view_mask_prob", 0.0) > 0.0
             or getattr(self.config, "view_mask_ratio", 0.0) > 0.0
         ):
             # vm_loss = self.compute_vm_loss_v2(images, hidden_states, boi_ids, eoi_ids, newline_ids, mask)
             vm_loss = self.compute_vm_loss(images, hidden_states, boi_ids, eoi_ids, newline_ids, mask)
-            loss += vm_loss
-            if getattr(self.config, 'ross_multi_task', False):
+            loss = loss + vm_loss
+            if getattr(self.config, 'ross_multi_task', False) and bev_enabled:
                 bev_loss = self.compute_vm_loss_bev(images, hidden_states, boi_ids, eoi_ids, newline_ids,
                                                     video_dict["bev_image"], mask)
-                loss += bev_loss
+                loss = loss + bev_loss
 
         # Hanwliu
         cycle_loss = None
@@ -544,7 +547,8 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             query_feat = F.normalize(query_feat)
             scores = (obj_feat * query_feat).sum(dim=-1)
 
-        loss, lm_loss = torch.tensor(0.).cuda(), torch.tensor(0.).cuda()
+        loss = hidden_states.new_zeros(())
+        lm_loss = hidden_states.new_zeros(())
         if box_labels is not None:
             if self.ground_head_type == "infonce":
                 if len(box_labels[0]) == 0: # zero-target

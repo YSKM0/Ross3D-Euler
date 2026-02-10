@@ -431,7 +431,11 @@ class Ross3DTrainer(Trainer):
         if hasattr(self, "_cycle_grad_seen"):
             self._cycle_grad_seen = False
         self._log_cuda_memory("before_training_step")
-        loss = super().training_step(model, inputs)
+        if os.getenv("ROSS3D_DEBUG_AUTOGRAD") == "1":
+            with torch.autograd.set_detect_anomaly(True):
+                loss = super().training_step(model, inputs)
+        else:
+            loss = super().training_step(model, inputs)
         self._log_cuda_memory("after_training_step")
         self._log_grad_stats("after_training_step")
         if hasattr(self, "_param_ready_counts") and self._param_ready_counts:
@@ -765,6 +769,23 @@ class Ross3DTrainer(Trainer):
                         "weight_decay": 0.0,
                     },
                 ]
+
+            if self.args.verbose_logging:
+                inv_params = [(n, p) for n, p in opt_model.named_parameters() if "mm_inv_projector" in n and p.requires_grad]
+                inv_param_set = {p for _, p in inv_params}
+                grouped_inv_param_set = {
+                    p for group in optimizer_grouped_parameters for p in group["params"] if p in inv_param_set
+                }
+                inv_total_numel = sum(p.numel() for p in inv_param_set)
+                inv_grouped_numel = sum(p.numel() for p in grouped_inv_param_set)
+                rank0_print(
+                    "[mm_inv_projector][debug] "
+                    f"optimizer_params={inv_grouped_numel:,}/{inv_total_numel:,}"
+                )
+                if inv_param_set and inv_grouped_numel == 0:
+                    rank0_print(
+                        "[mm_inv_projector][debug] WARNING: trainable params missing from optimizer groups."
+                    )
 
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
 

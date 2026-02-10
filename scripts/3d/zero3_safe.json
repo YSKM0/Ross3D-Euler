@@ -26,7 +26,7 @@
     "allgather_bucket_size": 4194304,
     "reduce_bucket_size": 4194304,
     "prefetch_bucket_size": 2097152,
-    "param_persistence_threshold": 35840,
+    "param_persistence_threshold": 0,
 
     "sub_group_size": 1000000000,
     "max_live_parameters": 1000000000,

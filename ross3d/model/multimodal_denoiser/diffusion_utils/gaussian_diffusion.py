@@ -5,6 +5,7 @@
 
 
 import math
+import os
 
 import numpy as np
 import torch as th
@@ -726,6 +727,7 @@ class GaussianDiffusion:
             pass to the model. This can be used for conditioning.
         :param noise: if specified, the specific Gaussian noise to try to remove.
         :return: a dict with the key "loss" containing a tensor of shape [N].
+                 When using MSE, a scalar "loss_scalar" is also provided.
                  Some mean or variance settings may also have other keys.
         """
         if model_kwargs is None:
@@ -780,14 +782,30 @@ class GaussianDiffusion:
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape
-            # terms["mse"] = mean_flat((target - model_output) ** 2)
-            terms["mse"] = (target - model_output) ** 2
+            terms["mse"] = mean_flat((target - model_output) ** 2)
             if "vb" in terms:
                 terms["loss"] = terms["mse"] + terms["vb"]
             else:
                 terms["loss"] = terms["mse"]
+            terms["loss_scalar"] = terms["loss"].mean()
         else:
             raise NotImplementedError(self.loss_type)
+
+        if "loss" in terms and "loss_scalar" not in terms:
+            terms["loss_scalar"] = terms["loss"].mean()
+
+        if os.getenv("ROSS3D_DEBUG_DENOISER_SHAPES") == "1" and "mse" in terms:
+            if not hasattr(self, "_ross3d_logged_shapes"):
+                self._ross3d_logged_shapes = True
+                from ross3d.utils import rank0_print
+                rank0_print(
+                    "[mm_inv_projector][denoiser][shapes] "
+                    f"x_start={tuple(x_start.shape)} "
+                    f"model_output={tuple(model_output.shape)} "
+                    f"target={tuple(target.shape)} "
+                    f"loss={tuple(terms['loss'].shape)} "
+                    f"loss_scalar={tuple(terms['loss_scalar'].shape)}"
+                )
 
         return terms
 

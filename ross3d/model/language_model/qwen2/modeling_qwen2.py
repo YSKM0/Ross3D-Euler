@@ -1051,6 +1051,22 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 all_hidden_states += (hidden_states,)
 
             if self.gradient_checkpointing and self.training:
+                # Keep checkpoint mode explicit at the callsite to avoid version-
+                # dependent implicit defaults (torch>=2.5 warns/error when omitted).
+                # The mode is configurable from training args and stored on config.
+                use_reentrant = getattr(self.config, "gradient_checkpointing_use_reentrant", False)
+                if (
+                    getattr(self.config, "verbose_logging", False)
+                    and getattr(self.config, "_qwen2_ckpt_log_count", 0) < 8
+                ):
+                    log_count = getattr(self.config, "_qwen2_ckpt_log_count", 0)
+                    logger.warning(
+                        "[checkpoint-debug][qwen2] checkpoint decoder_layer call; "
+                        "use_reentrant=%s layer_idx=%s",
+                        use_reentrant,
+                        len(all_hidden_states) if all_hidden_states is not None else "n/a",
+                    )
+                    setattr(self.config, "_qwen2_ckpt_log_count", log_count + 1)
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
@@ -1059,6 +1075,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     past_key_values,
                     output_attentions,
                     use_cache,
+                    use_reentrant=use_reentrant,
                 )
             else:
                 layer_outputs = decoder_layer(

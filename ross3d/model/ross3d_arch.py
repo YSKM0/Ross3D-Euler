@@ -22,6 +22,7 @@ import math
 import re
 import time
 import torch
+import torch._dynamo
 import torch.nn as nn
 from transformers.modeling_outputs import ModelOutput
 from einops import rearrange
@@ -309,6 +310,23 @@ class Ross3DMetaForCausalLM(ABC):
     @abstractmethod
     def get_model(self):
         pass
+
+    @staticmethod
+    @torch._dynamo.disable
+    def _sample_posterior_latents(posterior):
+        """Run posterior sampling in eager mode so Dynamo skips tracing randn."""
+        return posterior.sample()
+
+    @staticmethod
+    @torch._dynamo.disable
+    def _pack_vae_latents(z_q):
+        """Run latent packing in eager mode to avoid Dynamo SymInt/einops issues."""
+        if z_q.shape[-1] % 2 == 1:
+            z_q = nn.functional.interpolate(z_q, size=(z_q.shape[-2] + 1, z_q.shape[-1] + 1), mode='bilinear')
+        # group each (2x2) window
+        z_q = z_q.unfold(2, 2, 2).unfold(3, 2, 2)
+        z_q = rearrange(z_q, 'b c h w p1 p2 -> b (c p1 p2) h w').contiguous()
+        return z_q
 
     def get_vision_tower(self):
         return self.get_model().get_vision_tower()
@@ -1010,7 +1028,8 @@ class Ross3DMetaForCausalLM(ABC):
                     cur_new_input_embeds.append(cur_image_features)
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
 
-            cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
+            target_device = cur_input_embeds.device
+            cur_new_input_embeds = [x.to(target_device) for x in cur_new_input_embeds]
 
             # import pdb; pdb.set_trace()
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
@@ -1213,12 +1232,10 @@ class Ross3DMetaForCausalLM(ABC):
 
         with torch.no_grad():
             posterior = self.model.mm_pixel_decoder.encode(images_vae).latent_dist
-            z_q = (posterior.sample() - self.model.mm_pixel_decoder.shift_factor) * self.model.mm_pixel_decoder.scaling_factor
-            if z_q.shape[-1] % 2 == 1:
-                z_q = nn.functional.interpolate(z_q, size=(z_q.shape[-2] + 1, z_q.shape[-1] + 1), mode='bilinear')
-            # group each (2x2) window
-            z_q = z_q.unfold(2, 2, 2).unfold(3, 2, 2)
-            z_q = rearrange(z_q, 'b c h w p1 p2 -> b (c p1 p2) h w').contiguous()
+            z_q = (
+                self._sample_posterior_latents(posterior) - self.model.mm_pixel_decoder.shift_factor
+            ) * self.model.mm_pixel_decoder.scaling_factor
+            z_q = self._pack_vae_latents(z_q)
 
         _log_vm_cuda_memory("after_latents")
 
@@ -1227,7 +1244,7 @@ class Ross3DMetaForCausalLM(ABC):
             #     image_hidden_states) + self.model.mm_inv_projector.pos_embed
             image_hidden_states = self.model.mm_inv_projector.ln_pre(image_hidden_states)
             h = w = int(image_hidden_states.shape[1] ** 0.5)
-            image_hidden_states = rearrange(image_hidden_states, 'b (h w) c -> b c h w', h=h, w=w).contiguous()
+            image_hidden_states = image_hidden_states.transpose(1, 2).reshape(image_hidden_states.shape[0], image_hidden_states.shape[2], h, w).contiguous()
             vm_loss = self.model.mm_inv_projector(
                 z=image_hidden_states.repeat(repeat_factor, 1, 1, 1).contiguous().float(),
                 target=z_q.repeat(repeat_factor, 1, 1, 1).contiguous().float(),
@@ -1279,19 +1296,17 @@ class Ross3DMetaForCausalLM(ABC):
 
         with torch.no_grad():
             posterior = self.model.mm_pixel_decoder.encode(images_vae).latent_dist
-            z_q = (posterior.sample() - self.model.mm_pixel_decoder.shift_factor) * self.model.mm_pixel_decoder.scaling_factor
-            if z_q.shape[-1] % 2 == 1:
-                z_q = nn.functional.interpolate(z_q, size=(z_q.shape[-2] + 1, z_q.shape[-1] + 1), mode='bilinear')
-            # group each (2x2) window
-            z_q = z_q.unfold(2, 2, 2).unfold(3, 2, 2)
-            z_q = rearrange(z_q, 'b c h w p1 p2 -> b (c p1 p2) h w').contiguous()
+            z_q = (
+                self._sample_posterior_latents(posterior) - self.model.mm_pixel_decoder.shift_factor
+            ) * self.model.mm_pixel_decoder.scaling_factor
+            z_q = self._pack_vae_latents(z_q)
 
         with torch.amp.autocast('cuda', dtype=torch.float32):
             # image_hidden_states = self.model.mm_inv_projector.ln_pre(
             #     image_hidden_states) + self.model.mm_inv_projector.pos_embed
             image_hidden_states = self.model.mm_inv_projector.ln_pre(image_hidden_states)
             h = w = int(image_hidden_states.shape[1] ** 0.5)
-            image_hidden_states = rearrange(image_hidden_states, 'b (h w) c -> b c h w', h=h, w=w).contiguous()
+            image_hidden_states = image_hidden_states.transpose(1, 2).reshape(image_hidden_states.shape[0], image_hidden_states.shape[2], h, w).contiguous()
             vm_loss = self.model.mm_inv_projector(
                 z=image_hidden_states.float(),
                 x0=z_q.float(),
@@ -1359,12 +1374,10 @@ class Ross3DMetaForCausalLM(ABC):
 
         with torch.no_grad():
             posterior = self.model.mm_pixel_decoder.encode(images_vae).latent_dist
-            z_q = (posterior.sample() - self.model.mm_pixel_decoder.shift_factor) * self.model.mm_pixel_decoder.scaling_factor
-            if z_q.shape[-1] % 2 == 1:
-                z_q = nn.functional.interpolate(z_q, size=(z_q.shape[-2] + 1, z_q.shape[-1] + 1), mode='bilinear')
-            # group each (2x2) window
-            z_q = z_q.unfold(2, 2, 2).unfold(3, 2, 2)
-            z_q = rearrange(z_q, 'b c h w p1 p2 -> b (c p1 p2) h w').contiguous()
+            z_q = (
+                self._sample_posterior_latents(posterior) - self.model.mm_pixel_decoder.shift_factor
+            ) * self.model.mm_pixel_decoder.scaling_factor
+            z_q = self._pack_vae_latents(z_q)
             # filter
             bev_downsample = torch.nn.functional.interpolate(bev_image, size=(z_q.shape[-2], z_q.shape[-1]), mode='bilinear').mean(dim=1)
             loss_mask = (bev_downsample.unsqueeze(1) > 0).bool().repeat(1, z_q.shape[1], 1, 1)
@@ -1376,7 +1389,7 @@ class Ross3DMetaForCausalLM(ABC):
             #     image_hidden_states) + self.model.mm_inv_projector.pos_embed
             image_hidden_states = self.model.mm_inv_projector.ln_pre(image_hidden_states)
             h = w = int(image_hidden_states.shape[1] ** 0.5)
-            image_hidden_states = rearrange(image_hidden_states, 'b (h w) c -> b c h w', h=h, w=w).contiguous()
+            image_hidden_states = image_hidden_states.transpose(1, 2).reshape(image_hidden_states.shape[0], image_hidden_states.shape[2], h, w).contiguous()
             vm_loss = self.model.mm_inv_projector(
                 z=image_hidden_states.float(),
                 target=z_q.float(),

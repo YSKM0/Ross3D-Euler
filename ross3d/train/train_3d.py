@@ -135,6 +135,14 @@ class ModelArguments:
 
     view_mask_ratio: Optional[float] = field(default=0.)
     view_mask_prob: Optional[float] = field(default=0.)
+    enable_vm_loss: bool = field(
+        default=True,
+        metadata={"help": "Enable view-mask reconstruction auxiliary loss."},
+    )
+    enable_bev_loss: bool = field(
+        default=True,
+        metadata={"help": "Enable BEV reconstruction auxiliary loss (when ross_multi_task=True)."},
+    )
 
     #Hanwliu
     cycle_consist: bool = field(
@@ -262,6 +270,13 @@ class TrainingArguments(transformers.TrainingArguments):
     group_by_modality_length_auto: bool = field(default=False)
     auto_find_batch_size: bool = field(default=False)
     gradient_checkpointing: bool = field(default=True)
+    gradient_checkpointing_use_reentrant: bool = field(
+        default=False,
+        metadata={
+            "help": "Explicitly control torch.utils.checkpoint(use_reentrant=...). "
+            "Recommended False for ZeRO-3 with multi-branch auxiliary losses.",
+        },
+    )
     ddp_find_unused_parameters: Optional[bool] = field(
         default=True,
         metadata={"help": "Enable DDP unused parameter detection (useful for conditional losses)."},
@@ -1563,6 +1578,8 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
 
     overwrite_config["view_mask_ratio"] = model_args.view_mask_ratio
     overwrite_config["view_mask_prob"] = model_args.view_mask_prob
+    overwrite_config["enable_vm_loss"] = model_args.enable_vm_loss
+    overwrite_config["enable_bev_loss"] = model_args.enable_bev_loss
 
     if overwrite_config:
         assert cfg_pretrained is not None, "cfg_pretrained is None"
@@ -1621,6 +1638,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
     setattr(model.config, "cycle_detach_hidden_states", model_args.cycle_detach_hidden_states)
     setattr(model.config, "use_3d_coordinate", model_args.use_3d_coordinate)
     setattr(model.config, "verbose_logging", training_args.verbose_logging)
+    setattr(model.config, "gradient_checkpointing_use_reentrant", training_args.gradient_checkpointing_use_reentrant)
 
     if training_args.gradient_checkpointing and (model_args.cycle_consist or model_args.cycle_consist_v2):
         rank0_print(
@@ -1699,9 +1717,11 @@ def train(attn_implementation=None):
         except (TypeError, ValueError):
             supports_use_reentrant = False
 
-        def _non_reentrant_checkpoint(function, *args, **kwargs):
+        desired_use_reentrant = bool(training_args.gradient_checkpointing_use_reentrant)
+
+        def _checkpoint_with_explicit_mode(function, *args, **kwargs):
             if supports_use_reentrant and "use_reentrant" not in kwargs:
-                kwargs["use_reentrant"] = False
+                kwargs["use_reentrant"] = desired_use_reentrant
             return base_checkpoint(function, *args, **kwargs)
 
         def _patch_module_checkpoint(module_name, wrapper):
@@ -1715,17 +1735,23 @@ def train(attn_implementation=None):
 
             def _checkpoint_debug_wrapper(function, *args, **kwargs):
                 if supports_use_reentrant and "use_reentrant" not in kwargs:
-                    kwargs["use_reentrant"] = False
+                    kwargs["use_reentrant"] = desired_use_reentrant
                     if debug_count["count"] < debug_limit:
-                        rank0_print("[checkpoint-debug] checkpoint() injected use_reentrant=False")
+                        rank0_print(
+                            "[checkpoint-debug] checkpoint() injected "
+                            f"use_reentrant={desired_use_reentrant}"
+                        )
                 if debug_count["count"] < debug_limit:
                     stack = inspect.stack()
                     caller = stack[1] if len(stack) > 1 else None
                     location = f"{caller.filename}:{caller.lineno}" if caller else "unknown"
                     use_reentrant = kwargs.get("use_reentrant", "missing")
+                    fn_name = getattr(function, "__qualname__", getattr(function, "__name__", str(function)))
+                    fn_module = getattr(function, "__module__", "unknown")
                     rank0_print(
                         "[checkpoint-debug] checkpoint() call; "
-                        f"use_reentrant={use_reentrant}, caller={location}"
+                        f"use_reentrant={use_reentrant}, caller={location}, "
+                        f"fn={fn_module}.{fn_name}"
                     )
                     debug_count["count"] += 1
                 return base_checkpoint(function, *args, **kwargs)
@@ -1766,16 +1792,19 @@ def train(attn_implementation=None):
                 "(set to 1 to log checkpoint callsites)"
             )
         if supports_use_reentrant and not debug_calls_enabled:
-            torch.utils.checkpoint.checkpoint = _non_reentrant_checkpoint
-            _patch_module_checkpoint("ross3d.model.multimodal_encoder.eva_clip.eva_vit", _non_reentrant_checkpoint)
-            _patch_module_checkpoint("ross3d.model.multimodal_encoder.dev_eva_clip.eva_clip.eva_vit_model", _non_reentrant_checkpoint)
-            _patch_module_checkpoint("ross3d.model.multimodal_encoder.dev_eva_clip.eva_clip.transformer", _non_reentrant_checkpoint)
+            torch.utils.checkpoint.checkpoint = _checkpoint_with_explicit_mode
+            _patch_module_checkpoint("ross3d.model.multimodal_encoder.eva_clip.eva_vit", _checkpoint_with_explicit_mode)
+            _patch_module_checkpoint("ross3d.model.multimodal_encoder.dev_eva_clip.eva_clip.eva_vit_model", _checkpoint_with_explicit_mode)
+            _patch_module_checkpoint("ross3d.model.multimodal_encoder.dev_eva_clip.eva_clip.transformer", _checkpoint_with_explicit_mode)
 
         def _build_checkpoint_func():
             checkpoint_func = base_checkpoint
             try:
                 if "use_reentrant" in inspect.signature(checkpoint_func).parameters:
-                    return functools.partial(checkpoint_func, use_reentrant=False)
+                    return functools.partial(
+                        checkpoint_func,
+                        use_reentrant=desired_use_reentrant,
+                    )
             except (TypeError, ValueError):
                 pass
             return checkpoint_func
@@ -1807,13 +1836,18 @@ def train(attn_implementation=None):
 
         if hasattr(model, "gradient_checkpointing_enable"):
             try:
-                model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": desired_use_reentrant}
+                )
             except TypeError:
                 model.gradient_checkpointing_enable()
                 model.apply(_set_checkpoint_func)
             else:
                 if training_args.verbose_logging:
-                    rank0_print("[checkpoint-debug] model.gradient_checkpointing_enable used use_reentrant=False")
+                    rank0_print(
+                        "[checkpoint-debug] model.gradient_checkpointing_enable used "
+                        f"use_reentrant={desired_use_reentrant}"
+                    )
         if training_args.verbose_logging:
             modules_with_gc = []
             modules_with_checkpoint_func = []
@@ -2050,6 +2084,20 @@ def train(attn_implementation=None):
                     for name, param in model.named_parameters():
                         if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name and "mm_inv_projector" not in name and "mm_pixel_decoder" not in name:
                             param.requires_grad_(True)
+
+        if training_args.verbose_logging:
+            inv_projector = getattr(model.get_model(), "mm_inv_projector", None)
+            if inv_projector is None:
+                rank0_print("[mm_inv_projector][debug] mm_inv_projector is None.")
+            else:
+                inv_total = sum(p.numel() for p in inv_projector.parameters())
+                inv_trainable = sum(p.numel() for p in inv_projector.parameters() if p.requires_grad)
+                rank0_print(
+                    "[mm_inv_projector][debug] "
+                    f"params={inv_total:,}, trainable={inv_trainable:,}"
+                )
+                if inv_trainable == 0:
+                    rank0_print("[mm_inv_projector][debug] WARNING: no trainable parameters.")
 
         if model_args.world_position_embedding_type is not None:
             for name, param in model.named_parameters():
