@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-MID_RUN_NAME="train-cyclev1-8"
+MID_RUN_NAME="train-cyclev1-4"
 echo "MID_RUN_NAME: ${MID_RUN_NAME}"
 
 # Slurm context (these should exist inside the allocation step)
@@ -37,14 +37,14 @@ echo "This node rank = $NODE_RANK"
 echo "Visible GPUs (local): $CUDA_VISIBLE_DEVICES"
 echo "==============================="
 
-export ROSS3D_DEBUG_CHECKPOINT_CALLS=1
-export ROSS3D_DEBUG_CHECKPOINT_CALLS_LIMIT=20
+# export ROSS3D_DEBUG_CHECKPOINT_CALLS=1
+# export ROSS3D_DEBUG_CHECKPOINT_CALLS_LIMIT=20
 
 #  --torch_compile True \
 #  --torch_compile_backend "inductor" \
 # Launch distributed training: 4 ranks per node, across SLURM_NNODES nodes
 python -m torch.distributed.run \
-    --nproc_per_node=1 \
+    --nproc_per_node=4 \
     --nnodes="${SLURM_NNODES}" \
     --node_rank="${NODE_RANK}" \
     --master_addr="${MASTER_ADDR}" \
@@ -77,12 +77,15 @@ python -m torch.distributed.run \
     --bf16 True \
     --run_name ${MID_RUN_NAME} \
     --output_dir "./checkpoints/${MID_RUN_NAME}" \
+    --torch_compile True \
+    --torch_compile_backend "inductor" \
     --num_train_epochs 1 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
     --save_steps 1000 \
     --save_total_limit 1 \
-    --save_only_model \
+    --save_strategy "steps" \
+    --save_steps 300 \
     --weight_decay 0. \
     --lr_scheduler_type "cosine" \
     --logging_steps 1 \
@@ -113,4 +116,4 @@ python -m torch.distributed.run \
     --cycle_debug_optimizer False \
     --adamw_use_foreach True \
     --cycle_filter_positive_depth False \
-    --report_to wandb --run_name $MID_RUN_NAME
+    --report_to wandb 

@@ -40,6 +40,14 @@ echo "==============================="
 export ROSS3D_DEBUG_CHECKPOINT_CALLS=1
 export ROSS3D_DEBUG_CHECKPOINT_CALLS_LIMIT=20
 
+CKPT_USE_REENTRANT="${CKPT_USE_REENTRANT:-False}"
+ENABLE_VM_LOSS="${ENABLE_VM_LOSS:-True}"
+ENABLE_BEV_LOSS="${ENABLE_BEV_LOSS:-True}"
+ZERO_CONFIG="${ZERO_CONFIG:-./scripts/3d/zero3.json}"
+
+echo "CKPT_USE_REENTRANT=${CKPT_USE_REENTRANT} ENABLE_VM_LOSS=${ENABLE_VM_LOSS} ENABLE_BEV_LOSS=${ENABLE_BEV_LOSS}"
+echo "ZERO_CONFIG=${ZERO_CONFIG}"
+
 #  --torch_compile True \
 #  --torch_compile_backend "inductor" \
 # Launch distributed training: 4 ranks per node, across SLURM_NNODES nodes
@@ -56,7 +64,7 @@ python -m torch.distributed.run \
   --warmup_ratio 0.03 \
   --view_mask_ratio 0.25 \
   --view_mask_prob 0.25 \
-  --deepspeed ./scripts/3d/zero3.json \
+  --deepspeed "${ZERO_CONFIG}" \
   --model_name_or_path ./checkpoints/LLaVA-Video-7B-Qwen2 \
   --pretrain_mm_inv_adapter ./checkpoints/mm_inv_projector.bin \
   --version qwen_1_5 \
@@ -92,6 +100,9 @@ python -m torch.distributed.run \
   --tf32 True \
   --model_max_length 32768 \
   --gradient_checkpointing True \
+  --gradient_checkpointing_use_reentrant "${CKPT_USE_REENTRANT}" \
+  --enable_vm_loss "${ENABLE_VM_LOSS}" \
+  --enable_bev_loss "${ENABLE_BEV_LOSS}" \
   --dataloader_num_workers 2 \
   --lazy_preprocess True \
   --torch_compile False \

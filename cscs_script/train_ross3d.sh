@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-MID_RUN_NAME="ross3d-train-inductor"
+MID_RUN_NAME="ross3d-train-4"
 echo "MID_RUN_NAME: ${MID_RUN_NAME}"
 
 # Slurm context (these should exist inside the allocation step)
@@ -37,8 +37,8 @@ echo "This node rank = $NODE_RANK"
 echo "Visible GPUs (local): $CUDA_VISIBLE_DEVICES"
 echo "==============================="
 
-export ROSS3D_DEBUG_CHECKPOINT_CALLS=1
-export ROSS3D_DEBUG_CHECKPOINT_CALLS_LIMIT=20
+# export ROSS3D_DEBUG_CHECKPOINT_CALLS=1
+# export ROSS3D_DEBUG_CHECKPOINT_CALLS_LIMIT=20
 
 #  --torch_compile True \
 #  --torch_compile_backend "inductor" \
@@ -56,7 +56,7 @@ python -m torch.distributed.run \
   --warmup_ratio 0.03 \
   --view_mask_ratio 0.25 \
   --view_mask_prob 0.25 \
-  --deepspeed ./scripts/3d/zero3.json \
+  --deepspeed ./scripts/3d/zero3_original.json \
   --model_name_or_path ./checkpoints/LLaVA-Video-7B-Qwen2 \
   --pretrain_mm_inv_adapter ./checkpoints/mm_inv_projector.bin \
   --version qwen_1_5 \
@@ -85,7 +85,6 @@ python -m torch.distributed.run \
   --save_strategy "steps" \
   --save_steps 300 \
   --save_total_limit 1 \
-  --save_only_model \
   --weight_decay 0. \
   --lr_scheduler_type "cosine" \
   --logging_steps 1 \
@@ -94,7 +93,8 @@ python -m torch.distributed.run \
   --gradient_checkpointing True \
   --dataloader_num_workers 2 \
   --lazy_preprocess True \
-  --torch_compile False \
+  --torch_compile True \
+  --torch_compile_backend "inductor" \
   --dataloader_drop_last True \
   --mm_newline_position grid \
   --add_spatial_instruction True \
@@ -106,7 +106,7 @@ python -m torch.distributed.run \
   --group_by_task_length True \
   --frame_sampling_strategy uniform \
   --frames_upbound 32 \
-  --verbose_logging True \
+  --verbose_logging False \
   --cycle_debug_grad False \
   --cycle_debug_optimizer False \
-  --report_to wandb --run_name $MID_RUN_NAME
+  --report_to wandb 

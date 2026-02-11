@@ -6,7 +6,7 @@
 
 #SBATCH --nodes=1                       # interactive srun defaults to a single allocation unless requested otherwise
 #SBATCH --ntasks-per-node=1             # run one launcher task; your script handles any internal parallelism
-#SBATCH --gpus-per-node=1               # Clariden GH200 nodes provide 4 GPUs; request GPUs explicitly :contentReference[oaicite:2]{index=2}
+#SBATCH --gpus-per-node=4               # Clariden GH200 nodes provide 4 GPUs; request GPUs explicitly :contentReference[oaicite:2]{index=2}
 #SBATCH --cpus-per-task=288             # map full node CPU resources to the single task (CSCS tutorial pattern) :contentReference[oaicite:3]{index=3}
 
 #SBATCH --output=logs/slurm-%x-%j.out   # stdout (and stderr unless --error is set) :contentReference[oaicite:4]{index=4}
@@ -27,7 +27,7 @@ export WANDB_API_KEY="wandb_v1_HWZCob8EJKyrPL8cU2JWeV1Io6m_54eIfX1yigdZDsDBN39bK
 # Run inside the CSCS Container Engine EDF environment.
 # CSCS recommends using --environment with srun in batch scripts (and discourages #SBATCH --environment). :contentReference[oaicite:6]{index=6}
 
-srun -ul --environment=./clariden-ngc-pytorch-24.10-ffmpeg.toml bash -lc "
+srun -ul --environment=./clariden-ngc-pytorch-24.10-ffmpeg-original.toml bash -lc "
   #export TORCH_COMPILE_DISABLE=1
   #export TORCHDYNAMO_DISABLE=1
   #export DISABLE_TORCHDYNAMO=1
@@ -35,11 +35,11 @@ srun -ul --environment=./clariden-ngc-pytorch-24.10-ffmpeg.toml bash -lc "
   cd /iopsstor/scratch/cscs/hanwliu/project/Ross3D-Euler
 
   # Activate your venv exactly like in the interactive session
-  source ross3d-clariden/bin/activate
+  source ross3d-clariden-original/bin/activate
 
   # Match your test env var setup
   export WANDB_API_KEY="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"
 
   # Launch training
-  bash /iopsstor/scratch/cscs/hanwliu/project/Ross3D-Euler/scripts/3d/train/train_ross3d.sh
+  bash /iopsstor/scratch/cscs/hanwliu/project/Ross3D-Euler/cscs_script/train_ross3d.sh
 "

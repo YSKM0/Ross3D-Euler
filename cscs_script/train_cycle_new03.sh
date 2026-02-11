@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-MID_RUN_NAME="train-cyclev103*8"
+MID_RUN_NAME="train-cyclev103-8"
 echo "MID_RUN_NAME: ${MID_RUN_NAME}"
 
 # Slurm context (these should exist inside the allocation step)
@@ -44,7 +44,7 @@ export ROSS3D_DEBUG_CHECKPOINT_CALLS_LIMIT=20
 #  --torch_compile_backend "inductor" \
 # Launch distributed training: 4 ranks per node, across SLURM_NNODES nodes
 python -m torch.distributed.run \
-    --nproc_per_node=1 \
+    --nproc_per_node=4 \
     --nnodes="${SLURM_NNODES}" \
     --node_rank="${NODE_RANK}" \
     --master_addr="${MASTER_ADDR}" \
