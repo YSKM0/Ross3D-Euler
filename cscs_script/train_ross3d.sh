@@ -64,7 +64,7 @@ python -m torch.distributed.run \
   --image_folder data \
   --video_folder data \
   --embodiedscan_folder ./data/embodiedscan/ \
-  --mm_tunable_parts "mm_mlp_adapter,mm_language_model,mm_inv_adapter" \
+  --mm_tunable_parts "mm_mlp_adapter,mm_language_model, mm_inv_adapter" \
   --vision_tower ./models/siglip-so400m-patch14-384 \
   --ross_multi_task True \
   --mm_pixel_decoder ./checkpoints/FLUX.1-dev/vae \
@@ -93,8 +93,6 @@ python -m torch.distributed.run \
   --gradient_checkpointing True \
   --dataloader_num_workers 2 \
   --lazy_preprocess True \
-  --torch_compile True \
-  --torch_compile_backend "inductor" \
   --dataloader_drop_last True \
   --mm_newline_position grid \
   --add_spatial_instruction True \

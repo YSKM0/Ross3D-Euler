@@ -34,8 +34,7 @@
 
     "gather_16bit_weights_on_model_save": true,
 
-    "use_all_reduce_for_fetch_params": false,
-    "module_granularity_threshold": 1000000
+    "use_all_reduce_for_fetch_params": false
   },
 
   "gradient_accumulation_steps": "auto",

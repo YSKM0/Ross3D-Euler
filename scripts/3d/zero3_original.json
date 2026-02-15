@@ -8,14 +8,15 @@
     "offload_optimizer": { "device": "none", "pin_memory": true },
     "offload_param": { "device": "none", "pin_memory": true },
 
-    "overlap_comm": true,
+    "overlap_comm": false,
+    "ignore_unused_parameters": true,
     "contiguous_gradients": true,
-    "reduce_scatter": true,
+    "reduce_scatter": false,
     "allgather_partitions": true,
 
     "allgather_bucket_size": 12845056,
     "reduce_bucket_size": 12845056,
-    "prefetch_bucket_size": 11560550,
+    "prefetch_bucket_size": 0,
     "param_persistence_threshold": 35840,
 
     "sub_group_size": 1000000000,
@@ -23,6 +24,12 @@
     "gather_16bit_weights_on_model_save": true,
 
     "use_all_reduce_for_fetch_params": false
+  },
+
+    "activation_checkpointing": {
+    "partition_activations": true,
+    "contiguous_memory_optimization": true,
+    "synchronize_checkpoint_boundary": true
   },
 
   "gradient_accumulation_steps": "auto",
