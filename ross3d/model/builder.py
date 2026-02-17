@@ -25,6 +25,24 @@ from ross3d.utils import rank0_print
 from types import SimpleNamespace
 
 
+def _is_llava_or_multimodal(model_path, model_name, customized_config=None):
+    cfg = customized_config
+    if cfg is None:
+        try:
+            cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        except Exception as e:
+            warnings.warn(f"Failed to infer model type from config at {model_path}: {e}")
+            return False
+
+    model_type = getattr(cfg, "model_type", None)
+    architectures = getattr(cfg, "architectures", None) or []
+
+    if model_type == "llava":
+        return True
+
+    return any("ross3d" in arch.lower() for arch in architectures)
+
+
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", torch_dtype="float16",attn_implementation="flash_attention_2", customized_config=None, overwrite_config=None, **kwargs):
     kwargs["device_map"] = device_map
 
@@ -43,28 +61,35 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
     if customized_config is not None:
         kwargs["config"] = customized_config
 
-    if "multimodal" in kwargs:
-        if kwargs["multimodal"] is True:
-            is_multimodal = True
-            kwargs.pop("multimodal")
-    else:
-        is_multimodal = False
+    detected_multimodal = _is_llava_or_multimodal(model_path, model_name, customized_config=customized_config)
 
-    if "llava" in model_name.lower() or is_multimodal:
-        # Load LLaVA model
-        if "qwen" in model_name.lower():
+    if "multimodal" in kwargs:
+        is_multimodal = bool(kwargs.pop("multimodal"))
+    else:
+        is_multimodal = detected_multimodal
+
+    if is_multimodal:
+        # Load multimodal model based on config architecture, not folder name
+        base_cfg = kwargs.get("config")
+        if base_cfg is None:
+            base_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+
+        architectures = getattr(base_cfg, "architectures", None) or []
+
+        if any("Ross3DQwenForCausalLM" in arch for arch in architectures):
             tokenizer = AutoTokenizer.from_pretrained(model_path)
             from ross3d.model.language_model.ross3d_qwen import Ross3DQwenConfig
+
             if overwrite_config is not None:
-                cfg = Ross3DQwenConfig.from_pretrained(model_path)
+                ross_cfg = Ross3DQwenConfig.from_pretrained(model_path)
                 rank0_print(f"Overwriting config with {overwrite_config}")
                 for k, v in overwrite_config.items():
-                    setattr(cfg, k, v)
-                model = Ross3DQwenForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, attn_implementation=attn_implementation, config=cfg, **kwargs)
+                    setattr(ross_cfg, k, v)
+                model = Ross3DQwenForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, attn_implementation=attn_implementation, config=ross_cfg, trust_remote_code=True, **kwargs)
             else:
-                model = Ross3DQwenForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, attn_implementation=attn_implementation, **kwargs)
+                model = Ross3DQwenForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, attn_implementation=attn_implementation, trust_remote_code=True, **kwargs)
         else:
-            raise ValueError(f"Model {model_name} not supported")
+            raise ValueError(f"Multimodal model architecture not supported: {architectures}")
 
     else:
         # Load language model
@@ -96,7 +121,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
     rank0_print(f"Model Class: {model.__class__.__name__}")
     image_processor = None
 
-    if "llava" in model_name.lower() or is_multimodal:
+    if is_multimodal:
         mm_use_im_start_end = getattr(model.config, "mm_use_im_start_end", False)
         mm_use_im_patch_token = getattr(model.config, "mm_use_im_patch_token", True)
         if mm_use_im_patch_token:
