@@ -436,6 +436,9 @@ def smart_tokenizer_and_embedding_resize(
     Note: This is the unoptimized version that may make your embedding size not be divisible by 64.
     """
     num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict)
+    if num_new_tokens == 0:
+        return
+
     model.resize_token_embeddings(len(tokenizer))
 
     if num_new_tokens > 0:
@@ -458,6 +461,9 @@ def add_tokens_and_resize_embeddings(
     Note: This is the unoptimized version that may make your embedding size not be divisible by 64.
     """
     num_new_tokens = tokenizer.add_tokens(new_tokens)
+    if num_new_tokens == 0:
+        return
+
     model.resize_token_embeddings(len(tokenizer))
 
     if num_new_tokens > 0:
@@ -1481,7 +1487,8 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, dat
     return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
 
-def get_model(model_args, training_args, bnb_model_from_pretrained_args):
+def get_model(model_args, training_args, bnb_model_from_pretrained_args, load_source=None):
+    load_source = load_source or model_args.model_name_or_path
     assert training_args.attn_implementation
     if training_args.attn_implementation == "sdpa" and torch.__version__ < "2.1.2":
         raise ValueError("The 'sdpa' attention implementation requires torch version 2.1.2 or higher.")
@@ -1502,7 +1509,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
             model_args.mm_resampler_type is not None,
         ]
     ):
-        cfg_pretrained = AutoConfig.from_pretrained(model_args.model_name_or_path)
+        cfg_pretrained = AutoConfig.from_pretrained(load_source)
 
     if model_args.use_pos_skipping is not None and model_args.pos_skipping_range is not None:
         overwrite_config["use_pos_skipping"] = model_args.use_pos_skipping
@@ -1595,7 +1602,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         model_class = getattr(transformers, actual_model_class_name)
         rank0_print(f"Using model class {model_class} from {model_args.model_class_name}")
         model = model_class.from_pretrained(
-            model_args.model_name_or_path,
+            load_source,
             cache_dir=training_args.cache_dir,
             attn_implementation=training_args.attn_implementation,
             torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
@@ -1603,9 +1610,22 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
             **customized_kwargs,
         )
     elif model_args.vision_tower is not None:
-        if "qwen" in model_args.model_name_or_path.lower():
+        # Prefer config-based model class detection (robust to checkpoint directory names),
+        # but keep the original path-based heuristic as fallback for backwards compatibility.
+        cfg_architectures = getattr(cfg_pretrained, "architectures", [])
+        if isinstance(cfg_architectures, str):
+            cfg_architectures = [cfg_architectures]
+        cfg_architectures = [arch.lower() for arch in cfg_architectures]
+
+        is_qwen_style_checkpoint = (
+            "qwen" in model_args.model_name_or_path.lower()
+            or "qwen" in (model_args.version or "").lower()
+            or any("qwen" in arch for arch in cfg_architectures)
+        )
+
+        if is_qwen_style_checkpoint:
             model = Ross3DQwenForCausalLM.from_pretrained(
-                model_args.model_name_or_path,
+                load_source,
                 cache_dir=training_args.cache_dir,
                 attn_implementation=training_args.attn_implementation,
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
@@ -1613,10 +1633,14 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                 **customized_kwargs,
             )
         else:
-            raise ValueError(f"Unknown model class {model_args}")
+            raise ValueError(
+                "Unknown model class for multimodal checkpoint. "
+                f"model_name_or_path={load_source}, "
+                f"version={model_args.version}, architectures={cfg_architectures}"
+            )
     else:
         model = transformers.LlamaForCausalLM.from_pretrained(
-            model_args.model_name_or_path,
+            load_source,
             cache_dir=training_args.cache_dir,
             attn_implementation=training_args.attn_implementation,
             torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
@@ -1655,6 +1679,16 @@ def train(attn_implementation=None):
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    existing_checkpoints = sorted(
+        pathlib.Path(training_args.output_dir).glob("checkpoint-*"),
+        key=lambda path: int(path.name.split("-")[-1]) if path.name.split("-")[-1].isdigit() else -1,
+    )
+    resume_checkpoint = str(existing_checkpoints[-1]) if existing_checkpoints else None
+    is_resuming = resume_checkpoint is not None
+    load_source = resume_checkpoint if is_resuming else model_args.model_name_or_path
+    if is_resuming:
+        rank0_print(f"[resume] Using checkpoint as load source: {load_source}")
+
     if training_args.verbose_logging:
         rank0_print(f"Inspecting experiment hyperparameters:\n")
         rank0_print(f"model_args = {vars(model_args)}\n\n")
@@ -1690,7 +1724,7 @@ def train(attn_implementation=None):
     model_args.min_xyz_range = data_args.min_xyz_range
     model_args.max_xyz_range = data_args.max_xyz_range
 
-    model = get_model(model_args, training_args, bnb_model_from_pretrained_args)
+    model = get_model(model_args, training_args, bnb_model_from_pretrained_args, load_source=load_source)
     model.config.use_cache = False
     if model_args.rope_scaling_factor is not None and model_args.rope_scaling_type is not None:
         model.config.rope_scaling = {
@@ -1899,34 +1933,53 @@ def train(attn_implementation=None):
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
 
-    if "mistral" in model_args.model_name_or_path.lower() or "mixtral" in model_args.model_name_or_path.lower() or "zephyr" in model_args.model_name_or_path.lower():
+    model_path_lower = load_source.lower()
+    cfg_architectures = getattr(model.config, "architectures", [])
+    if isinstance(cfg_architectures, str):
+        cfg_architectures = [cfg_architectures]
+    cfg_architectures = [arch.lower() for arch in cfg_architectures]
+
+    tokenizer_source = load_source
+
+    if "mistral" in model_path_lower or "mixtral" in model_path_lower or "zephyr" in model_path_lower:
         tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_args.model_name_or_path,
+            tokenizer_source,
             cache_dir=training_args.cache_dir,
             model_max_length=training_args.model_max_length,
             padding_side="left",
         )
-    elif "qwen" in model_args.model_name_or_path.lower():
+    elif (
+        "qwen" in model_path_lower
+        or "qwen" in (model_args.version or "").lower()
+        or any("qwen" in arch for arch in cfg_architectures)
+    ):
         tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_args.model_name_or_path,
+            tokenizer_source,
             cache_dir=training_args.cache_dir,
             model_max_length=training_args.model_max_length,
             padding_side="right",
         )
     elif (
-        "wizardlm-2" in model_args.model_name_or_path.lower()
-        or "vicuna" in model_args.model_name_or_path.lower()
-        or "llama" in model_args.model_name_or_path.lower()
-        or "yi" in model_args.model_name_or_path.lower()
-        or "nous-hermes" in model_args.model_name_or_path.lower()
-        and "wizard-2" in model_args.model_name_or_path.lower()
+        "wizardlm-2" in model_path_lower
+        or "vicuna" in model_path_lower
+        or "llama" in model_path_lower
+        or "yi" in model_path_lower
+        or "nous-hermes" in model_path_lower
+        and "wizard-2" in model_path_lower
     ):
         tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_args.model_name_or_path,
+            tokenizer_source,
             cache_dir=training_args.cache_dir,
             model_max_length=training_args.model_max_length,
             padding_side="right",
             use_fast=False,
+        )
+    else:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            tokenizer_source,
+            cache_dir=training_args.cache_dir,
+            model_max_length=training_args.model_max_length,
+            padding_side="right",
         )
 
     rank0_print(f"Prompt version: {model_args.version}")
@@ -1950,20 +2003,30 @@ def train(attn_implementation=None):
     # add ground tokens
     if model_args.ground_head_type:
         from ross3d.constants import GROUND_TOKEN
+
+    if model_args.ground_head_type and not is_resuming:
         ground_tokens = [GROUND_TOKEN]
         add_tokens_and_resize_embeddings(
             ground_tokens,
             tokenizer=tokenizer,
             model=model,
         )
-        setattr(model.config, "ground_token_ids", tokenizer.encode("".join(ground_tokens), add_special_tokens=False))
+    if model_args.ground_head_type:
+        ground_token_ids = tokenizer.encode(GROUND_TOKEN, add_special_tokens=False)
+        if is_resuming and len(ground_token_ids) == 0:
+            raise ValueError(f"Missing {GROUND_TOKEN} in resumed tokenizer at {tokenizer_source}")
+        setattr(model.config, "ground_token_ids", ground_token_ids)
 
-    add_tokens_and_resize_embeddings(
-        ["<coord>"],
-        tokenizer=tokenizer,
-        model=model,
-    )
-    setattr(model.config, "coord_token_ids", tokenizer.encode("".join(["<coord>"]), add_special_tokens=False))
+    if not is_resuming:
+        add_tokens_and_resize_embeddings(
+            ["<coord>"],
+            tokenizer=tokenizer,
+            model=model,
+        )
+    coord_token_ids = tokenizer.encode("<coord>", add_special_tokens=False)
+    if is_resuming and len(coord_token_ids) == 0:
+        raise ValueError(f"Missing <coord> token in resumed tokenizer at {tokenizer_source}")
+    setattr(model.config, "coord_token_ids", coord_token_ids)
     setattr(model.config, "vocab_size", len(tokenizer))
     rank0_print(tokenizer)
     rank0_print(model)
@@ -2145,8 +2208,9 @@ def train(attn_implementation=None):
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     trainer = Ross3DTrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
+    if resume_checkpoint is not None:
+        rank0_print(f"Resuming from checkpoint: {resume_checkpoint}")
+        trainer.train(resume_from_checkpoint=resume_checkpoint)
     else:
         try:
             trainer.train()
