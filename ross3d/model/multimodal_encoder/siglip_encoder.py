@@ -7,9 +7,7 @@ from dataclasses import dataclass
 from functools import partial, reduce
 from PIL import Image
 import torch
-import torch._dynamo
 import torch.utils.checkpoint
-import inspect
 from torch import nn
 import os
 from transformers.image_processing_utils import BatchFeature, get_size_dict
@@ -381,19 +379,11 @@ class SigLipEncoder(nn.Module):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
             if self.gradient_checkpointing and self.training:
-                checkpoint_func = getattr(self, "_gradient_checkpointing_func", torch.utils.checkpoint.checkpoint)
-                checkpoint_kwargs = {}
-                try:
-                    if "use_reentrant" in inspect.signature(checkpoint_func).parameters:
-                        checkpoint_kwargs["use_reentrant"] = False
-                except (TypeError, ValueError):
-                    pass
-                layer_outputs = checkpoint_func(
+                layer_outputs = self._gradient_checkpointing_func(
                     encoder_layer.__call__,
                     hidden_states,
                     attention_mask,
                     output_attentions,
-                    **checkpoint_kwargs,
                 )
             else:
                 layer_outputs = encoder_layer(
@@ -556,8 +546,6 @@ class SigLipVisionTower(nn.Module):
         self.vision_tower_name = vision_tower
 
         self.image_processor = SigLipImageProcessor()
-        self._device = torch.device("cpu")
-        self._dtype = torch.float32
 
         if not delay_load:
             rank0_print(f"Loading vision tower: {vision_tower}")
@@ -583,33 +571,18 @@ class SigLipVisionTower(nn.Module):
         self.vision_tower.vision_model.head = nn.Identity()
         self.vision_tower.requires_grad_(False)
 
-        first_param = next(self.vision_tower.parameters())
-        self._device = first_param.device
-        self._dtype = first_param.dtype
-
         self.is_loaded = True
-
-    @staticmethod
-    @torch._dynamo.disable
-    def _vision_forward(vision_tower, images):
-        return vision_tower(images, output_hidden_states=True)
 
     def forward(self, images):
         if type(images) is list:
             image_features = []
             for image in images:
-                image_forward_out = self._vision_forward(
-                    self.vision_tower,
-                    image.to(device=self.device, dtype=self.dtype).unsqueeze(0),
-                )
+                image_forward_out = self.vision_tower(image.to(device=self.device, dtype=self.dtype).unsqueeze(0), output_hidden_states=True)
                 image_feature = image_forward_out.hidden_states[-1].to(image.dtype)
                 assert image_features.shape[-2] == 729
                 image_features.append(image_feature)
         else:
-            image_forward_outs = self._vision_forward(
-                self.vision_tower,
-                images.to(device=self.device, dtype=self.dtype),
-            )
+            image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True)
             image_features = image_forward_outs.hidden_states[-1].to(images.dtype)
             assert image_features.shape[-2] == 729
 
@@ -621,11 +594,13 @@ class SigLipVisionTower(nn.Module):
 
     @property
     def dtype(self):
-        return self._dtype
+        for p in self.vision_tower.parameters():
+            return p.dtype
 
     @property
     def device(self):
-        return self._device
+        for p in self.vision_tower.parameters():
+            return p.device
 
     @property
     def hidden_size(self):
