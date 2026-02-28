@@ -238,6 +238,7 @@ class DataArguments:
     max_xyz_range: List[float] = field(default_factory=lambda: [15, 15, 5])
 
     frame_sampling_strategy: str = 'uniform' # uniform, mc32, mc24
+    fvs_cache_file: str = 'data/metadata/scannet_fvs_selected_frames.json'
 
 
 @dataclass
@@ -1119,6 +1120,7 @@ class LazySupervisedDataset(Dataset):
             min_xyz_range=getattr(data_args, "min_xyz_range", None),
             max_xyz_range=getattr(data_args, "max_xyz_range", None),
             frame_sampling_strategy=getattr(data_args, "frame_sampling_strategy", "uniform"),
+            fvs_cache_file=getattr(data_args, "fvs_cache_file", 'data/metadata/scannet_fvs_selected_frames.json'),
         )
 
         # Handle multiple JSON files specified in the data_path

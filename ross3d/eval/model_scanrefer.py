@@ -140,6 +140,7 @@ def eval_model(questions, args):
         # min_xyz_range=model.config.min_xyz_range,
         # max_xyz_range=model.config.max_xyz_range,
         frame_sampling_strategy=args.frame_sampling_strategy,
+        fvs_cache_file=args.fvs_cache_file,
     )
     
     ret = []
@@ -231,6 +232,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_beams", type=int, default=1)
     parser.add_argument("--max_frame_num", type=int, default=32)
     parser.add_argument("--frame_sampling_strategy", type=str, default='uniform')
+    parser.add_argument("--fvs_cache_file", type=str, default="data/metadata/scannet_fvs_selected_frames.json")
     parser.add_argument("--force_sample", type=bool, default=True)
     parser.add_argument("--overwrite_cfg", type=bool, default=False)
     parser.add_argument("--val_box_type", type=str, default="pred")

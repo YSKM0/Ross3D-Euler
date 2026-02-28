@@ -11,6 +11,108 @@ import json
 from tqdm import tqdm
 import random
 import copy
+import tempfile
+
+
+def euclidean_dist(p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
+    """Squared Euclidean distance from p1 to each row in p2."""
+    p1 = np.reshape(p1, (1, 3))
+    return np.sum((p2 - p1) ** 2, axis=1)
+
+
+def _parse_selected_status(selected_status, n_points: int) -> np.ndarray:
+    """Convert selected_status into a bool mask with length n_points."""
+    if selected_status is None or len(selected_status) == 0:
+        return np.zeros(n_points, dtype=bool)
+
+    ss = np.asarray(selected_status)
+    if ss.dtype == bool:
+        if ss.shape[0] != n_points:
+            raise ValueError(f"selected_status boolean mask must have length {n_points}")
+        return ss.copy()
+
+    mask = np.zeros(n_points, dtype=bool)
+    idx = ss.astype(int).ravel()
+    if idx.size > 0:
+        if np.any(idx < 0) or np.any(idx >= n_points):
+            raise ValueError("selected_status indices out of range")
+        mask[idx] = True
+    return mask
+
+
+def farthest_view_sampling(
+    k: int,
+    candidates,
+    seed: int,
+    selected_status=None,
+):
+    """Greedy farthest-point sampling over candidate camera centers."""
+    points = np.asarray(candidates, dtype=float)
+    n_points = points.shape[0]
+    if n_points == 0 or k <= 0:
+        return []
+    if k > n_points:
+        k = n_points
+
+    selected_mask = _parse_selected_status(selected_status, n_points)
+    dist = np.full(n_points, np.inf, dtype=float)
+    point_left_idx = np.arange(n_points, dtype=int)
+    selected_points = []
+
+    np.random.seed(seed)
+
+    if np.any(selected_mask):
+        selected_points = point_left_idx[selected_mask].tolist()
+        point_left_idx = point_left_idx[~selected_mask]
+
+        for idx in selected_points:
+            d = euclidean_dist(points[idx], points[point_left_idx])
+            dist[point_left_idx] = np.minimum(dist[point_left_idx], d)
+
+        selected_index = selected_points[-1]
+        start_iter = 0
+    else:
+        selected_index = int(np.random.randint(0, n_points))
+        selected_points.append(selected_index)
+        point_left_idx = point_left_idx[point_left_idx != selected_index]
+        start_iter = 1
+
+    for _ in range(start_iter, k):
+        if point_left_idx.size == 0:
+            break
+
+        active_point = points[selected_index]
+        d = euclidean_dist(active_point, points[point_left_idx])
+        dist[point_left_idx] = np.minimum(dist[point_left_idx], d)
+
+        farthest_pos = int(np.argmax(dist[point_left_idx]))
+        selected_index = int(point_left_idx[farthest_pos])
+        selected_points.append(selected_index)
+        point_left_idx = np.delete(point_left_idx, farthest_pos)
+
+    return selected_points
+
+
+def _expand_indices_to_target_count(indices, target_count: int):
+    """Expand sampled indices to target_count deterministically by repeating entries.
+
+    This keeps FVS compatible with existing training assumptions that
+    force-sampled videos yield a fixed number of frames (e.g. 32), even when
+    a scene has fewer available frames.
+    """
+    if target_count <= 0:
+        return []
+    if len(indices) == 0:
+        return []
+    if len(indices) == target_count:
+        return indices
+
+    if len(indices) > target_count:
+        return indices[:target_count]
+
+    # len(indices) < target_count: deterministically repeat via linspace mapping
+    pos = np.linspace(0, len(indices) - 1, target_count, dtype=int)
+    return [indices[i] for i in pos]
 
 def convert_from_uvd(u, v, d, intr, pose):
     # extr = np.linalg.inv(pose)
@@ -79,12 +181,14 @@ class VideoProcessor:
         max_xyz_range=None,
         frame_sampling_strategy='uniform',
         val_box_type='pred',
+        fvs_cache_file='data/metadata/scannet_fvs_selected_frames.json',
     ):
         self.video_folder = video_folder
         self.voxel_size = voxel_size
         self.min_xyz_range = torch.tensor(min_xyz_range) if min_xyz_range is not None else None
         self.max_xyz_range = torch.tensor(max_xyz_range) if max_xyz_range is not None else None
         self.frame_sampling_strategy = frame_sampling_strategy
+        self.fvs_cache_file = fvs_cache_file
         self.scene = {}
         print('============ frame sampling strategy: {} ============='.format(self.frame_sampling_strategy))
 
@@ -127,6 +231,65 @@ class VideoProcessor:
                     max_xyz = [max(v1, v2) for v1, v2 in zip(max_xyz, data)]
                 self.pc_min[scene_id] = torch.Tensor(min_xyz) / 10
                 self.pc_max[scene_id] = torch.Tensor(max_xyz) / 10
+
+        if 'fvs' in self.frame_sampling_strategy:
+            camera_center_file = "data/metadata/scannet_camera_centers.json"
+            self.fvs_camera_centers = {}
+            with open(camera_center_file) as f:
+                data = json.load(f)
+                for dd in data:
+                    self.fvs_camera_centers[dd["video_id"]] = dd["camera_centers"]
+
+            self.fvs_cache = {}
+            if self.fvs_cache_file and os.path.exists(self.fvs_cache_file):
+                try:
+                    with open(self.fvs_cache_file) as f:
+                        self.fvs_cache = json.load(f)
+                except json.JSONDecodeError:
+                    print(
+                        f"[Warning] Failed to parse FVS cache JSON: {self.fvs_cache_file}. "
+                        "Starting with empty cache."
+                    )
+                    self.fvs_cache = {}
+
+    def _save_fvs_cache(self):
+        if not self.fvs_cache_file:
+            return
+        cache_dir = os.path.dirname(self.fvs_cache_file)
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix="fvs_cache_", suffix=".json", dir=cache_dir or None)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(self.fvs_cache, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.fvs_cache_file)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    def _validate_fvs_cache_entry(self, cache_entry, frame_files, num_frames_to_sample):
+        if cache_entry is None:
+            return False
+        if cache_entry.get("total_frames") != len(frame_files):
+            return False
+
+        cached_frame_files = cache_entry.get("frame_files")
+        if not isinstance(cached_frame_files, list) or len(cached_frame_files) != len(frame_files):
+            return False
+        if cached_frame_files != frame_files:
+            return False
+
+        cached_indices = cache_entry.get("selected_indices")
+        if not isinstance(cached_indices, list) or len(cached_indices) != num_frames_to_sample:
+            return False
+        if any((not isinstance(i, int)) for i in cached_indices):
+            return False
+        if any(i < 0 or i >= len(frame_files) for i in cached_indices):
+            return False
+
+        return True
 
 
     def sample_frame_files_mc(self, video_id: str, frames_upbound: int = 32, do_shift=False):
@@ -200,6 +363,55 @@ class VideoProcessor:
 
         return frames, bev_file
 
+    def sample_frame_files_fvs(
+        self,
+        video_id: str,
+        force_sample: bool = False,
+        frames_upbound: int = 0,
+        seed: int = 0,
+    ):
+        meta_info = self.scene[video_id]
+        frame_files = [os.path.join(self.video_folder, img["img_path"]) for img in meta_info["images"]]
+
+        if force_sample:
+            num_frames_to_sample = frames_upbound
+        else:
+            num_frames_to_sample = 10
+
+        camera_centers = self.fvs_camera_centers.get(video_id)
+        if camera_centers is None:
+            raise KeyError(f"Missing camera centers for {video_id} in scannet_camera_centers.json")
+        if len(camera_centers) != len(frame_files):
+            raise ValueError(
+                f"camera center length mismatch for {video_id}: {len(camera_centers)} vs {len(frame_files)}"
+            )
+
+        cache_entry = self.fvs_cache.get(video_id)
+        if self._validate_fvs_cache_entry(cache_entry, frame_files, num_frames_to_sample):
+            sampled_indices = cache_entry["selected_indices"]
+        else:
+            sampled_indices = farthest_view_sampling(
+                k=num_frames_to_sample,
+                candidates=np.asarray(camera_centers, dtype=float),
+                seed=seed,
+            )
+            sampled_indices = sorted(sampled_indices)
+            sampled_indices = _expand_indices_to_target_count(sampled_indices, num_frames_to_sample)
+            self.fvs_cache[video_id] = {
+                "total_frames": len(frame_files),
+                "selected_indices": sampled_indices,
+                "selected_frame_files": [frame_files[i] for i in sampled_indices],
+                "frame_files": frame_files,
+            }
+            self._save_fvs_cache()
+
+        frames = [frame_files[i] for i in sampled_indices]
+
+        scene_id = frame_files[0].split('/')[3]
+        bev_file = f"{frame_files[0].split('/')[0]}/{frame_files[0].split('/')[1]}/scans/{scene_id}/view_0.jpg"
+
+        return frames, bev_file
+
     def calculate_world_coords(
         self,
         video_id: str, 
@@ -270,6 +482,12 @@ class VideoProcessor:
                 video_id,
                 frames_upbound=frames_upbound,
                 do_shift=('shift' in self.frame_sampling_strategy),
+            )
+        elif 'fvs' in self.frame_sampling_strategy:
+            frame_files, bev_file = self.sample_frame_files_fvs(
+                video_id,
+                force_sample=force_sample,
+                frames_upbound=frames_upbound,
             )
         else:
             frame_files, bev_file = self.sample_frame_files(

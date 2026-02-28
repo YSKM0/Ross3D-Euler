@@ -139,6 +139,7 @@ def eval_model(questions, args):
         # min_xyz_range=model.config.min_xyz_range,
         # max_xyz_range=model.config.max_xyz_range,
         frame_sampling_strategy=args.frame_sampling_strategy,
+        fvs_cache_file=args.fvs_cache_file,
     )
     
     ret = []
@@ -301,6 +302,7 @@ if __name__ == "__main__":
     parser.add_argument("--video-folder", type=str, default="data")
     parser.add_argument("--embodiedscan-folder", type=str, default="data/embodiedscan")
     parser.add_argument("--frame_sampling_strategy", type=str, default="uniform")
+    parser.add_argument("--fvs_cache_file", type=str, default="data/metadata/scannet_fvs_selected_frames.json")
     parser.add_argument("--extra-prompt", type=str, default="The video captures 3D spatial information of a scene. Please focus on the spatial relationships in the video and answer the following questions.\n")
     parser.add_argument("--question-file", type=str, default="tables/question.jsonl")
     parser.add_argument("--answer-file", type=str, default="answer.jsonl")

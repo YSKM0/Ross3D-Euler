@@ -81,6 +81,23 @@ And then we perform the maximum coverage sampling offiline, and the results will
 python scripts/3d/preprocessing/max_coverage_sampling.py
 ```
 
+3. (Optional) Prepare per-frame camera centers for FVS (farthest-view-sampling). The results will be saved at `data/metadata/scannet_camera_centers.json`.
+```bash
+python scripts/3d/preprocessing/extract_camera_centers.py
+```
+
+4. (Optional) Pre-sample all scenes listed by your training YAML using FVS and save reusable selections to cache.
+```bash
+python scripts/3d/preprocessing/presample_fvs_from_yaml.py \
+  --data_yaml scripts/3d/train/video3dllm_223k.yaml \
+  --annotation_dir data/embodiedscan \
+  --video_folder data \
+  --force_sample \
+  --frames_upbound 32 \
+  --fvs_cache_file data/metadata/scannet_fvs_selected_frames.json
+```
+If `--camera_center_file` does not exist yet, the script will compute camera centers from per-frame pose files on-the-fly. Add `--save_camera_centers` to save them for future reuse.
+
 ### Downstream Benchmarks
 1. SQA3D: Download the [SQA3D](https://github.com/SilongYong/SQA3D?tab=readme-ov-file) and convert the annotation to the LLaVA format using the following script.
 ```bash
