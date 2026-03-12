@@ -52,6 +52,27 @@ class Ross3DQwenConfig(Qwen2Config):
         self.cycle_debug_optimizer = kwargs.get("cycle_debug_optimizer", False)
         self.cycle_detach_hidden_states = kwargs.get("cycle_detach_hidden_states", True)
         self.use_3d_coordinate = kwargs.get("use_3d_coordinate", True)
+        self.occupancy_projector_dim = kwargs.get("occupancy_projector_dim", None)
+        self.enable_occ_geom_loss = kwargs.get("enable_occ_geom_loss", False)
+        self.occ_geom_loss_weight = kwargs.get("occ_geom_loss_weight", 0.0)
+        self.occ_geom_mask_weight = kwargs.get("occ_geom_mask_weight", 1.0)
+        self.occ_geom_box_weight = kwargs.get("occ_geom_box_weight", 1.0)
+        self.occ_geom_ctr_weight = kwargs.get("occ_geom_ctr_weight", 1.0)
+        self.occ_geom_vis_weight = kwargs.get("occ_geom_vis_weight", 1.0)
+        self.occ_geom_mask_dice_weight = kwargs.get("occ_geom_mask_dice_weight", 0.5)
+        self.occ_geom_box_giou_weight = kwargs.get("occ_geom_box_giou_weight", 1.0)
+        self.occ_geom_center_alpha = kwargs.get("occ_geom_center_alpha", 0.1)
+        self.occ_geom_eps = kwargs.get("occ_geom_eps", 1e-6)
+        self.enable_occ_temp_loss = kwargs.get("enable_occ_temp_loss", False)
+        self.occ_temp_loss_weight = kwargs.get("occ_temp_loss_weight", 0.0)
+        self.occ_temp_eps = kwargs.get("occ_temp_eps", 1e-6)
+        self.occ_temp_min_frames = kwargs.get("occ_temp_min_frames", 2)
+        self.occ_temp_pos_weight = kwargs.get("occ_temp_pos_weight", 1.0)
+        self.occ_temp_same_min_margin = kwargs.get("occ_temp_same_min_margin", 0.10)
+        self.occ_temp_same_max_margin = kwargs.get("occ_temp_same_max_margin", 0.25)
+        self.occ_temp_same_weight = kwargs.get("occ_temp_same_weight", 1.0)
+        self.occ_temp_diff_margin = kwargs.get("occ_temp_diff_margin", 0.30)
+        self.occ_temp_diff_weight = kwargs.get("occ_temp_diff_weight", 1.0)
 
 
 class Ross3DQwenModel(Ross3DMetaModel, Qwen2Model):
@@ -368,6 +389,40 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
                                                     video_dict["bev_image"], mask)
                 loss = loss + bev_loss
 
+        occupancy_aux_outputs = None
+        if self.training and (video_dict is not None):
+            occupancy_aux_outputs = self.extract_occupancy_object_embeddings(
+                hidden_states=hidden_states,
+                boi_ids=boi_ids,
+                eoi_ids=eoi_ids,
+                newline_ids=newline_ids,
+                video_dict=video_dict,
+            )
+
+        occ_geom_loss = None
+        if (
+            self.training
+            and getattr(self.config, "enable_occ_geom_loss", False)
+            and (occupancy_aux_outputs is not None)
+            and (video_dict is not None)
+        ):
+            occ_geom_loss = self.compute_occupancy_geometry_loss(
+                occupancy_aux_outputs=occupancy_aux_outputs,
+                video_dict=video_dict,
+            )
+            loss = loss + getattr(self.config, "occ_geom_loss_weight", 0.0) * occ_geom_loss
+
+        occ_temp_loss = None
+        if (
+            self.training
+            and getattr(self.config, "enable_occ_temp_loss", False)
+            and (occupancy_aux_outputs is not None)
+        ):
+            occ_temp_loss = self.compute_occupancy_temporal_loss(
+                occupancy_aux_outputs=occupancy_aux_outputs,
+            )
+            loss = loss + getattr(self.config, "occ_temp_loss_weight", 0.0) * occ_temp_loss
+
         # Hanwliu
         cycle_loss = None
         if self.training and (
@@ -416,6 +471,9 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             vm_loss=vm_loss,
             bev_loss=bev_loss,
             cycle_loss=cycle_loss, # Hanwliu
+            occupancy_aux_outputs=occupancy_aux_outputs,
+            occ_geom_loss=occ_geom_loss,
+            occ_temp_loss=occ_temp_loss,
         )
 
     @torch.no_grad()
@@ -599,6 +657,9 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             vm_loss=vm_loss,
             scores=scores,
             bev_loss=bev_loss,
+            occupancy_aux_outputs=None,
+            occ_geom_loss=None,
+            occ_temp_loss=None,
         )
 
         # loss = None

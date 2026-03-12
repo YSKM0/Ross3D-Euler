@@ -15,7 +15,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union, Dict
+from typing import Any, List, Optional, Tuple, Union, Dict
 import torch.nn.functional as F
 
 import math
@@ -43,6 +43,21 @@ from ross3d.utils import rank0_print, rank_print
 import random
 
 
+class SimCLRStylePatchProjector(nn.Module):
+    def __init__(self, d_model: int, d_proj: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_proj),
+            nn.GELU(),
+            nn.Linear(d_proj, d_proj),
+            nn.LayerNorm(d_proj),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class Ross3DMetaModel:
 
     def __init__(self, config):
@@ -57,6 +72,48 @@ class Ross3DMetaModel:
 
             if "unpad" in getattr(config, "mm_patch_merge_type", ""):
                 self.image_newline = nn.Parameter(torch.empty(config.hidden_size, dtype=self.dtype))
+
+        d_model = getattr(config, "hidden_size", None)
+        if d_model is not None:
+            d_proj = getattr(config, "occupancy_projector_dim", None)
+            d_proj = d_model if (d_proj is None) else d_proj
+            self.occupancy_patch_projector = SimCLRStylePatchProjector(d_model=d_model, d_proj=d_proj)
+            self.occupancy_object_norm = nn.LayerNorm(d_proj)
+            self.config.occupancy_projector_dim = d_proj
+
+            self.occ_geom_patch_norm = nn.LayerNorm(d_proj)
+            self.occ_geom_obj_query = nn.Sequential(
+                nn.LayerNorm(d_proj),
+                nn.Linear(d_proj, d_proj),
+            )
+            self.occ_geom_relation = nn.Sequential(
+                nn.LayerNorm(3 * d_proj),
+                nn.Linear(3 * d_proj, d_proj),
+                nn.GELU(),
+                nn.Linear(d_proj, d_proj),
+                nn.LayerNorm(d_proj),
+            )
+            self.occ_geom_mask_head = nn.Linear(d_proj, 1)
+            self.occ_geom_center_head = nn.Linear(d_proj, 1)
+            self.occ_geom_size_head = nn.Sequential(
+                nn.LayerNorm(d_proj),
+                nn.Linear(d_proj, d_proj),
+                nn.GELU(),
+                nn.Linear(d_proj, 2),
+            )
+            self.occ_geom_vis_head = nn.Sequential(
+                nn.LayerNorm(d_proj),
+                nn.Linear(d_proj, d_proj),
+                nn.GELU(),
+                nn.Linear(d_proj, 1),
+            )
+            self.occ_temp_projector = nn.Sequential(
+                nn.LayerNorm(d_proj),
+                nn.Linear(d_proj, d_proj),
+                nn.GELU(),
+                nn.Linear(d_proj, d_proj),
+                nn.LayerNorm(d_proj),
+            )
         
         if hasattr(self.config, 'world_position_embedding_type'):
             from ross3d.model.position_encoding import PositionEmbeddingSine3D, PositionEmbeddingMLP
@@ -1168,6 +1225,650 @@ class Ross3DMetaForCausalLM(ABC):
                 for p in self.get_output_embeddings().parameters():
                     p.requires_grad = False
 
+    def _extract_frame_patch_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        boi_ids: List[int],
+        eoi_ids: List[int],
+        newline_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Extract per-frame patch tokens using the same ordering as VM/BEV loss."""
+        B = hidden_states.shape[0]
+        assert B == 1, "Per-frame patch extraction currently supports batch_size==1"
+
+        boi_ids_tensor = torch.LongTensor(boi_ids)
+        eoi_ids_tensor = torch.LongTensor(eoi_ids)
+        T = boi_ids_tensor.shape[0]
+        P = self.model.image_embed_len
+        D = hidden_states.shape[-1]
+        patch_h = math.ceil(math.sqrt(P))
+
+        feats = torch.zeros((T, P, D), dtype=hidden_states.dtype, device=hidden_states.device)
+
+        for t, (cur_boi, cur_eoi) in enumerate(zip(boi_ids_tensor, eoi_ids_tensor)):
+            if (cur_boi is None) or (cur_eoi is None):
+                continue
+
+            cur_rows = [hidden_states[0][cur_boi: newline_ids[t * patch_h]]]
+            for k in range(t * patch_h + 1, (t + 1) * patch_h):
+                cur_rows.append(hidden_states[0][newline_ids[k - 1] + 1: newline_ids[k]])
+            cur_rows.append(hidden_states[0][newline_ids[(t + 1) * patch_h - 1] + 1: cur_eoi])
+
+            feats[t] = torch.cat(cur_rows, dim=0)
+
+        return feats
+
+    def extract_occupancy_object_embeddings(
+        self,
+        hidden_states: torch.Tensor,
+        boi_ids: List[int],
+        eoi_ids: List[int],
+        newline_ids: torch.Tensor,
+        video_dict: Optional[Dict[str, torch.Tensor]] = None,
+        eps: float = 1e-6,
+    ) -> Optional[Dict[str, Union[torch.Tensor, List[int], List[str], str]]]:
+        if video_dict is None:
+            return None
+        patch_occupancy = video_dict.get("patch_occupancy", None)
+        if patch_occupancy is None:
+            return None
+
+        patch_feats = self._extract_frame_patch_hidden_states(hidden_states, boi_ids, eoi_ids, newline_ids)
+        projected_patch_feats = self.model.occupancy_patch_projector(patch_feats)
+
+        frame_ids = video_dict.get("frame_ids", [str(i) for i in range(projected_patch_feats.shape[0])])
+        scene_id = video_dict.get("scene_id", None)
+        visible_bboxes = video_dict.get("visible_bboxes", [None for _ in range(projected_patch_feats.shape[0])])
+
+        T, P, Dp = projected_patch_feats.shape
+        device = projected_patch_feats.device
+        dtype = projected_patch_feats.dtype
+
+        detected_ids_per_frame = []
+        all_detected_ids = set()
+        obj_id_to_label = {}
+        for fidx in range(T):
+            occ_anno = patch_occupancy[fidx] if fidx < len(patch_occupancy) else None
+            vis_anno = visible_bboxes[fidx] if fidx < len(visible_bboxes) else None
+
+            # collect labels from visible_bboxes first
+            if vis_anno is not None:
+                for obj in vis_anno.get("detected", []):
+                    try:
+                        oid = int(obj.get("object_id"))
+                    except Exception:
+                        continue
+                    label = str(obj.get("label", "")).strip().lower()
+                    if label:
+                        if oid not in obj_id_to_label:
+                            obj_id_to_label[oid] = label
+                        elif obj_id_to_label[oid] != label:
+                            rank0_print(
+                                f"[occupancy_aux] conflicting labels for object_id={oid}: "
+                                f"keep='{obj_id_to_label[oid]}', ignore='{label}'"
+                            )
+
+            if occ_anno is None:
+                detected_ids_per_frame.append([])
+                continue
+
+            detected_objects = occ_anno.get("detected_objects", [])
+            detected_ids = []
+            for obj in detected_objects:
+                if "object_id" in obj:
+                    try:
+                        oid = int(obj["object_id"])
+                        detected_ids.append(oid)
+                        if oid not in obj_id_to_label:
+                            label = str(obj.get("label", "")).strip().lower()
+                            if label:
+                                obj_id_to_label[oid] = label
+                    except Exception:
+                        continue
+            detected_ids_per_frame.append(detected_ids)
+            all_detected_ids.update(detected_ids)
+
+        obj_ids_union = sorted(all_detected_ids)
+        O = len(obj_ids_union)
+
+        z_raw = torch.zeros((T, O, Dp), device=device, dtype=dtype)
+        den = torch.zeros((T, O), device=device, dtype=dtype)
+        present = torch.zeros((T, O), device=device, dtype=torch.bool)
+
+        if O == 0:
+            return {
+                "patch_embeddings": projected_patch_feats,
+                "obj_ids_union": torch.zeros((0,), device=device, dtype=torch.long),
+                "obj_labels_union": [],
+                "obj_cat_ids_union": torch.zeros((0,), device=device, dtype=torch.long),
+                "object_embeddings": z_raw,
+                "object_occupancy_sums": den,
+                "present": present,
+                "frame_ids": frame_ids,
+                "scene_id": scene_id,
+            }
+
+        id_to_union_col = {oid: u for u, oid in enumerate(obj_ids_union)}
+
+        for fidx in range(T):
+            occ_anno = patch_occupancy[fidx] if fidx < len(patch_occupancy) else None
+            if occ_anno is None:
+                continue
+
+            detected_ids = detected_ids_per_frame[fidx]
+            patches = occ_anno.get("patches", [])
+            if len(detected_ids) == 0 or len(patches) == 0:
+                continue
+
+            occ_matrix = torch.zeros((P, len(detected_ids)), device=device, dtype=dtype)
+            id_to_local_col = {oid: j for j, oid in enumerate(detected_ids)}
+
+            for patch in patches:
+                pidx = int(patch.get("patch_index", -1))
+                if pidx < 0 or pidx >= P:
+                    continue
+                patch_occ = patch.get("occupancy", {})
+                for k, v in patch_occ.items():
+                    try:
+                        oid = int(k)
+                    except Exception:
+                        continue
+                    if oid not in id_to_local_col:
+                        continue
+                    occ_matrix[pidx, id_to_local_col[oid]] = float(v)
+
+            occ_sum_local = occ_matrix.sum(dim=0)
+            valid_local = occ_sum_local > 0
+            if not valid_local.any():
+                continue
+
+            occ_valid = occ_matrix[:, valid_local]
+            occ_sum_valid = occ_sum_local[valid_local]
+            z_local = (occ_valid.T @ projected_patch_feats[fidx]) / (occ_sum_valid[:, None] + eps)
+            z_local = self.model.occupancy_object_norm(z_local)
+
+            kept_local_ids = [detected_ids[j] for j, is_valid in enumerate(valid_local.tolist()) if is_valid]
+            union_cols = torch.tensor([id_to_union_col[oid] for oid in kept_local_ids], device=device, dtype=torch.long)
+
+            z_raw[fidx, union_cols, :] = z_local
+            den[fidx, union_cols] = occ_sum_valid
+            present[fidx, union_cols] = True
+
+        obj_labels_union = []
+        for oid in obj_ids_union:
+            label = obj_id_to_label.get(oid, f"__unknown_obj_{oid}")
+            obj_labels_union.append(label)
+        label_to_cat_id = {}
+        obj_cat_ids = []
+        for label in obj_labels_union:
+            if label not in label_to_cat_id:
+                label_to_cat_id[label] = len(label_to_cat_id)
+            obj_cat_ids.append(label_to_cat_id[label])
+
+        return {
+            "patch_embeddings": projected_patch_feats,
+            "obj_ids_union": torch.tensor(obj_ids_union, device=device, dtype=torch.long),
+            "obj_labels_union": obj_labels_union,
+            "obj_cat_ids_union": torch.tensor(obj_cat_ids, device=device, dtype=torch.long),
+            "object_embeddings": z_raw,
+            "object_occupancy_sums": den,
+            "present": present,
+            "frame_ids": frame_ids,
+            "scene_id": scene_id,
+        }
+
+    def _build_patch_centers_normalized(self, occ_anno: Dict[str, Any], device, dtype) -> torch.Tensor:
+        preprocess = occ_anno.get("vision_tower_preprocess", {})
+        grid = preprocess.get("grid", None)
+        if grid is None:
+            raise ValueError("Missing vision_tower_preprocess.grid in occupancy annotation.")
+        H, W = int(grid[0]), int(grid[1])
+        patches = occ_anno.get("patches", [])
+        P = H * W
+        patch_centers = torch.zeros((P, 2), device=device, dtype=dtype)
+        for patch in patches:
+            pidx = int(patch.get("patch_index", -1))
+            if pidx < 0 or pidx >= P:
+                continue
+            row = int(patch.get("row", pidx // W))
+            col = int(patch.get("col", pidx % W))
+            patch_centers[pidx, 0] = (col + 0.5) / float(W)
+            patch_centers[pidx, 1] = (row + 0.5) / float(H)
+        if len(patches) == 0:
+            rows = torch.arange(H, device=device, dtype=dtype)
+            cols = torch.arange(W, device=device, dtype=dtype)
+            rr, cc = torch.meshgrid(rows, cols, indexing="ij")
+            patch_centers[:, 0] = (cc.reshape(-1) + 0.5) / float(W)
+            patch_centers[:, 1] = (rr.reshape(-1) + 0.5) / float(H)
+        return patch_centers
+
+    def _convert_visible_bbox_to_geom_target(self, vis_obj: Dict[str, Any], vis_anno: Dict[str, Any], occ_anno: Dict[str, Any]):
+        image_size = vis_anno.get("image_size", None)
+        if image_size is None or len(image_size) < 2:
+            return None, None, None
+        raw_w, raw_h = float(image_size[0]), float(image_size[1])
+        if raw_w <= 0 or raw_h <= 0:
+            return None, None, None
+
+        preprocess = occ_anno.get("vision_tower_preprocess", {})
+        resize = preprocess.get("resize", None)
+        grid = preprocess.get("grid", None)
+        if resize is None or grid is None:
+            raise ValueError("Missing resize/grid in occupancy annotation for geometry conversion.")
+        img_h, img_w = float(resize[0]), float(resize[1])
+
+        bbox = vis_obj.get("bbox_xyxy", None)
+        if bbox is None or len(bbox) < 4:
+            return None, None, None
+        x1_raw, y1_raw, x2_raw, y2_raw = [float(v) for v in bbox[:4]]
+        x1_img = x1_raw * (img_w / raw_w)
+        y1_img = y1_raw * (img_h / raw_h)
+        x2_img = x2_raw * (img_w / raw_w)
+        y2_img = y2_raw * (img_h / raw_h)
+
+        x1n = x1_img / img_w
+        y1n = y1_img / img_h
+        x2n = x2_img / img_w
+        y2n = y2_img / img_h
+
+        x1n = max(0.0, min(1.0, x1n))
+        y1n = max(0.0, min(1.0, y1n))
+        x2n = max(0.0, min(1.0, x2n))
+        y2n = max(0.0, min(1.0, y2n))
+
+        if x2n <= x1n or y2n <= y1n:
+            return None, None, None
+
+        center_norm = None
+        center_uv = vis_obj.get("projected_center_uv", None)
+        if center_uv is not None and len(center_uv) >= 2:
+            cx_raw, cy_raw = float(center_uv[0]), float(center_uv[1])
+            cx_img = cx_raw * (img_w / raw_w)
+            cy_img = cy_raw * (img_h / raw_h)
+            center_norm = [
+                max(0.0, min(1.0, cx_img / img_w)),
+                max(0.0, min(1.0, cy_img / img_h)),
+            ]
+
+        center_visible = bool(vis_obj.get("projected_center_in_bbox", False))
+        return [x1n, y1n, x2n, y2n], center_norm, center_visible
+
+    def _build_frame_object_occupancy_targets(self, occ_anno: Dict[str, Any], obj_ids_union: torch.Tensor, device, dtype) -> torch.Tensor:
+        preprocess = occ_anno.get("vision_tower_preprocess", {})
+        grid = preprocess.get("grid", None)
+        if grid is None:
+            raise ValueError("Missing vision_tower_preprocess.grid in occupancy annotation.")
+        H, W = int(grid[0]), int(grid[1])
+        P = H * W
+        O = int(obj_ids_union.shape[0])
+        occ_target = torch.zeros((P, O), device=device, dtype=dtype)
+
+        detected_objects = occ_anno.get("detected_objects", [])
+        detected_ids = []
+        for obj in detected_objects:
+            if "object_id" in obj:
+                try:
+                    detected_ids.append(int(obj["object_id"]))
+                except Exception:
+                    continue
+        if len(detected_ids) == 0 or O == 0:
+            return occ_target
+
+        id_to_union_col = {int(oid): i for i, oid in enumerate(obj_ids_union.detach().cpu().tolist())}
+        local_to_union = {}
+        for j, oid in enumerate(detected_ids):
+            if oid in id_to_union_col:
+                local_to_union[j] = id_to_union_col[oid]
+        if len(local_to_union) == 0:
+            return occ_target
+
+        rows, cols, vals = [], [], []
+        for patch in occ_anno.get("patches", []):
+            pidx = int(patch.get("patch_index", -1))
+            if pidx < 0 or pidx >= P:
+                continue
+            patch_occ = patch.get("occupancy", {})
+            for k, v in patch_occ.items():
+                try:
+                    oid = int(k)
+                except Exception:
+                    continue
+                if oid not in id_to_union_col:
+                    continue
+                rows.append(pidx)
+                cols.append(id_to_union_col[oid])
+                vals.append(float(v))
+
+        if len(rows) > 0:
+            row_t = torch.tensor(rows, device=device, dtype=torch.long)
+            col_t = torch.tensor(cols, device=device, dtype=torch.long)
+            val_t = torch.tensor(vals, device=device, dtype=dtype)
+            occ_target[row_t, col_t] = val_t
+
+        return occ_target
+
+    def _generalized_iou_xyxy(self, boxes1: torch.Tensor, boxes2: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        x1 = torch.maximum(boxes1[:, 0], boxes2[:, 0])
+        y1 = torch.maximum(boxes1[:, 1], boxes2[:, 1])
+        x2 = torch.minimum(boxes1[:, 2], boxes2[:, 2])
+        y2 = torch.minimum(boxes1[:, 3], boxes2[:, 3])
+
+        inter_w = (x2 - x1).clamp(min=0.0)
+        inter_h = (y2 - y1).clamp(min=0.0)
+        inter = inter_w * inter_h
+
+        area1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(min=0.0) * (boxes1[:, 3] - boxes1[:, 1]).clamp(min=0.0)
+        area2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(min=0.0) * (boxes2[:, 3] - boxes2[:, 1]).clamp(min=0.0)
+        union = area1 + area2 - inter
+        iou = inter / (union + eps)
+
+        cx1 = torch.minimum(boxes1[:, 0], boxes2[:, 0])
+        cy1 = torch.minimum(boxes1[:, 1], boxes2[:, 1])
+        cx2 = torch.maximum(boxes1[:, 2], boxes2[:, 2])
+        cy2 = torch.maximum(boxes1[:, 3], boxes2[:, 3])
+        c_area = (cx2 - cx1).clamp(min=0.0) * (cy2 - cy1).clamp(min=0.0)
+        giou = iou - (c_area - union) / (c_area + eps)
+        return giou
+
+    def compute_occupancy_geometry_loss(
+        self,
+        occupancy_aux_outputs: Dict[str, Any],
+        video_dict: Dict[str, Any],
+    ) -> torch.Tensor:
+        if occupancy_aux_outputs is None or video_dict is None:
+            return torch.zeros((), device=self.device if hasattr(self, "device") else None)
+
+        X = occupancy_aux_outputs.get("patch_embeddings", None)
+        E = occupancy_aux_outputs.get("object_embeddings", None)
+        obj_ids_union = occupancy_aux_outputs.get("obj_ids_union", None)
+        present = occupancy_aux_outputs.get("present", None)
+        frame_ids = occupancy_aux_outputs.get("frame_ids", None)
+
+        if X is None or E is None or obj_ids_union is None or present is None:
+            ref = X if X is not None else E
+            if ref is None:
+                return torch.zeros(())
+            return torch.zeros((), device=ref.device, dtype=ref.dtype)
+
+        device = X.device
+        dtype = X.dtype
+
+        patch_occupancy = video_dict.get("patch_occupancy", None)
+        visible_bboxes = video_dict.get("visible_bboxes", None)
+        if patch_occupancy is None or visible_bboxes is None:
+            return torch.zeros((), device=device, dtype=dtype)
+
+        T, P, Dp = X.shape
+        assert len(patch_occupancy) == T, "patch_occupancy length must match T"
+        assert len(visible_bboxes) == T, "visible_bboxes length must match T"
+        assert present.shape[:2] == E.shape[:2], "present must align with object_embeddings"
+
+        union_list = [int(v) for v in obj_ids_union.detach().cpu().tolist()]
+        union_id_to_col = {oid: i for i, oid in enumerate(union_list)}
+
+        eps = float(getattr(self.config, "occ_geom_eps", 1e-6))
+        mask_loss_sum = torch.zeros((), device=device, dtype=dtype)
+        box_loss_sum = torch.zeros((), device=device, dtype=dtype)
+        ctr_loss_sum = torch.zeros((), device=device, dtype=dtype)
+        vis_loss_sum = torch.zeros((), device=device, dtype=dtype)
+        mask_count = box_count = ctr_count = vis_count = 0
+
+        for f in range(T):
+            occ_anno = patch_occupancy[f]
+            vis_anno = visible_bboxes[f]
+            if occ_anno is None or vis_anno is None:
+                continue
+
+            if frame_ids is not None and vis_anno.get("frame_id", None) is not None:
+                vis_fid = str(vis_anno.get("frame_id"))
+                if vis_fid != str(frame_ids[f]):
+                    rank0_print(f"[occ_geom] frame_id mismatch at frame {f}: frame_ids={frame_ids[f]}, visible_bboxes={vis_fid}")
+
+            preprocess = occ_anno.get("vision_tower_preprocess", {})
+            grid = preprocess.get("grid", None)
+            resize = preprocess.get("resize", None)
+            if grid is None or resize is None:
+                continue
+            H, W = int(grid[0]), int(grid[1])
+            if H * W != P:
+                continue
+            if int(resize[0]) <= 0 or int(resize[1]) <= 0:
+                continue
+
+            patch_centers = self._build_patch_centers_normalized(occ_anno, device=device, dtype=dtype)
+            occ_target = self._build_frame_object_occupancy_targets(occ_anno, obj_ids_union, device=device, dtype=dtype)
+
+            union_cols = []
+            vis_objs = []
+            tgt_boxes = []
+            tgt_centers = []
+            tgt_center_visible = []
+
+            for vis_obj in vis_anno.get("detected", []):
+                if "object_id" not in vis_obj:
+                    continue
+                oid = int(vis_obj["object_id"])
+                if oid not in union_id_to_col:
+                    continue
+                ucol = union_id_to_col[oid]
+                if not bool(present[f, ucol].item()):
+                    continue
+
+                bbox_norm, center_norm, center_visible = self._convert_visible_bbox_to_geom_target(vis_obj, vis_anno, occ_anno)
+                if bbox_norm is None:
+                    continue
+
+                union_cols.append(ucol)
+                vis_objs.append(vis_obj)
+                tgt_boxes.append(bbox_norm)
+                tgt_centers.append(center_norm)
+                tgt_center_visible.append(center_visible)
+
+            if len(union_cols) == 0:
+                continue
+
+            union_cols_t = torch.tensor(union_cols, device=device, dtype=torch.long)
+            x_f = X[f]
+            e_f = E[f, union_cols_t, :]
+            Ov = e_f.shape[0]
+
+            x_feat = self.model.occ_geom_patch_norm(x_f)
+            e_query = self.model.occ_geom_obj_query(e_f)
+
+            x_expand = x_feat.unsqueeze(0).expand(Ov, -1, -1)
+            e_expand = e_query.unsqueeze(1).expand(-1, P, -1)
+            rel_input = torch.cat([e_expand, x_expand, e_expand * x_expand], dim=-1)
+            h = self.model.occ_geom_relation(rel_input)
+
+            mask_logits = self.model.occ_geom_mask_head(h).squeeze(-1)
+            mask_prob = torch.sigmoid(mask_logits)
+            alpha = mask_prob / (mask_prob.sum(dim=1, keepdim=True) + eps)
+            g = torch.sum(alpha.unsqueeze(-1) * h, dim=1)
+
+            soft_center = torch.sum(alpha.unsqueeze(-1) * patch_centers.unsqueeze(0), dim=1)
+            pred_cx = soft_center[:, 0]
+            pred_cy = soft_center[:, 1]
+
+            pred_size = torch.sigmoid(self.model.occ_geom_size_head(g))
+            pred_w = pred_size[:, 0]
+            pred_h = pred_size[:, 1]
+
+            pred_box = torch.stack([
+                pred_cx - 0.5 * pred_w,
+                pred_cy - 0.5 * pred_h,
+                pred_cx + 0.5 * pred_w,
+                pred_cy + 0.5 * pred_h,
+            ], dim=-1).clamp(0.0, 1.0)
+
+            pred_vis_logit = self.model.occ_geom_vis_head(g).squeeze(-1)
+            center_logprob = F.log_softmax(self.model.occ_geom_center_head(h).squeeze(-1), dim=1)
+
+            for k in range(Ov):
+                ucol = union_cols[k]
+                target_mask = occ_target[:, ucol]
+                loss_mask_bce = F.binary_cross_entropy_with_logits(mask_logits[k], target_mask, reduction="mean")
+                pred_mask = torch.sigmoid(mask_logits[k])
+                dice_num = 2.0 * (pred_mask * target_mask).sum()
+                dice_den = pred_mask.sum() + target_mask.sum() + eps
+                loss_mask_dice = 1.0 - (dice_num / dice_den)
+                loss_mask_obj = loss_mask_bce + float(getattr(self.config, "occ_geom_mask_dice_weight", 0.5)) * loss_mask_dice
+                mask_loss_sum = mask_loss_sum + loss_mask_obj
+                mask_count += 1
+
+                target_box = torch.tensor(tgt_boxes[k], device=device, dtype=pred_box.dtype)
+                loss_box_l1 = F.smooth_l1_loss(pred_box[k], target_box, reduction="mean")
+                loss_box_giou = 1.0 - self._generalized_iou_xyxy(
+                    pred_box[k].unsqueeze(0),
+                    target_box.unsqueeze(0),
+                    eps=eps,
+                ).mean()
+                loss_box_obj = loss_box_l1 + float(getattr(self.config, "occ_geom_box_giou_weight", 1.0)) * loss_box_giou
+                box_loss_sum = box_loss_sum + loss_box_obj
+                box_count += 1
+
+                target_vis = torch.tensor(1.0 if tgt_center_visible[k] else 0.0, device=device, dtype=pred_vis_logit.dtype)
+                loss_vis_obj = F.binary_cross_entropy_with_logits(pred_vis_logit[k], target_vis, reduction="mean")
+                vis_loss_sum = vis_loss_sum + loss_vis_obj
+                vis_count += 1
+
+                if tgt_center_visible[k] and (tgt_centers[k] is not None):
+                    cxn, cyn = float(tgt_centers[k][0]), float(tgt_centers[k][1])
+                    dx = patch_centers[:, 0] - cxn
+                    dy = patch_centers[:, 1] - cyn
+                    bbox_norm = tgt_boxes[k]
+                    bw = max(float(bbox_norm[2] - bbox_norm[0]), 1e-6)
+                    bh = max(float(bbox_norm[3] - bbox_norm[1]), 1e-6)
+                    sigma_x = max(1.0 / float(W), float(getattr(self.config, "occ_geom_center_alpha", 0.1)) * bw)
+                    sigma_y = max(1.0 / float(H), float(getattr(self.config, "occ_geom_center_alpha", 0.1)) * bh)
+                    target_ctr = torch.exp(-0.5 * (dx * dx / (sigma_x * sigma_x) + dy * dy / (sigma_y * sigma_y)))
+                    target_ctr = target_ctr / (target_ctr.sum() + eps)
+                    loss_ctr_obj = F.kl_div(center_logprob[k].unsqueeze(0), target_ctr.unsqueeze(0), reduction="batchmean", log_target=False)
+                    ctr_loss_sum = ctr_loss_sum + loss_ctr_obj
+                    ctr_count += 1
+
+        if mask_count == 0 and box_count == 0 and ctr_count == 0 and vis_count == 0:
+            return torch.zeros((), device=device, dtype=dtype)
+
+        loss_mask = mask_loss_sum / max(mask_count, 1)
+        loss_box = box_loss_sum / max(box_count, 1)
+        loss_ctr = ctr_loss_sum / max(ctr_count, 1)
+        loss_vis = vis_loss_sum / max(vis_count, 1)
+
+        geom_loss = (
+            float(getattr(self.config, "occ_geom_mask_weight", 1.0)) * loss_mask
+            + float(getattr(self.config, "occ_geom_box_weight", 1.0)) * loss_box
+            + float(getattr(self.config, "occ_geom_ctr_weight", 1.0)) * loss_ctr
+            + float(getattr(self.config, "occ_geom_vis_weight", 1.0)) * loss_vis
+        )
+        return geom_loss
+
+    def compute_occupancy_temporal_loss(
+        self,
+        occupancy_aux_outputs: Dict[str, Any],
+    ) -> torch.Tensor:
+        if occupancy_aux_outputs is None:
+            return torch.zeros(())
+
+        Z = occupancy_aux_outputs.get("object_embeddings", None)
+        present = occupancy_aux_outputs.get("present", None)
+        obj_cat_ids_union = occupancy_aux_outputs.get("obj_cat_ids_union", None)
+        if Z is None or present is None or obj_cat_ids_union is None:
+            ref = Z if Z is not None else present
+            if ref is None:
+                return torch.zeros(())
+            return torch.zeros((), device=ref.device, dtype=ref.dtype if hasattr(ref, 'dtype') else torch.float32)
+
+        device = Z.device
+        dtype = Z.dtype
+        if Z.shape[:2] != present.shape:
+            return torch.zeros((), device=device, dtype=dtype)
+
+        T, O, _ = Z.shape
+        if T < 2 or O == 0:
+            return torch.zeros((), device=device, dtype=dtype)
+        if obj_cat_ids_union.shape[0] != O:
+            return torch.zeros((), device=device, dtype=dtype)
+
+        same_min = float(getattr(self.config, "occ_temp_same_min_margin", 0.10))
+        same_max = float(getattr(self.config, "occ_temp_same_max_margin", 0.25))
+        diff_margin = float(getattr(self.config, "occ_temp_diff_margin", 0.30))
+        if not (diff_margin > same_max > same_min > 0.0):
+            return torch.zeros((), device=device, dtype=dtype)
+
+        min_frames = int(getattr(self.config, "occ_temp_min_frames", 2))
+        eps = float(getattr(self.config, "occ_temp_eps", 1e-6))
+
+        U = self.model.occ_temp_projector(Z)
+        U = F.normalize(U, dim=-1)
+
+        counts = present.long().sum(dim=0)
+        if counts.shape[0] != O:
+            return torch.zeros((), device=device, dtype=dtype)
+
+        valid_anchor_obj = counts >= min_frames
+        valid_proto_obj = counts >= 1
+        if not valid_anchor_obj.any():
+            return torch.zeros((), device=device, dtype=dtype)
+
+        present_f = present.unsqueeze(-1).to(U.dtype)
+        sum_u = (U * present_f).sum(dim=0)
+        proto_all = sum_u / counts.clamp(min=1).to(U.dtype).unsqueeze(-1)
+        proto_all = F.normalize(proto_all, dim=-1)
+
+        loss_sum = torch.zeros((), device=device, dtype=dtype)
+        anchor_count = 0
+
+        cat_ids = obj_cat_ids_union.to(device=device)
+
+        for t in range(T):
+            for o in range(O):
+                if not bool(present[t, o].item()):
+                    continue
+                if not bool(valid_anchor_obj[o].item()):
+                    continue
+
+                pos_count = int((counts[o] - 1).item())
+                if pos_count <= 0:
+                    continue
+
+                u_anchor = U[t, o]
+                pos_sum = sum_u[o] - U[t, o]
+                pos_proto = pos_sum / float(max(pos_count, 1))
+                pos_proto = F.normalize(pos_proto, dim=-1)
+                s_pos = torch.sum(u_anchor * pos_proto, dim=-1)
+                loss_pos = 1.0 - s_pos
+
+                is_other = torch.arange(O, device=device) != o
+                valid_neg = is_other & valid_proto_obj.to(device=device)
+                same_mask = valid_neg & (cat_ids == cat_ids[o])
+                diff_mask = valid_neg & (cat_ids != cat_ids[o])
+
+                loss_same = torch.zeros((), device=device, dtype=dtype)
+                if same_mask.any():
+                    s_same = torch.matmul(proto_all[same_mask], u_anchor)
+                    gap_same = s_pos - s_same
+                    loss_same_i = F.relu(same_min - gap_same) + F.relu(gap_same - same_max)
+                    loss_same = loss_same_i.mean()
+
+                loss_diff = torch.zeros((), device=device, dtype=dtype)
+                if diff_mask.any():
+                    s_diff = torch.matmul(proto_all[diff_mask], u_anchor)
+                    gap_diff = s_pos - s_diff
+                    loss_diff_i = F.relu(diff_margin - gap_diff)
+                    loss_diff = loss_diff_i.mean()
+
+                loss_anchor = (
+                    float(getattr(self.config, "occ_temp_pos_weight", 1.0)) * loss_pos
+                    + float(getattr(self.config, "occ_temp_same_weight", 1.0)) * loss_same
+                    + float(getattr(self.config, "occ_temp_diff_weight", 1.0)) * loss_diff
+                )
+                loss_sum = loss_sum + loss_anchor
+                anchor_count += 1
+
+        if anchor_count == 0:
+            return torch.zeros((), device=device, dtype=dtype)
+        return loss_sum / float(anchor_count)
+
     def compute_vm_loss(
         self,
         images: torch.Tensor,
@@ -2109,3 +2810,6 @@ class CausalLMOutputWithPastRoss(ModelOutput):
     scores: Optional[torch.FloatTensor] = None
     # Hanwliu
     cycle_loss: Optional[torch.FloatTensor] = None
+    occupancy_aux_outputs: Optional[Dict[str, Union[torch.Tensor, List[int], List[str], str]]] = None
+    occ_geom_loss: Optional[torch.FloatTensor] = None
+    occ_temp_loss: Optional[torch.FloatTensor] = None

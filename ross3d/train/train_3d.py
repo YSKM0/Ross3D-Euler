@@ -213,6 +213,42 @@ class ModelArguments:
         },
     )
 
+    occupancy_projector_dim: Optional[int] = field(
+        default=None,
+        metadata={"help": "Projection dim for occupancy auxiliary patch projector (defaults to hidden_size)."},
+    )
+
+    enable_occ_geom_loss: bool = field(
+        default=False,
+        metadata={"help": "Enable occupancy-geometry auxiliary loss."},
+    )
+    occ_geom_loss_weight: float = field(default=0.0)
+
+    occ_geom_mask_weight: float = field(default=1.0)
+    occ_geom_box_weight: float = field(default=1.0)
+    occ_geom_ctr_weight: float = field(default=1.0)
+    occ_geom_vis_weight: float = field(default=1.0)
+
+    occ_geom_mask_dice_weight: float = field(default=0.5)
+    occ_geom_box_giou_weight: float = field(default=1.0)
+    occ_geom_center_alpha: float = field(default=0.1)
+    occ_geom_eps: float = field(default=1e-6)
+
+    enable_occ_temp_loss: bool = field(default=False)
+    occ_temp_loss_weight: float = field(default=0.0)
+
+    occ_temp_eps: float = field(default=1e-6)
+    occ_temp_min_frames: int = field(default=2)
+
+    occ_temp_pos_weight: float = field(default=1.0)
+
+    occ_temp_same_min_margin: float = field(default=0.10)
+    occ_temp_same_max_margin: float = field(default=0.25)
+    occ_temp_same_weight: float = field(default=1.0)
+
+    occ_temp_diff_margin: float = field(default=0.30)
+    occ_temp_diff_weight: float = field(default=1.0)
+
 @dataclass
 class DataArguments:
     data_path: str = field(default=None, metadata={"help": "Path to the training data, in llava's instruction.json format. Supporting multiple json files via /path/to/{a,b,c}.json"})
@@ -239,6 +275,14 @@ class DataArguments:
 
     frame_sampling_strategy: str = 'uniform' # uniform, mc32, mc24
     fvs_cache_file: str = 'data/metadata/scannet_fvs_selected_frames.json'
+    occupancy_root: Optional[str] = field(
+        default=None,
+        metadata={"help": "Root directory containing per-scene patch occupancy JSON annotations."},
+    )
+    coordinates_root: Optional[str] = field(
+        default=None,
+        metadata={"help": "Root directory containing per-scene visible bboxes JSON annotations."},
+    )
 
 
 @dataclass
@@ -1121,6 +1165,8 @@ class LazySupervisedDataset(Dataset):
             max_xyz_range=getattr(data_args, "max_xyz_range", None),
             frame_sampling_strategy=getattr(data_args, "frame_sampling_strategy", "uniform"),
             fvs_cache_file=getattr(data_args, "fvs_cache_file", 'data/metadata/scannet_fvs_selected_frames.json'),
+            occupancy_root=getattr(data_args, "occupancy_root", None),
+            coordinates_root=getattr(data_args, "coordinates_root", None),
         )
 
         # Handle multiple JSON files specified in the data_path
@@ -1663,6 +1709,27 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args, load_so
     setattr(model.config, "cycle_debug_optimizer", model_args.cycle_debug_optimizer)
     setattr(model.config, "cycle_detach_hidden_states", model_args.cycle_detach_hidden_states)
     setattr(model.config, "use_3d_coordinate", model_args.use_3d_coordinate)
+    setattr(model.config, "occupancy_projector_dim", model_args.occupancy_projector_dim)
+    setattr(model.config, "enable_occ_geom_loss", model_args.enable_occ_geom_loss)
+    setattr(model.config, "occ_geom_loss_weight", model_args.occ_geom_loss_weight)
+    setattr(model.config, "occ_geom_mask_weight", model_args.occ_geom_mask_weight)
+    setattr(model.config, "occ_geom_box_weight", model_args.occ_geom_box_weight)
+    setattr(model.config, "occ_geom_ctr_weight", model_args.occ_geom_ctr_weight)
+    setattr(model.config, "occ_geom_vis_weight", model_args.occ_geom_vis_weight)
+    setattr(model.config, "occ_geom_mask_dice_weight", model_args.occ_geom_mask_dice_weight)
+    setattr(model.config, "occ_geom_box_giou_weight", model_args.occ_geom_box_giou_weight)
+    setattr(model.config, "occ_geom_center_alpha", model_args.occ_geom_center_alpha)
+    setattr(model.config, "occ_geom_eps", model_args.occ_geom_eps)
+    setattr(model.config, "enable_occ_temp_loss", model_args.enable_occ_temp_loss)
+    setattr(model.config, "occ_temp_loss_weight", model_args.occ_temp_loss_weight)
+    setattr(model.config, "occ_temp_eps", model_args.occ_temp_eps)
+    setattr(model.config, "occ_temp_min_frames", model_args.occ_temp_min_frames)
+    setattr(model.config, "occ_temp_pos_weight", model_args.occ_temp_pos_weight)
+    setattr(model.config, "occ_temp_same_min_margin", model_args.occ_temp_same_min_margin)
+    setattr(model.config, "occ_temp_same_max_margin", model_args.occ_temp_same_max_margin)
+    setattr(model.config, "occ_temp_same_weight", model_args.occ_temp_same_weight)
+    setattr(model.config, "occ_temp_diff_margin", model_args.occ_temp_diff_margin)
+    setattr(model.config, "occ_temp_diff_weight", model_args.occ_temp_diff_weight)
     setattr(model.config, "verbose_logging", training_args.verbose_logging)
     setattr(model.config, "gradient_checkpointing_use_reentrant", training_args.gradient_checkpointing_use_reentrant)
 

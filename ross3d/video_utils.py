@@ -13,6 +13,8 @@ import random
 import copy
 import tempfile
 
+from ross3d.utils import rank0_print
+
 
 def euclidean_dist(p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
     """Squared Euclidean distance from p1 to each row in p2."""
@@ -182,6 +184,8 @@ class VideoProcessor:
         frame_sampling_strategy='uniform',
         val_box_type='pred',
         fvs_cache_file='data/metadata/scannet_fvs_selected_frames.json',
+        occupancy_root=None,
+        coordinates_root=None,
     ):
         self.video_folder = video_folder
         self.voxel_size = voxel_size
@@ -189,6 +193,8 @@ class VideoProcessor:
         self.max_xyz_range = torch.tensor(max_xyz_range) if max_xyz_range is not None else None
         self.frame_sampling_strategy = frame_sampling_strategy
         self.fvs_cache_file = fvs_cache_file
+        self.occupancy_root = occupancy_root
+        self.coordinates_root = coordinates_root
         self.scene = {}
         print('============ frame sampling strategy: {} ============='.format(self.frame_sampling_strategy))
 
@@ -576,9 +582,74 @@ class VideoProcessor:
             "boundry": boundry,
             "objects": torch.tensor(self.scan2obj[video_id]),
             "bev_image": bev_image,
+            "scene_id": video_id,
+            "frame_ids": [os.path.splitext(os.path.basename(f))[0] for f in frame_files],
+            "patch_occupancy": self._load_patch_occupancy_annotations(video_id, frame_files),
+            "visible_bboxes": self._load_visible_bboxes_annotations(video_id, frame_files),
             # "world_coords_norm": resized_coords_norm
         }
 
+
+
+    def _load_patch_occupancy_annotations(self, video_id: str, frame_files):
+        annotations = []
+        if not self.occupancy_root:
+            return [None for _ in frame_files]
+
+        scene_name = video_id.split('/')[-1]
+        for frame_file in frame_files:
+            frame_id = os.path.splitext(os.path.basename(frame_file))[0]
+            occ_path = os.path.join(
+                self.occupancy_root,
+                scene_name,
+                "patch_occupancy",
+                f"{frame_id}_patch_occupancy.json",
+            )
+            if os.path.exists(occ_path):
+                with open(occ_path, 'r') as f:
+                    annotations.append(json.load(f))
+            else:
+                annotations.append(None)
+        return annotations
+
+    def _load_visible_bboxes_annotations(self, video_id: str, frame_files):
+        annotations = []
+        if not self.coordinates_root:
+            return [None for _ in frame_files]
+
+        scene_name = video_id.split('/')[-1]
+        for frame_file in frame_files:
+            frame_id = os.path.splitext(os.path.basename(frame_file))[0]
+            bbox_path = os.path.join(
+                self.coordinates_root,
+                scene_name,
+                "visible_bboxes",
+                f"{frame_id}_visible_bboxes.json",
+            )
+            if os.path.exists(bbox_path):
+                with open(bbox_path, 'r') as f:
+                    bbox_data = json.load(f)
+
+                loaded_frame_id = str(bbox_data.get("frame_id", frame_id))
+                if loaded_frame_id != frame_id:
+                    rank0_print(
+                        f"[Warning] visible_bboxes frame_id mismatch for {video_id}: "
+                        f"expected {frame_id}, got {loaded_frame_id} ({bbox_path})"
+                    )
+
+                loaded_scene_id = str(bbox_data.get("scene_id", video_id))
+                if loaded_scene_id != video_id:
+                    rank0_print(
+                        f"[Warning] visible_bboxes scene_id mismatch for {video_id}: "
+                        f"expected {video_id}, got {loaded_scene_id} ({bbox_path})"
+                    )
+
+                annotations.append(bbox_data)
+            else:
+                annotations.append(None)
+
+        assert len(annotations) == len(frame_files)
+        return annotations
 
     def process_3d_video(
         self,
@@ -626,6 +697,8 @@ def merge_video_dict(video_dict_list):
             for video_dict in video_dict_list:
                 if video_dict[k] is not None:
                     new_video_dict[k].append(video_dict[k])
+        elif k in ['patch_occupancy', 'visible_bboxes', 'frame_ids', 'scene_id']:
+            new_video_dict[k] = video_dict_list[0][k]
 
     new_video_dict['box_input'] = torch.Tensor(new_video_dict['box_input'])
     return new_video_dict
