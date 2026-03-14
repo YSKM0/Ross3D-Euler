@@ -1635,6 +1635,9 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args, load_so
     overwrite_config["view_mask_prob"] = model_args.view_mask_prob
     overwrite_config["enable_vm_loss"] = model_args.enable_vm_loss
     overwrite_config["enable_bev_loss"] = model_args.enable_bev_loss
+    overwrite_config["enable_occ_geom_loss"] = model_args.enable_occ_geom_loss
+    overwrite_config["enable_occ_temp_loss"] = model_args.enable_occ_temp_loss
+    overwrite_config["occupancy_projector_dim"] = model_args.occupancy_projector_dim
 
     if overwrite_config:
         assert cfg_pretrained is not None, "cfg_pretrained is None"
