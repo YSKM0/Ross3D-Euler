@@ -556,8 +556,6 @@ class SigLipVisionTower(nn.Module):
         self.vision_tower_name = vision_tower
 
         self.image_processor = SigLipImageProcessor()
-        self._device = torch.device("cpu")
-        self._dtype = torch.float32
 
         if not delay_load:
             rank0_print(f"Loading vision tower: {vision_tower}")
@@ -582,10 +580,6 @@ class SigLipVisionTower(nn.Module):
         del self.vision_tower.vision_model.encoder.layers[-1:]
         self.vision_tower.vision_model.head = nn.Identity()
         self.vision_tower.requires_grad_(False)
-
-        first_param = next(self.vision_tower.parameters())
-        self._device = first_param.device
-        self._dtype = first_param.dtype
 
         self.is_loaded = True
 
@@ -621,11 +615,11 @@ class SigLipVisionTower(nn.Module):
 
     @property
     def dtype(self):
-        return self._dtype
+        return next(self.vision_tower.parameters()).dtype
 
     @property
     def device(self):
-        return self._device
+        return next(self.vision_tower.parameters()).device
 
     @property
     def hidden_size(self):

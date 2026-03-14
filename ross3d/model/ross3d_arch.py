@@ -74,7 +74,10 @@ class Ross3DMetaModel:
                 self.image_newline = nn.Parameter(torch.empty(config.hidden_size, dtype=self.dtype))
 
         d_model = getattr(config, "hidden_size", None)
-        if d_model is not None:
+        occ_geom_enabled = bool(getattr(config, "enable_occ_geom_loss", False))
+        occ_temp_enabled = bool(getattr(config, "enable_occ_temp_loss", False))
+        occ_aux_enabled = occ_geom_enabled or occ_temp_enabled
+        if d_model is not None and occ_aux_enabled:
             d_proj = getattr(config, "occupancy_projector_dim", None)
             d_proj = d_model if (d_proj is None) else d_proj
             self.occupancy_patch_projector = SimCLRStylePatchProjector(d_model=d_model, d_proj=d_proj)
@@ -1267,6 +1270,8 @@ class Ross3DMetaForCausalLM(ABC):
         video_dict: Optional[Dict[str, torch.Tensor]] = None,
         eps: float = 1e-6,
     ) -> Optional[Dict[str, Union[torch.Tensor, List[int], List[str], str]]]:
+        if not hasattr(self.model, "occupancy_patch_projector") or not hasattr(self.model, "occupancy_object_norm"):
+            return None
         if video_dict is None:
             return None
         patch_occupancy = video_dict.get("patch_occupancy", None)
@@ -1575,6 +1580,19 @@ class Ross3DMetaForCausalLM(ABC):
         occupancy_aux_outputs: Dict[str, Any],
         video_dict: Dict[str, Any],
     ) -> torch.Tensor:
+        if not all(
+            hasattr(self.model, name)
+            for name in [
+                "occ_geom_patch_norm",
+                "occ_geom_obj_query",
+                "occ_geom_relation",
+                "occ_geom_mask_head",
+                "occ_geom_center_head",
+                "occ_geom_size_head",
+                "occ_geom_vis_head",
+            ]
+        ):
+            return torch.zeros((), device=self.device if hasattr(self, "device") else None)
         if occupancy_aux_outputs is None or video_dict is None:
             return torch.zeros((), device=self.device if hasattr(self, "device") else None)
 
@@ -1766,6 +1784,8 @@ class Ross3DMetaForCausalLM(ABC):
         self,
         occupancy_aux_outputs: Dict[str, Any],
     ) -> torch.Tensor:
+        if not hasattr(self.model, "occ_temp_projector"):
+            return torch.zeros(())
         if occupancy_aux_outputs is None:
             return torch.zeros(())
 

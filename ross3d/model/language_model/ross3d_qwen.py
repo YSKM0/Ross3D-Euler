@@ -390,7 +390,10 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
                 loss = loss + bev_loss
 
         occupancy_aux_outputs = None
-        if self.training and (video_dict is not None):
+        occ_geom_enabled = bool(getattr(self.config, "enable_occ_geom_loss", False))
+        occ_temp_enabled = bool(getattr(self.config, "enable_occ_temp_loss", False))
+        occ_aux_enabled = occ_geom_enabled or occ_temp_enabled
+        if self.training and occ_aux_enabled and (video_dict is not None):
             occupancy_aux_outputs = self.extract_occupancy_object_embeddings(
                 hidden_states=hidden_states,
                 boi_ids=boi_ids,
@@ -402,7 +405,7 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
         occ_geom_loss = None
         if (
             self.training
-            and getattr(self.config, "enable_occ_geom_loss", False)
+            and occ_geom_enabled
             and (occupancy_aux_outputs is not None)
             and (video_dict is not None)
         ):
@@ -415,7 +418,7 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
         occ_temp_loss = None
         if (
             self.training
-            and getattr(self.config, "enable_occ_temp_loss", False)
+            and occ_temp_enabled
             and (occupancy_aux_outputs is not None)
         ):
             occ_temp_loss = self.compute_occupancy_temporal_loss(
