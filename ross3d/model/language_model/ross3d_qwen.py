@@ -14,6 +14,7 @@
 
 
 from typing import List, Optional, Tuple, Union, Dict
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -289,6 +290,54 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
                 video_dict=video_dict,
             )
 
+
+    def _dtype_debug_should_log(self) -> bool:
+        if os.getenv("ROSS3D_DTYPE_DEBUG", "0") != "1":
+            return False
+        max_logs = int(os.getenv("ROSS3D_DTYPE_DEBUG_MAX", "2"))
+        count = getattr(self, "_dtype_debug_log_count", 0)
+        if count >= max_logs:
+            return False
+        if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return False
+        setattr(self, "_dtype_debug_log_count", count + 1)
+        return True
+
+    def _nan_debug_should_log(self) -> bool:
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
+            return False
+        if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return False
+        max_logs = int(os.getenv("ROSS3D_NAN_DEBUG_MAX", "64"))
+        count = int(getattr(self, "_nan_debug_log_count", 0))
+        if count >= max_logs:
+            return False
+        setattr(self, "_nan_debug_log_count", count + 1)
+        return True
+
+    def _nan_debug_tensor_stats(self, tag: str, t: Optional[torch.Tensor]) -> None:
+        if (t is None) or (not torch.is_tensor(t)):
+            return
+        if not self._nan_debug_should_log():
+            return
+        x = t.detach()
+        finite = torch.isfinite(x)
+        finite_any = bool(finite.any().item())
+        nan_count = int(torch.isnan(x).sum().item())
+        inf_count = int(torch.isinf(x).sum().item())
+        if finite_any:
+            vals = x[finite]
+            min_val = float(vals.min().item())
+            max_val = float(vals.max().item())
+            minmax_msg = f"min={min_val:.6e} max={max_val:.6e}"
+        else:
+            minmax_msg = "min=NA max=NA"
+        rank_print(
+            "[NAN_DEBUG][predict_box] "
+            f"tag={tag} shape={tuple(x.shape)} dtype={x.dtype} "
+            f"finite_all={bool(finite.all().item())} nan_count={nan_count} inf_count={inf_count} {minmax_msg}"
+        )
+
     def inner_forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -342,6 +391,15 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        if self._dtype_debug_should_log():
+            rank_print(
+                "[DTYPE_DEBUG][inner_forward][before self.model] "
+                f"inputs_embeds={getattr(inputs_embeds, 'dtype', None)} "
+                f"attention_mask={getattr(attention_mask, 'dtype', None)} "
+                f"position_ids={getattr(position_ids, 'dtype', None)} "
+                f"labels={getattr(labels, 'dtype', None)} "
+                f"occ_enabled={(bool(getattr(self.config, 'enable_occ_geom_loss', False)) or bool(getattr(self.config, 'enable_occ_temp_loss', False)))}"
+            )
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -355,6 +413,11 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
         )
 
         hidden_states = outputs[0]
+        if self._dtype_debug_should_log():
+            rank_print(
+                "[DTYPE_DEBUG][inner_forward][after self.model] "
+                f"hidden_states={hidden_states.dtype} logits_weight={self.lm_head.weight.dtype}"
+            )
         logits = self.lm_head(hidden_states)
         logits = logits.float()
 
@@ -412,7 +475,7 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             occ_geom_loss = self.compute_occupancy_geometry_loss(
                 occupancy_aux_outputs=occupancy_aux_outputs,
                 video_dict=video_dict,
-            )
+            ).float()
             loss = loss + getattr(self.config, "occ_geom_loss_weight", 0.0) * occ_geom_loss
 
         occ_temp_loss = None
@@ -423,7 +486,7 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
         ):
             occ_temp_loss = self.compute_occupancy_temporal_loss(
                 occupancy_aux_outputs=occupancy_aux_outputs,
-            )
+            ).float()
             loss = loss + getattr(self.config, "occ_temp_loss_weight", 0.0) * occ_temp_loss
 
         # Hanwliu
@@ -572,6 +635,21 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
         )
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        if self._dtype_debug_should_log():
+            rank_print(
+                "[DTYPE_DEBUG][predict_box][before self.model] "
+                f"inputs_embeds={getattr(inputs_embeds, 'dtype', None)} "
+                f"attention_mask={getattr(attention_mask, 'dtype', None)} "
+                f"position_ids={getattr(position_ids, 'dtype', None)} "
+                f"occ_enabled={(bool(getattr(self.config, 'enable_occ_geom_loss', False)) or bool(getattr(self.config, 'enable_occ_temp_loss', False)))}"
+            )
+        inputs_embeds = inputs_embeds.to(self.model.embed_tokens.weight.dtype)
+        if self._dtype_debug_should_log():
+            rank_print(
+                "[DTYPE_DEBUG][predict_box][aligned before self.model] "
+                f"inputs_embeds={getattr(inputs_embeds, 'dtype', None)} "
+                f"embed_tokens_weight={self.model.embed_tokens.weight.dtype}"
+            )
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -585,28 +663,78 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
         )
 
         hidden_states = outputs[0]
+        if self._dtype_debug_should_log():
+            rank_print(
+                "[DTYPE_DEBUG][predict_box][after self.model] "
+                f"hidden_states={hidden_states.dtype}"
+            )
 
         ground_locations = (labels >= self.config.ground_token_ids[0]) & (labels <= self.config.ground_token_ids[-1])
         ground_hidden = hidden_states[ground_locations].squeeze(1)
+        self._nan_debug_tensor_stats("ground_hidden", ground_hidden)
+
+        hook_state = {"fired": False}
+
+        def _register_nonfinite_grad_hook(name: str, tensor: Optional[torch.Tensor]):
+            if tensor is None or (not torch.is_tensor(tensor)) or (not tensor.requires_grad):
+                return
+
+            def _hook(grad):
+                if hook_state["fired"]:
+                    return grad
+                if grad is None:
+                    return grad
+                if not torch.isfinite(grad).all():
+                    hook_state["fired"] = True
+                    if os.getenv("ROSS3D_NAN_DEBUG", "0") == "1":
+                        if (not torch.distributed.is_available()) or (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0:
+                            rank_print(
+                                "[NAN_DEBUG][predict_box][backward] "
+                                f"first_nonfinite_grad_tensor={name} "
+                                f"grad_shape={tuple(grad.shape)} grad_dtype={grad.dtype}"
+                            )
+                return grad
+
+            tensor.register_hook(_hook)
+
+        _register_nonfinite_grad_hook("ground_hidden", ground_hidden)
         
         if self.ground_head_type == 'mlp':
             ground_hidden = self.ground_head(ground_hidden).squeeze(0) 
             scores = (ground_hidden * object_features).sum(dim=-1)
+            self._nan_debug_tensor_stats("scores_mlp", scores)
+            _register_nonfinite_grad_hook("scores_mlp", scores)
         elif self.ground_head_type == 'score':
             obj_feat = self.ground_head_obj(object_features.to(ground_hidden.dtype)) # B, C
             query_feat = self.ground_head_query(ground_hidden) # 1, C
+            self._nan_debug_tensor_stats("obj_feat_score", obj_feat)
+            self._nan_debug_tensor_stats("query_feat_score", query_feat)
+            _register_nonfinite_grad_hook("obj_feat_score", obj_feat)
+            _register_nonfinite_grad_hook("query_feat_score", query_feat)
             # sim = (F.normalize(obj_feat) * F.normalize(query_feat)).sum(dim=-1)
             mul_feat = obj_feat * query_feat
             scores = self.ground_head_score(mul_feat) # B, 1
             scores = scores.squeeze(1)
+            self._nan_debug_tensor_stats("scores_score", scores)
+            _register_nonfinite_grad_hook("scores_score", scores)
 
         elif self.ground_head_type == "infonce":
             object_features = torch.cat([object_features, self.ground_head_zero_target.unsqueeze(0)], dim=0)
             obj_feat = self.ground_head_obj(object_features.to(ground_hidden.dtype))
             query_feat = self.ground_head_query(ground_hidden)
+            obj_feat_norm = obj_feat.norm(dim=-1)
+            query_feat_norm = query_feat.norm(dim=-1)
+            self._nan_debug_tensor_stats("obj_feat_infonce_pre_norm", obj_feat)
+            self._nan_debug_tensor_stats("query_feat_infonce_pre_norm", query_feat)
+            self._nan_debug_tensor_stats("obj_feat_infonce_pre_norm_norm", obj_feat_norm)
+            self._nan_debug_tensor_stats("query_feat_infonce_pre_norm_norm", query_feat_norm)
+            _register_nonfinite_grad_hook("obj_feat_infonce_pre_norm", obj_feat)
+            _register_nonfinite_grad_hook("query_feat_infonce_pre_norm", query_feat)
             obj_feat = F.normalize(obj_feat)
             query_feat = F.normalize(query_feat)
             scores = (obj_feat * query_feat).sum(dim=-1)
+            self._nan_debug_tensor_stats("scores_infonce", scores)
+            _register_nonfinite_grad_hook("scores_infonce", scores)
 
         loss = hidden_states.new_zeros(())
         lm_loss = hidden_states.new_zeros(())
@@ -614,8 +742,15 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             if self.ground_head_type == "infonce":
                 if len(box_labels[0]) == 0: # zero-target
                     box_labels[0].append(-1)
-                logits = torch.exp(scores / self.ground_head_temperature)
-                loss = - torch.log( logits[box_labels[0]].sum() / logits.sum())
+                scaled_scores = scores / self.ground_head_temperature
+                self._nan_debug_tensor_stats("scaled_scores_infonce", scaled_scores)
+                logits = torch.exp(scaled_scores)
+                self._nan_debug_tensor_stats("logits_infonce", logits)
+                pos_sum = logits[box_labels[0]].sum()
+                all_sum = logits.sum()
+                self._nan_debug_tensor_stats("logits_pos_sum_infonce", pos_sum)
+                self._nan_debug_tensor_stats("logits_all_sum_infonce", all_sum)
+                loss = - torch.log(pos_sum / all_sum)
                 # negative_logits_sum = logits.sum() - logits[box_labels[0]].sum()
                 # for idx in box_labels[0]:
                 #     loss += - torch.log(logits[idx] / (negative_logits_sum + logits[idx]))

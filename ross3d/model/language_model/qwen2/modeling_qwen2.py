@@ -20,6 +20,7 @@
 """ PyTorch Qwen2 model."""
 import inspect
 import math
+import os
 import warnings
 from typing import List, Optional, Tuple, Union
 
@@ -53,6 +54,14 @@ if is_flash_attn_2_available():
 
 
 logger = logging.get_logger(__name__)
+
+
+def _dtype_debug_log_qwen(tag: str, message: str) -> None:
+    if os.getenv("ROSS3D_DTYPE_DEBUG", "0") != "1":
+        return
+    if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    logger.warning("[DTYPE_DEBUG][%s] %s", tag, message)
 
 
 _CHECKPOINT_FOR_DOC = "Qwen/Qwen2-7B-beta"
@@ -265,6 +274,15 @@ class Qwen2Attention(nn.Module):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
+        if os.getenv("ROSS3D_DTYPE_DEBUG", "0") == "1":
+            attn_dbg_count = int(getattr(self.config, "_dtype_debug_attn_count", 0))
+            attn_dbg_max = int(os.getenv("ROSS3D_DTYPE_DEBUG_MAX", "2"))
+            if attn_dbg_count < attn_dbg_max:
+                _dtype_debug_log_qwen(
+                    "qwen_attn",
+                    f"pre_reshape layer_idx={self.layer_idx} hidden_states={hidden_states.dtype} hidden_shape={tuple(hidden_states.shape)} q_proj={query_states.dtype} k_proj={key_states.dtype} v_proj={value_states.dtype} q_weight={self.q_proj.weight.dtype} autocast={torch.is_autocast_enabled()} ckpt_enabled={bool(getattr(self.config, 'gradient_checkpointing', False)) and self.training}",
+                )
+
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -463,6 +481,16 @@ class Qwen2FlashAttention2(Qwen2Attention):
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
 
+        if os.getenv("ROSS3D_DTYPE_DEBUG", "0") == "1":
+            attn_dbg_count = int(getattr(self.config, "_dtype_debug_attn_count", 0))
+            attn_dbg_max = int(os.getenv("ROSS3D_DTYPE_DEBUG_MAX", "2"))
+            if attn_dbg_count < attn_dbg_max:
+                _dtype_debug_log_qwen(
+                    "qwen_attn",
+                    f"before_flash layer_idx={self.layer_idx} q={query_states.dtype} k={key_states.dtype} v={value_states.dtype} q_shape={tuple(query_states.shape)} k_shape={tuple(key_states.shape)} v_shape={tuple(value_states.shape)} autocast={torch.is_autocast_enabled()} ckpt_enabled={bool(getattr(self.config, 'gradient_checkpointing', False)) and self.training}",
+                )
+                setattr(self.config, "_dtype_debug_attn_count", attn_dbg_count + 1)
+
         attn_output = self._flash_attention_forward(
             query_states,
             key_states,
@@ -523,6 +551,38 @@ class Qwen2FlashAttention2(Qwen2Attention):
         if use_sliding_windows and self.layer_idx >= self.config.max_window_layers:
             use_sliding_windows = False
 
+        def _should_log_kernel_debug(q, k, v) -> bool:
+            if os.getenv("ROSS3D_DTYPE_DEBUG", "0") != "1":
+                return False
+            if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+                return False
+            dbg_non_lowp_only = os.getenv("ROSS3D_DTYPE_DEBUG_ONLY_NONLOWP", "0") == "1"
+            if dbg_non_lowp_only:
+                lowp = {torch.float16, torch.bfloat16}
+                if q.dtype in lowp and k.dtype in lowp and v.dtype in lowp:
+                    return False
+            count = int(getattr(self.config, "_dtype_debug_flash_kernel_count", 0))
+            max_logs = int(os.getenv("ROSS3D_DTYPE_DEBUG_MAX", "64"))
+            if count >= max_logs:
+                return False
+            setattr(self.config, "_dtype_debug_flash_kernel_count", count + 1)
+            return True
+
+        def _target_flash_dtype() -> torch.dtype:
+            if torch.is_autocast_enabled():
+                return torch.get_autocast_gpu_dtype()
+            return self.q_proj.weight.dtype
+
+        def _align_qkv_for_flash(q, k, v):
+            target_dtype = _target_flash_dtype()
+            if q.dtype != target_dtype:
+                q = q.to(target_dtype)
+            if k.dtype != target_dtype:
+                k = k.to(target_dtype)
+            if v.dtype != target_dtype:
+                v = v.to(target_dtype)
+            return q, k, v, target_dtype
+
         # Contains at least one padding token in the sequence
         if attention_mask is not None:
             batch_size = query_states.shape[0]
@@ -534,6 +594,12 @@ class Qwen2FlashAttention2(Qwen2Attention):
             max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
 
             if not use_sliding_windows:
+                query_states, key_states, value_states, flash_target_dtype = _align_qkv_for_flash(query_states, key_states, value_states)
+                if _should_log_kernel_debug(query_states, key_states, value_states):
+                    _dtype_debug_log_qwen(
+                        "flash_kernel",
+                        f"layer_idx={self.layer_idx} branch=varlen_no_swa q={query_states.dtype} k={key_states.dtype} v={value_states.dtype} q_shape={tuple(query_states.shape)} k_shape={tuple(key_states.shape)} v_shape={tuple(value_states.shape)} cu_q={tuple(cu_seqlens_q.shape)} cu_k={tuple(cu_seqlens_k.shape)} max_q={max_seqlen_in_batch_q} max_k={max_seqlen_in_batch_k} autocast={torch.is_autocast_enabled()} target={flash_target_dtype}",
+                    )
                 attn_output_unpad = flash_attn_varlen_func(
                     query_states,
                     key_states,
@@ -547,6 +613,12 @@ class Qwen2FlashAttention2(Qwen2Attention):
                     causal=causal,
                 )
             else:
+                query_states, key_states, value_states, flash_target_dtype = _align_qkv_for_flash(query_states, key_states, value_states)
+                if _should_log_kernel_debug(query_states, key_states, value_states):
+                    _dtype_debug_log_qwen(
+                        "flash_kernel",
+                        f"layer_idx={self.layer_idx} branch=varlen_swa q={query_states.dtype} k={key_states.dtype} v={value_states.dtype} q_shape={tuple(query_states.shape)} k_shape={tuple(key_states.shape)} v_shape={tuple(value_states.shape)} cu_q={tuple(cu_seqlens_q.shape)} cu_k={tuple(cu_seqlens_k.shape)} max_q={max_seqlen_in_batch_q} max_k={max_seqlen_in_batch_k} window={self.config.sliding_window} autocast={torch.is_autocast_enabled()} target={flash_target_dtype}",
+                    )
                 attn_output_unpad = flash_attn_varlen_func(
                     query_states,
                     key_states,
@@ -564,6 +636,12 @@ class Qwen2FlashAttention2(Qwen2Attention):
             attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
         else:
             if not use_sliding_windows:
+                query_states, key_states, value_states, flash_target_dtype = _align_qkv_for_flash(query_states, key_states, value_states)
+                if _should_log_kernel_debug(query_states, key_states, value_states):
+                    _dtype_debug_log_qwen(
+                        "flash_kernel",
+                        f"layer_idx={self.layer_idx} branch=flash_no_swa q={query_states.dtype} k={key_states.dtype} v={value_states.dtype} q_shape={tuple(query_states.shape)} k_shape={tuple(key_states.shape)} v_shape={tuple(value_states.shape)} autocast={torch.is_autocast_enabled()} target={flash_target_dtype}",
+                    )
                 attn_output = flash_attn_func(
                     query_states,
                     key_states,
@@ -573,6 +651,12 @@ class Qwen2FlashAttention2(Qwen2Attention):
                     causal=causal,
                 )
             else:
+                query_states, key_states, value_states, flash_target_dtype = _align_qkv_for_flash(query_states, key_states, value_states)
+                if _should_log_kernel_debug(query_states, key_states, value_states):
+                    _dtype_debug_log_qwen(
+                        "flash_kernel",
+                        f"layer_idx={self.layer_idx} branch=flash_swa q={query_states.dtype} k={key_states.dtype} v={value_states.dtype} q_shape={tuple(query_states.shape)} k_shape={tuple(key_states.shape)} v_shape={tuple(value_states.shape)} window={self.config.sliding_window} autocast={torch.is_autocast_enabled()} target={flash_target_dtype}",
+                    )
                 attn_output = flash_attn_func(
                     query_states,
                     key_states,
@@ -1040,6 +1124,15 @@ class Qwen2Model(Qwen2PreTrainedModel):
             )
 
         hidden_states = inputs_embeds
+        if os.getenv("ROSS3D_DTYPE_DEBUG", "0") == "1":
+            qwen_dbg_count = int(getattr(self.config, "_dtype_debug_qwen_model_count", 0))
+            qwen_dbg_max = int(os.getenv("ROSS3D_DTYPE_DEBUG_MAX", "2"))
+            if qwen_dbg_count < qwen_dbg_max:
+                _dtype_debug_log_qwen(
+                    "qwen_model",
+                    f"forward_entry inputs_embeds={getattr(inputs_embeds, 'dtype', None)} hidden_states={hidden_states.dtype} attention_mask={getattr(attention_mask, 'dtype', None)} position_ids={getattr(position_ids, 'dtype', None)}",
+                )
+                setattr(self.config, "_dtype_debug_qwen_model_count", qwen_dbg_count + 1)
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None

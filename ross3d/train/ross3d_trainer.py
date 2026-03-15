@@ -423,6 +423,7 @@ class Ross3DTrainer(Trainer):
         )
 
     def training_step(self, model, inputs):
+        self._nan_guard_total_steps = int(getattr(self, "_nan_guard_total_steps", 0)) + 1
         self._maybe_init_param_ready_debug()
         self._maybe_init_cycle_grad_debug()
         if hasattr(self, "_param_ready_counts"):
@@ -436,6 +437,7 @@ class Ross3DTrainer(Trainer):
                 loss = super().training_step(model, inputs)
         else:
             loss = super().training_step(model, inputs)
+        self._check_nonfinite_grads_after_backward_and_guard()
         self._log_cuda_memory("after_training_step")
         self._log_grad_stats("after_training_step")
         if hasattr(self, "_param_ready_counts") and self._param_ready_counts:
@@ -458,6 +460,92 @@ class Ross3DTrainer(Trainer):
                 f"param={getattr(self, '_cycle_grad_param', 'n/a')}"
             )
         return loss
+
+    def _grad_group_from_name(self, name: str) -> str:
+        if "mm_projector" in name:
+            return "mm_projector"
+        if "image_newline" in name:
+            return "image_newline"
+        if ("ground_head" in name) or ("predict_box" in name):
+            return "ground_head"
+        if name.startswith("model.") or name.startswith("lm_head"):
+            return "qwen_model"
+        return "other"
+
+    def _check_nonfinite_grads_after_backward_and_guard(self) -> None:
+        model = getattr(self, "model", None)
+        if model is None:
+            return
+
+        if not hasattr(self, "_nan_guard_total_hits"):
+            self._nan_guard_total_hits = 0
+            self._nan_guard_consecutive_hits = 0
+            self._nan_guard_max_consecutive_hits = 0
+            self._nan_guard_last_hit_step = -1
+            self._nan_guard_first_bad_group_hist = {}
+            self._nan_guard_first_bad_param_hist = {}
+
+        first_bad = None
+        for name, param in model.named_parameters():
+            if (not param.requires_grad) or (param.grad is None):
+                continue
+            if not torch.isfinite(param.grad).all():
+                first_bad = name
+                break
+
+        if first_bad is None:
+            self._nan_guard_consecutive_hits = 0
+            self._maybe_log_nan_guard_summary(force=False)
+            return
+
+        self._nan_guard_total_hits += 1
+        self._nan_guard_consecutive_hits += 1
+        self._nan_guard_max_consecutive_hits = max(self._nan_guard_max_consecutive_hits, self._nan_guard_consecutive_hits)
+        self._nan_guard_last_hit_step = int(self.state.global_step)
+        bad_group = self._grad_group_from_name(first_bad)
+        self._nan_guard_first_bad_group_hist[bad_group] = int(self._nan_guard_first_bad_group_hist.get(bad_group, 0)) + 1
+        self._nan_guard_first_bad_param_hist[first_bad] = int(self._nan_guard_first_bad_param_hist.get(first_bad, 0)) + 1
+
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") == "1":
+            if (not torch.distributed.is_available()) or (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0:
+                rank0_print(
+                    "[NAN_DEBUG][after_backward] "
+                    f"first_nonfinite_grad_param={first_bad} group={bad_group} "
+                    f"global_step={self.state.global_step}"
+                )
+
+        self._maybe_log_nan_guard_summary(force=False)
+
+        optimizer = getattr(self, "optimizer", None)
+        if optimizer is not None:
+            optimizer.zero_grad(set_to_none=True)
+
+    def _maybe_log_nan_guard_summary(self, force: bool = False) -> None:
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
+            return
+        if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+
+        total_steps = int(getattr(self, "_nan_guard_total_steps", 0))
+        if total_steps <= 0:
+            return
+        interval = int(os.getenv("ROSS3D_NAN_GUARD_SUMMARY_INTERVAL", "50"))
+        if (not force) and (total_steps % interval != 0):
+            return
+
+        total_hits = int(getattr(self, "_nan_guard_total_hits", 0))
+        hit_rate = float(total_hits) / float(total_steps)
+        last_hit_step = int(getattr(self, "_nan_guard_last_hit_step", -1))
+        steps_since_last_hit = (total_steps - last_hit_step) if last_hit_step >= 0 else -1
+        group_hist = dict(sorted(getattr(self, "_nan_guard_first_bad_group_hist", {}).items(), key=lambda kv: kv[1], reverse=True))
+        param_hist = sorted(getattr(self, "_nan_guard_first_bad_param_hist", {}).items(), key=lambda kv: kv[1], reverse=True)[:5]
+        rank0_print(
+            "[NAN_DEBUG][guard_summary] "
+            f"steps={total_steps} hits={total_hits} hit_rate={hit_rate:.6f} "
+            f"consecutive_current={int(getattr(self, '_nan_guard_consecutive_hits', 0))} "
+            f"consecutive_max={int(getattr(self, '_nan_guard_max_consecutive_hits', 0))} "
+            f"steps_since_last_hit={steps_since_last_hit} group_hist={group_hist} top_params={param_hist}"
+        )
     def _wrap_model(self, model, training=True, dataloader=None):
         model = super()._wrap_model(model, training=training, dataloader=dataloader)
         if not training:
@@ -569,14 +657,152 @@ class Ross3DTrainer(Trainer):
         )
 
     def optimizer_step(self, *args, **kwargs):
+        self._log_nonfinite_grad_param_debug("before_optimizer_step")
+        has_nonfinite, first_nonfinite_name = self._find_first_nonfinite_grad_param()
+        if has_nonfinite:
+            rank0_print(
+                "[NAN_DEBUG][optimizer] "
+                f"skip optimizer.step due to non-finite gradients; first_param={first_nonfinite_name}"
+            )
+            optimizer = getattr(self, "optimizer", None)
+            if optimizer is not None:
+                optimizer.zero_grad(set_to_none=True)
+            return None
         self._log_cuda_memory("before_optimizer_step")
         self._log_optimizer_state("before_optimizer_step")
         self._log_optimizer_param_counts("before_optimizer_step")
         result = super().optimizer_step(*args, **kwargs)
+        self._log_nonfinite_grad_param_debug("after_optimizer_step")
         self._log_cuda_memory("after_optimizer_step")
         self._log_optimizer_state("after_optimizer_step")
         self._log_optimizer_param_counts("after_optimizer_step")
         return result
+
+    def _find_first_nonfinite_grad_param(self):
+        model = getattr(self, "model", None)
+        if model is None:
+            return False, None
+        for name, param in model.named_parameters():
+            if (not param.requires_grad) or (param.grad is None):
+                continue
+            if not torch.isfinite(param.grad).all():
+                return True, name
+        return False, None
+
+    def _log_nonfinite_grad_param_debug(self, tag: str) -> None:
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
+            return
+        if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+        count = int(getattr(self, "_nan_debug_opt_count", 0))
+        max_logs = int(os.getenv("ROSS3D_NAN_DEBUG_MAX", "64"))
+        if count >= max_logs:
+            return
+        setattr(self, "_nan_debug_opt_count", count + 1)
+
+        model = getattr(self, "model", None)
+        if model is None:
+            return
+
+        groups = {
+            "vision_tower": [],
+            "vision_resampler": [],
+            "mm_projector": [],
+            "image_newline": [],
+            "mask_token": [],
+            "occupancy": [],
+            "other": [],
+        }
+
+        def _group_name(param_name: str) -> str:
+            if "vision_tower" in param_name:
+                return "vision_tower"
+            if "vision_resampler" in param_name:
+                return "vision_resampler"
+            if "mm_projector" in param_name:
+                return "mm_projector"
+            if "image_newline" in param_name:
+                return "image_newline"
+            if "mask_token" in param_name:
+                return "mask_token"
+            if ("occupancy" in param_name) or ("occ_" in param_name):
+                return "occupancy"
+            return "other"
+
+        for name, param in model.named_parameters():
+            groups[_group_name(name)].append((name, param))
+
+        for gname, params in groups.items():
+            if len(params) == 0:
+                continue
+
+            grad_nonfinite = False
+            first_grad_nonfinite_name = None
+            grad_norm_sq = torch.zeros((), device=params[0][1].device)
+            grad_norm_is_finite = True
+            for name, param in params:
+                if param.grad is None:
+                    continue
+                g = param.grad.detach()
+                if not torch.isfinite(g).all():
+                    grad_nonfinite = True
+                    if first_grad_nonfinite_name is None:
+                        first_grad_nonfinite_name = name
+                if grad_norm_is_finite:
+                    if torch.isfinite(g).all():
+                        grad_norm_sq = grad_norm_sq + (g.float() * g.float()).sum()
+                    else:
+                        grad_norm_is_finite = False
+
+            param_nonfinite = False
+            first_param_nonfinite_name = None
+            for name, param in params:
+                p = param.detach()
+                if not torch.isfinite(p).all():
+                    param_nonfinite = True
+                    first_param_nonfinite_name = name
+                    break
+
+            grad_norm_msg = "nan"
+            if grad_norm_is_finite:
+                grad_norm_msg = f"{float(torch.sqrt(grad_norm_sq).item()):.6e}"
+
+            rank0_print(
+                "[NAN_DEBUG][optimizer] "
+                f"tag={tag} group={gname} grad_nonfinite={grad_nonfinite} "
+                f"first_grad_nonfinite={first_grad_nonfinite_name} grad_norm={grad_norm_msg} "
+                f"param_nonfinite={param_nonfinite} first_param_nonfinite={first_param_nonfinite_name}"
+            )
+
+    def _log_loss_finiteness(self, loss, outputs) -> None:
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
+            return
+        if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+        count = int(getattr(self, "_nan_debug_loss_count", 0))
+        max_logs = int(os.getenv("ROSS3D_NAN_DEBUG_MAX", "64"))
+        if count >= max_logs:
+            return
+        setattr(self, "_nan_debug_loss_count", count + 1)
+
+        def _fmt_tensor_finite(name: str, value):
+            if value is None:
+                return f"{name}=None"
+            if not torch.is_tensor(value):
+                return f"{name}=non_tensor"
+            v = value.detach()
+            finite = bool(torch.isfinite(v).all().item())
+            msg = f"{name}=finite:{finite}"
+            if v.numel() == 1:
+                msg += f" val={float(v.float().item()):.6e}"
+            else:
+                msg += f" shape={tuple(v.shape)}"
+            return msg
+
+        parts = [_fmt_tensor_finite("loss", loss)]
+        for key in ["lm_loss", "vm_loss", "bev_loss", "cycle_loss", "occ_geom_loss", "occ_temp_loss"]:
+            parts.append(_fmt_tensor_finite(key, outputs.get(key, None) if isinstance(outputs, dict) else None))
+        rank0_print("[NAN_DEBUG][loss] " + " | ".join(parts))
 
     def create_accelerator_and_postprocess(self):
         grad_acc_kwargs = {"num_steps": self.args.gradient_accumulation_steps}
@@ -787,6 +1013,21 @@ class Ross3DTrainer(Trainer):
                         "[mm_inv_projector][debug] WARNING: trainable params missing from optimizer groups."
                     )
 
+            if os.getenv("ROSS3D_NAN_DEBUG", "0") == "1":
+                param_ptr_seen = set()
+                duplicated = 0
+                for group in optimizer_grouped_parameters:
+                    for p in group["params"]:
+                        ptr = p.data_ptr()
+                        if ptr in param_ptr_seen:
+                            duplicated += 1
+                        else:
+                            param_ptr_seen.add(ptr)
+                rank0_print(
+                    "[NAN_DEBUG][optimizer_groups] "
+                    f"group_count={len(optimizer_grouped_parameters)} duplicated_param_tensors={duplicated}"
+                )
+
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
 
             if (
@@ -872,6 +1113,7 @@ class Ross3DTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, *args, **kwargs):
         loss, outputs = self._compute_loss_with_global_step(model, inputs, return_outputs=True)
+        self._log_loss_finiteness(loss, outputs)
 
         log_dict = {}
         self._cycle_loss_active = outputs.get("cycle_loss", None) is not None
