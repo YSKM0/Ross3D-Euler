@@ -437,7 +437,6 @@ class Ross3DTrainer(Trainer):
                 loss = super().training_step(model, inputs)
         else:
             loss = super().training_step(model, inputs)
-        self._check_nonfinite_grads_after_backward_and_guard()
         self._log_cuda_memory("after_training_step")
         self._log_grad_stats("after_training_step")
         if hasattr(self, "_param_ready_counts") and self._param_ready_counts:
@@ -658,16 +657,6 @@ class Ross3DTrainer(Trainer):
 
     def optimizer_step(self, *args, **kwargs):
         self._log_nonfinite_grad_param_debug("before_optimizer_step")
-        has_nonfinite, first_nonfinite_name = self._find_first_nonfinite_grad_param()
-        if has_nonfinite:
-            rank0_print(
-                "[NAN_DEBUG][optimizer] "
-                f"skip optimizer.step due to non-finite gradients; first_param={first_nonfinite_name}"
-            )
-            optimizer = getattr(self, "optimizer", None)
-            if optimizer is not None:
-                optimizer.zero_grad(set_to_none=True)
-            return None
         self._log_cuda_memory("before_optimizer_step")
         self._log_optimizer_state("before_optimizer_step")
         self._log_optimizer_param_counts("before_optimizer_step")
@@ -677,17 +666,6 @@ class Ross3DTrainer(Trainer):
         self._log_optimizer_state("after_optimizer_step")
         self._log_optimizer_param_counts("after_optimizer_step")
         return result
-
-    def _find_first_nonfinite_grad_param(self):
-        model = getattr(self, "model", None)
-        if model is None:
-            return False, None
-        for name, param in model.named_parameters():
-            if (not param.requires_grad) or (param.grad is None):
-                continue
-            if not torch.isfinite(param.grad).all():
-                return True, name
-        return False, None
 
     def _log_nonfinite_grad_param_debug(self, tag: str) -> None:
         if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
