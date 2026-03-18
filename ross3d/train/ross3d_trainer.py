@@ -1,5 +1,6 @@
 import os
 import inspect
+import copy
 import torch
 import torch.nn as nn
 import datetime
@@ -16,6 +17,7 @@ from transformers.trainer_pt_utils import AcceleratorConfig
 from transformers.trainer import TRAINER_STATE_NAME
 from typing import List, Optional
 from datetime import timedelta
+from pathlib import Path
 
 from ross3d.utils import rank0_print
 
@@ -422,8 +424,333 @@ class Ross3DTrainer(Trainer):
             f"tracking {len(self._param_ready_counts)} trainable params"
         )
 
+    def _nan_debug_rank0_enabled(self) -> bool:
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
+            return False
+        if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return False
+        return True
+
+    def _audit_model_special_params(self, stage: str) -> None:
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
+            return
+        if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+        model = getattr(self, "model", None)
+        if model is None:
+            return
+        candidates = [model]
+        if hasattr(model, "module"):
+            candidates.append(model.module)
+        for m in candidates:
+            targets = [m]
+            if hasattr(m, "get_model"):
+                try:
+                    targets.append(m.get_model())
+                except Exception:
+                    pass
+            for t in targets:
+                if t is None:
+                    continue
+                if hasattr(t, "_audit_special_param_finiteness"):
+                    t._audit_special_param_finiteness(stage)
+                if hasattr(t, "_audit_special_param_aliases"):
+                    t._audit_special_param_aliases(stage)
+                if hasattr(t, "_sanitize_mask_token_if_nonfinite"):
+                    pre_forward_only = os.getenv("ROSS3D_SANITIZE_MASK_TOKEN_PRE_FORWARD_ONLY", "0") == "1"
+                    if (not pre_forward_only) or (stage == "before_first_batch_forward"):
+                        t._sanitize_mask_token_if_nonfinite(stage)
+
+    def _format_grad_state(self, grad: Optional[torch.Tensor]):
+        if grad is None:
+            return "none", None, None, None, None, None
+        g = grad.detach()
+        finite = torch.isfinite(g)
+        finite_any = bool(finite.any().item())
+        finite_all = bool(finite.all().item())
+        nan_count = int(torch.isnan(g).sum().item())
+        inf_count = int(torch.isinf(g).sum().item())
+        if finite_any:
+            vals = g[finite]
+            gmin = float(vals.min().item())
+            gmax = float(vals.max().item())
+        else:
+            gmin, gmax = None, None
+        grad_state = "finite" if finite_all else "nonfinite"
+        return grad_state, nan_count, inf_count, gmin, gmax, tuple(g.shape)
+
+    def _get_target_debug_params(self):
+        model = getattr(self, "model", None)
+        if model is None:
+            return []
+        targets = [
+            "mask_token",
+            "image_newline",
+            "mm_projector.0.weight",
+            "mm_projector.0.bias",
+            "mm_projector.2.weight",
+            "mm_projector.2.bias",
+        ]
+        return [(name, p) for name, p in model.named_parameters() if any(t in name for t in targets)]
+
+    def _maybe_install_target_grad_hooks(self) -> None:
+        if getattr(self, "_nan_debug_target_grad_hooks_installed", False):
+            return
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
+            return
+        targets = self._get_target_debug_params()
+        self._nan_debug_target_grad_handles = []
+        self._nan_debug_grad_hook_counter = 0
+        self._nan_debug_first_nonfinite_grad_hook = None
+
+        for name, param in targets:
+            def _make_hook(param_name: str):
+                def _hook(grad):
+                    if not self._nan_debug_rank0_enabled():
+                        return grad
+                    self._nan_debug_grad_hook_counter += 1
+                    grad_state, nan_count, inf_count, gmin, gmax, gshape = self._format_grad_state(grad)
+                    micro = getattr(self, "_gradient_accumulation_steps", None)
+                    rank0_print(
+                        "[NAN_DEBUG][hook] "
+                        f"name={param_name} step={int(getattr(self.state, 'global_step', -1))} "
+                        f"microstep={micro} order={self._nan_debug_grad_hook_counter} grad_state={grad_state} "
+                        f"nan_count={nan_count} inf_count={inf_count} min={gmin} max={gmax} "
+                        f"dtype={getattr(grad, 'dtype', None)} shape={gshape}"
+                    )
+                    if grad_state == "nonfinite" and self._nan_debug_first_nonfinite_grad_hook is None:
+                        self._nan_debug_first_nonfinite_grad_hook = {
+                            "name": param_name,
+                            "step": int(getattr(self.state, 'global_step', -1)),
+                            "order": self._nan_debug_grad_hook_counter,
+                        }
+                        rank0_print(f"[NAN_DEBUG][hook] first_nonfinite_grad_event={self._nan_debug_first_nonfinite_grad_hook}")
+                    return grad
+                return _hook
+            self._nan_debug_target_grad_handles.append(param.register_hook(_make_hook(name)))
+
+        self._nan_debug_target_grad_hooks_installed = True
+
+    def _log_target_finiteness_boundary(self, tag: str) -> None:
+        if not self._nan_debug_rank0_enabled():
+            return
+        for name, param in self._get_target_debug_params():
+            pdata = param.detach()
+            p_finite = torch.isfinite(pdata)
+            p_finite_all = bool(p_finite.all().item())
+            p_finite_any = bool(p_finite.any().item())
+            p_nan = int(torch.isnan(pdata).sum().item())
+            p_inf = int(torch.isinf(pdata).sum().item())
+            if p_finite_any:
+                pvals = pdata[p_finite]
+                pmin = float(pvals.min().item())
+                pmax = float(pvals.max().item())
+            else:
+                pmin, pmax = None, None
+
+            grad_state, g_nan, g_inf, gmin, gmax, gshape = self._format_grad_state(param.grad)
+            rank0_print(
+                f"[NAN_DEBUG][transition] boundary={tag} name={name} "
+                f"param_finite_all={p_finite_all} param_nan={p_nan} param_inf={p_inf} param_min={pmin} param_max={pmax} "
+                f"grad_state={grad_state} grad_nan={g_nan} grad_inf={g_inf} grad_min={gmin} grad_max={gmax} "
+                f"param_dtype={pdata.dtype} param_shape={tuple(pdata.shape)} grad_shape={gshape}"
+            )
+            first_map = getattr(self, "_nan_debug_first_nonfinite_boundary", None)
+            if first_map is None:
+                first_map = {}
+                setattr(self, "_nan_debug_first_nonfinite_boundary", first_map)
+            if name not in first_map and ((not p_finite_all) or (grad_state == "nonfinite")):
+                first_map[name] = tag
+                rank0_print(f"[NAN_DEBUG][transition] first_nonfinite_boundary name={name} boundary={tag}")
+
+        model = getattr(self, "model", None)
+        if model is not None and hasattr(model, "_maybe_log_projector_internal_backward"):
+            model._maybe_log_projector_internal_backward(tag)
+        if model is not None and hasattr(model, "_maybe_log_newline_packed_grad"):
+            model._maybe_log_newline_packed_grad(tag)
+        if model is not None and hasattr(model, "_maybe_log_multimodal_backward_chain"):
+            model._maybe_log_multimodal_backward_chain(tag)
+        if model is not None and hasattr(model, "_nan_debug_validate_layout_snapshot"):
+            model._nan_debug_validate_layout_snapshot(tag)
+        if model is not None and hasattr(model, "_log_lm_boundary_grad_summary"):
+            model._log_lm_boundary_grad_summary(tag)
+
+    def _parse_force_set_to_none(self):
+        raw = os.getenv("ROSS3D_FORCE_ZERO_GRAD_SET_TO_NONE", "").strip().lower()
+        if raw in {"1", "true", "yes", "y", "none_true"}:
+            return True
+        if raw in {"0", "false", "no", "n", "none_false"}:
+            return False
+        return None
+
+    def _maybe_run_inplace_stale_state_audit(self) -> None:
+        if os.getenv("ROSS3D_NAN_AUDIT_INPLACE", "0") != "1":
+            return
+        if bool(getattr(self, "_nan_debug_inplace_audit_done", False)):
+            return
+        if not self._nan_debug_rank0_enabled():
+            return
+        mut_patterns = [".data", ".copy_(", ".set_(", ".fill_(", ".zero_(", ".normal_(", ".uniform_(", ".add_(", ".mul_(", ".masked_fill_(", ".scatter_(", ".index_put_("]
+        root = Path("ross3d")
+        for path in sorted(root.rglob("*.py")):
+            try:
+                text = path.read_text().splitlines()
+            except Exception:
+                continue
+            f = str(path)
+            for i, line in enumerate(text, start=1):
+                if any(p in line for p in mut_patterns):
+                    rank0_print(f"[NAN_DEBUG][audit] file={f}:{i} line={line.strip()}")
+                if ("mask_token" in line or "image_newline" in line) and ("=" in line):
+                    rank0_print(f"[NAN_DEBUG][audit][mask_newline_assign] file={f}:{i} line={line.strip()}")
+                if "self." in line and "=" in line and "_nan_debug" not in line and "def " not in line:
+                    if any(tok in line for tok in ["image", "embed", "feature", "mask", "newline"]):
+                        rank0_print(f"[NAN_DEBUG][audit][state_assign] file={f}:{i} line={line.strip()}")
+        self._nan_debug_inplace_audit_done = True
+
+    def _manual_one_batch_root_cause_pass(self, model, inputs):
+        if not self._nan_debug_rank0_enabled():
+            return None
+        variant = os.getenv("ROSS3D_MANUAL_ONE_BATCH_VARIANT", "backward_then_second_forward")
+        rank0_print(f"[NAN_DEBUG][manual_one_batch] variant={variant}")
+
+        local_inputs = copy.deepcopy(inputs)
+        loss, outputs = self._compute_loss_with_global_step(model, local_inputs, return_outputs=True)
+        self._log_loss_finiteness(loss, outputs)
+        self.accelerator.backward(loss)
+        self._log_target_finiteness_boundary("manual_after_backward")
+
+        if variant == "backward_grad_norm_second_forward":
+            params = [p for p in model.parameters() if p.grad is not None]
+            if len(params) > 0:
+                total = torch.zeros((), device=params[0].device)
+                for p in params:
+                    g = p.grad.detach().float()
+                    if torch.isfinite(g).all():
+                        total = total + (g * g).sum()
+                rank0_print(f"[NAN_DEBUG][manual_one_batch] grad_norm={float(torch.sqrt(total).item()):.6e}")
+        elif variant == "backward_grad_clip_second_forward":
+            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            rank0_print(f"[NAN_DEBUG][manual_one_batch] clip_grad_norm={float(norm):.6e}")
+        elif variant == "backward_zero_grad_second_forward":
+            opt = getattr(self, "optimizer", None)
+            if opt is not None:
+                opt.zero_grad(set_to_none=True)
+
+        self._log_target_finiteness_boundary("manual_before_second_forward")
+        second_ok = True
+        second_err = None
+        with torch.no_grad():
+            try:
+                local_inputs2 = copy.deepcopy(inputs)
+                loss2, outputs2 = self._compute_loss_with_global_step(model, local_inputs2, return_outputs=True)
+                self._log_loss_finiteness(loss2, outputs2)
+            except Exception as e:
+                second_ok = False
+                second_err = str(e)
+        rank0_print(f"[NAN_DEBUG][manual_one_batch] second_forward_ok={second_ok} second_forward_err={second_err}")
+        self._log_target_finiteness_boundary("manual_after_second_forward")
+        return loss.detach()
+
+    def _maybe_install_zero_grad_debug_hooks(self) -> None:
+        if getattr(self, "_nan_debug_zero_grad_hooks_installed", False):
+            return
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
+            return
+
+        optimizer = getattr(self, "optimizer", None)
+        model = getattr(self, "model", None)
+
+        if optimizer is not None and hasattr(optimizer, "zero_grad"):
+            orig_opt_zero_grad = optimizer.zero_grad
+
+            def _opt_zero_grad_wrapper(*args, **kwargs):
+                if self._nan_debug_rank0_enabled():
+                    opt_type = type(optimizer).__name__
+                    path_name = "accelerate-managed zero_grad" if "Accelerated" in opt_type else "optimizer.zero_grad"
+                    rank0_print(
+                        "[NAN_DEBUG][zero_grad] "
+                        f"path={path_name} optimizer_type={opt_type} incoming_kwargs={kwargs}"
+                    )
+                    self._log_target_finiteness_boundary("before_zero_grad")
+
+                if os.getenv("ROSS3D_SKIP_ZERO_GRAD_ONCE", "0") == "1" and not bool(getattr(self, "_nan_debug_skipped_zero_grad_once", False)):
+                    setattr(self, "_nan_debug_skipped_zero_grad_once", True)
+                    if self._nan_debug_rank0_enabled():
+                        rank0_print("[NAN_DEBUG][zero_grad] skip_zero_grad_once active, skipping this zero_grad call")
+                        self._log_target_finiteness_boundary("after_zero_grad_skip")
+                    return None
+
+                forced = self._parse_force_set_to_none()
+                if forced is not None:
+                    kwargs["set_to_none"] = forced
+
+                out = orig_opt_zero_grad(*args, **kwargs)
+                if self._nan_debug_rank0_enabled():
+                    rank0_print(
+                        "[NAN_DEBUG][zero_grad] completed path=optimizer.zero_grad "
+                        f"effective_set_to_none={kwargs.get('set_to_none', 'default')}"
+                    )
+                    self._log_target_finiteness_boundary("after_zero_grad")
+                return out
+
+            optimizer.zero_grad = _opt_zero_grad_wrapper
+
+        if model is not None and hasattr(model, "zero_grad"):
+            orig_model_zero_grad = model.zero_grad
+
+            def _model_zero_grad_wrapper(*args, **kwargs):
+                if self._nan_debug_rank0_enabled():
+                    rank0_print(
+                        "[NAN_DEBUG][zero_grad] path=model.zero_grad "
+                        f"model_type={type(model).__name__} incoming_kwargs={kwargs}"
+                    )
+                    self._log_target_finiteness_boundary("before_model_zero_grad")
+                out = orig_model_zero_grad(*args, **kwargs)
+                if self._nan_debug_rank0_enabled():
+                    self._log_target_finiteness_boundary("after_model_zero_grad")
+                return out
+
+            model.zero_grad = _model_zero_grad_wrapper
+
+        scheduler = getattr(self, "lr_scheduler", None)
+        if scheduler is not None and hasattr(scheduler, "step"):
+            orig_sched_step = scheduler.step
+
+            def _sched_step_wrapper(*args, **kwargs):
+                if self._nan_debug_rank0_enabled():
+                    opt_executed = bool(getattr(self, "_nan_debug_optimizer_step_executed_last", False))
+                    rank0_print(
+                        f"[NAN_DEBUG][transition] scheduler_step_start scheduler_type={type(scheduler).__name__} "
+                        f"optimizer_step_executed_last={opt_executed}"
+                    )
+                    self._log_target_finiteness_boundary("before_scheduler_step")
+                out = orig_sched_step(*args, **kwargs)
+                if self._nan_debug_rank0_enabled():
+                    rank0_print("[NAN_DEBUG][transition] scheduler_step_end")
+                    self._log_target_finiteness_boundary("after_scheduler_step")
+                return out
+
+            scheduler.step = _sched_step_wrapper
+
+        self._nan_debug_zero_grad_hooks_installed = True
+
     def training_step(self, model, inputs):
         self._nan_guard_total_steps = int(getattr(self, "_nan_guard_total_steps", 0)) + 1
+        self._maybe_run_inplace_stale_state_audit()
+        self._maybe_install_zero_grad_debug_hooks()
+        self._maybe_install_target_grad_hooks()
+        self._audit_model_special_params("before_first_batch_forward")
+        self._log_target_finiteness_boundary("forward_entry")
+        if os.getenv("ROSS3D_MANUAL_ONE_BATCH_DEBUG", "0") == "1":
+            if not bool(getattr(self, "_nan_debug_manual_one_batch_done", False)):
+                self._nan_debug_manual_one_batch_done = True
+                manual_loss = self._manual_one_batch_root_cause_pass(model, inputs)
+                if os.getenv("ROSS3D_MANUAL_ONE_BATCH_STOP", "1") == "1":
+                    raise RuntimeError("[NAN_DEBUG] manual one-batch root-cause pass completed; stopping by request")
+                if manual_loss is not None:
+                    return manual_loss
+        self._maybe_freeze_nan_debug_modules()
         self._maybe_init_param_ready_debug()
         self._maybe_init_cycle_grad_debug()
         if hasattr(self, "_param_ready_counts"):
@@ -431,12 +758,32 @@ class Ross3DTrainer(Trainer):
                 self._param_ready_counts[name] = 0
         if hasattr(self, "_cycle_grad_seen"):
             self._cycle_grad_seen = False
+        before_snapshot = None
+        if os.getenv("ROSS3D_SKIP_OPT_STEP", "0") == "1" and os.getenv("ROSS3D_NAN_DEBUG", "0") == "1":
+            before_snapshot = self._capture_target_param_snapshot()
         self._log_cuda_memory("before_training_step")
-        if os.getenv("ROSS3D_DEBUG_AUTOGRAD") == "1":
+        anomaly_enabled = os.getenv("ROSS3D_AUTOGRAD_ANOMALY", "0") == "1"
+        if self._nan_debug_rank0_enabled():
+            rank0_print(f"[NAN_DEBUG][anomaly_mode] enabled={anomaly_enabled}")
+        if anomaly_enabled:
             with torch.autograd.set_detect_anomaly(True):
                 loss = super().training_step(model, inputs)
+            if autograd_one:
+                self._nan_debug_one_batch_anomaly_done = True
+            if mm_anomaly_one:
+                self._nan_debug_mm_anomaly_done = True
         else:
             loss = super().training_step(model, inputs)
+        self._log_target_finiteness_boundary("after_backward_raw")
+        nonfinite_guard = self._check_nonfinite_grads_after_backward_and_guard()
+        if self._nan_debug_rank0_enabled():
+            rank0_print(f"[NAN_DEBUG][after_backward] guard_nonfinite_detected={nonfinite_guard}")
+        self._audit_model_special_params("after_first_backward")
+        self._log_target_finiteness_boundary("after_backward")
+        self._check_named_params_finiteness(model.named_parameters(), "after_backward")
+        self._log_target_param_stats(model.named_parameters(), "after_backward")
+        if before_snapshot is not None:
+            self._log_target_param_mutation(before_snapshot, "after_backward")
         self._log_cuda_memory("after_training_step")
         self._log_grad_stats("after_training_step")
         if hasattr(self, "_param_ready_counts") and self._param_ready_counts:
@@ -458,7 +805,123 @@ class Ross3DTrainer(Trainer):
                 f"llm_grad_seen={self._cycle_grad_seen} "
                 f"param={getattr(self, '_cycle_grad_param', 'n/a')}"
             )
+        self._log_target_finiteness_boundary("before_dataloader_next_batch")
         return loss
+
+    def _capture_target_param_snapshot(self):
+        model = getattr(self, "model", None)
+        if model is None:
+            return {}
+        targets = ["mask_token", "image_newline", "mm_projector.0.weight", "mm_projector.0.bias", "mm_projector.2.weight", "mm_projector.2.bias"]
+        snap = {}
+        for name, param in model.named_parameters():
+            if any(t in name for t in targets):
+                snap[name] = param.detach().float().clone()
+        return snap
+
+    def _log_target_param_mutation(self, before_snapshot, tag: str) -> None:
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
+            return
+        if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+        model = getattr(self, "model", None)
+        if model is None:
+            return
+        for name, param in model.named_parameters():
+            if name not in before_snapshot:
+                continue
+            prev = before_snapshot[name].to(device=param.device)
+            cur = param.detach().float()
+            if prev.shape != cur.shape:
+                rank0_print(f"[NAN_DEBUG][{tag}] param_shape_changed name={name} prev={tuple(prev.shape)} cur={tuple(cur.shape)}")
+                continue
+            delta = (cur - prev).abs()
+            max_delta = float(delta.max().item()) if delta.numel() > 0 else 0.0
+            changed = bool(max_delta > 0.0)
+            rank0_print(f"[NAN_DEBUG][{tag}] param_mutation name={name} changed={changed} max_abs_delta={max_delta:.6e}")
+
+    def _maybe_freeze_nan_debug_modules(self) -> None:
+        combined = os.getenv("ROSS3D_FREEZE_MM_PROJECTOR_DEBUG", "0") == "1"
+        freeze_newline_only = os.getenv("ROSS3D_FREEZE_IMAGE_NEWLINE_ONLY", "0") == "1"
+        freeze_proj_only = os.getenv("ROSS3D_FREEZE_MM_PROJECTOR_ONLY", "0") == "1"
+        if not (combined or freeze_newline_only or freeze_proj_only):
+            return
+        if bool(getattr(self, "_nan_debug_freeze_applied", False)):
+            return
+        model = getattr(self, "model", None)
+        if model is None:
+            return
+
+        frozen = []
+        for name, param in model.named_parameters():
+            should_freeze = False
+            if combined and (("mm_projector" in name) or ("image_newline" in name) or ("mask_token" in name)):
+                should_freeze = True
+            if freeze_newline_only and ("image_newline" in name):
+                should_freeze = True
+            if freeze_proj_only and ("mm_projector" in name):
+                should_freeze = True
+            if should_freeze:
+                param.requires_grad = False
+                frozen.append(name)
+
+        self._nan_debug_freeze_applied = True
+        rank0_print(f"[NAN_DEBUG] froze_params_count={len(frozen)} froze_params_head={frozen[:16]}")
+
+    def _log_target_param_stats(self, named_params, tag: str) -> None:
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
+            return
+        if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+
+        targets = [
+            "image_newline",
+            "mm_projector.0.weight",
+            "mm_projector.0.bias",
+            "mm_projector.2.weight",
+            "mm_projector.2.bias",
+            "mask_token",
+        ]
+
+        for name, param in named_params:
+            if not any(t in name for t in targets):
+                continue
+
+            pdata = param.data.detach()
+            param_has_nan = bool(torch.isnan(pdata).any().item())
+            param_has_inf = bool(torch.isinf(pdata).any().item())
+            pfinite = torch.isfinite(pdata)
+            if bool(pfinite.any().item()):
+                pvals = pdata[pfinite]
+                pmin = float(pvals.min().item())
+                pmax = float(pvals.max().item())
+            else:
+                pmin, pmax = None, None
+
+            if param.grad is None:
+                grad_has_nan = None
+                grad_has_inf = None
+                gmin, gmax = None, None
+            else:
+                gdata = param.grad.detach()
+                grad_has_nan = bool(torch.isnan(gdata).any().item())
+                grad_has_inf = bool(torch.isinf(gdata).any().item())
+                gfinite = torch.isfinite(gdata)
+                if bool(gfinite.any().item()):
+                    gvals = gdata[gfinite]
+                    gmin = float(gvals.min().item())
+                    gmax = float(gvals.max().item())
+                else:
+                    gmin, gmax = None, None
+
+            rank0_print(
+                f"[NAN_DEBUG][{tag}][TARGET] "
+                f"name={name} "
+                f"param_has_nan={param_has_nan} param_has_inf={param_has_inf} "
+                f"param_min={pmin} param_max={pmax} "
+                f"grad_has_nan={grad_has_nan} grad_has_inf={grad_has_inf} "
+                f"grad_min={gmin} grad_max={gmax}"
+            )
 
     def _grad_group_from_name(self, name: str) -> str:
         if "mm_projector" in name:
@@ -471,10 +934,49 @@ class Ross3DTrainer(Trainer):
             return "qwen_model"
         return "other"
 
-    def _check_nonfinite_grads_after_backward_and_guard(self) -> None:
+    def _check_named_params_finiteness(self, named_params, tag: str, max_print: int = 20) -> None:
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
+            return
+        if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+
+        bad = []
+        first_bad = None
+        group_keys = ["mm_projector", "image_newline", "qwen_model", "ground_head", "other"]
+        group_summary = {key: {"grad": 0, "param": 0} for key in group_keys}
+
+        for name, param in named_params:
+            group = self._grad_group_from_name(name)
+            if group not in group_summary:
+                group = "other"
+
+            if param.grad is not None:
+                grad_has_nan = bool(torch.isnan(param.grad).any().item())
+                grad_has_inf = bool(torch.isinf(param.grad).any().item())
+                if grad_has_nan or grad_has_inf:
+                    if first_bad is None:
+                        first_bad = (name, "grad", grad_has_nan, grad_has_inf)
+                    bad.append((name, "grad", grad_has_nan, grad_has_inf))
+                    group_summary[group]["grad"] += 1
+
+            param_has_nan = bool(torch.isnan(param.data).any().item())
+            param_has_inf = bool(torch.isinf(param.data).any().item())
+            if param_has_nan or param_has_inf:
+                if first_bad is None:
+                    first_bad = (name, "param", param_has_nan, param_has_inf)
+                bad.append((name, "param", param_has_nan, param_has_inf))
+                group_summary[group]["param"] += 1
+
+        rank0_print(
+            f"[NAN_DEBUG][{tag}] bad_count={len(bad)} first_bad={first_bad} group_summary={group_summary}"
+        )
+        for row in bad[:max_print]:
+            rank0_print(f"[NAN_DEBUG][{tag}] {row}")
+
+    def _check_nonfinite_grads_after_backward_and_guard(self) -> bool:
         model = getattr(self, "model", None)
         if model is None:
-            return
+            return False
 
         if not hasattr(self, "_nan_guard_total_hits"):
             self._nan_guard_total_hits = 0
@@ -494,8 +996,11 @@ class Ross3DTrainer(Trainer):
 
         if first_bad is None:
             self._nan_guard_consecutive_hits = 0
+            self._nan_debug_skip_optimizer_step = False
             self._maybe_log_nan_guard_summary(force=False)
-            return
+            if self._nan_debug_rank0_enabled():
+                rank0_print("[NAN_DEBUG][after_backward] nonfinite_guard_triggered=False")
+            return False
 
         self._nan_guard_total_hits += 1
         self._nan_guard_consecutive_hits += 1
@@ -518,6 +1023,13 @@ class Ross3DTrainer(Trainer):
         optimizer = getattr(self, "optimizer", None)
         if optimizer is not None:
             optimizer.zero_grad(set_to_none=True)
+        self._nan_debug_skip_optimizer_step = True
+        if self._nan_debug_rank0_enabled():
+            rank0_print(
+                f"[NAN_DEBUG][after_backward] nonfinite_guard_triggered=True first_bad={first_bad} "
+                "action=skip_optimizer_step_and_zero_grad"
+            )
+        return True
 
     def _maybe_log_nan_guard_summary(self, force: bool = False) -> None:
         if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
@@ -547,6 +1059,23 @@ class Ross3DTrainer(Trainer):
         )
     def _wrap_model(self, model, training=True, dataloader=None):
         model = super()._wrap_model(model, training=training, dataloader=dataloader)
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") == "1":
+            for m in [model, getattr(model, "module", None)]:
+                if m is None:
+                    continue
+                targets = [m]
+                if hasattr(m, "get_model"):
+                    try:
+                        targets.append(m.get_model())
+                    except Exception:
+                        pass
+                for t in targets:
+                    if t is None:
+                        continue
+                    if hasattr(t, "_audit_special_param_finiteness"):
+                        t._audit_special_param_finiteness("after_accelerator_wrapping")
+                    if hasattr(t, "_audit_special_param_aliases"):
+                        t._audit_special_param_aliases("after_accelerator_wrapping")
         if not training:
             return model
         if not getattr(self.args, "gradient_checkpointing", False):
@@ -563,6 +1092,23 @@ class Ross3DTrainer(Trainer):
             model._set_static_graph()
             if getattr(self.args, "verbose_logging", False):
                 rank0_print("[checkpoint-debug] DDP static graph enabled")
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") == "1":
+            for m in [model, getattr(model, "module", None)]:
+                if m is None:
+                    continue
+                targets = [m]
+                if hasattr(m, "get_model"):
+                    try:
+                        targets.append(m.get_model())
+                    except Exception:
+                        pass
+                for t in targets:
+                    if t is None:
+                        continue
+                    if hasattr(t, "_audit_special_param_finiteness"):
+                        t._audit_special_param_finiteness("after_ddp_wrapping")
+                    if hasattr(t, "_audit_special_param_aliases"):
+                        t._audit_special_param_aliases("after_ddp_wrapping")
         return model
 
     def _log_optimizer_state(self, tag: str) -> None:
@@ -656,11 +1202,57 @@ class Ross3DTrainer(Trainer):
         )
 
     def optimizer_step(self, *args, **kwargs):
+        model = getattr(self, "model", None)
+        if model is not None:
+            self._log_target_finiteness_boundary("before_optimizer_step")
+            self._check_named_params_finiteness(model.named_parameters(), "before_optimizer_step")
+            self._log_target_param_stats(model.named_parameters(), "before_optimizer_step")
         self._log_nonfinite_grad_param_debug("before_optimizer_step")
         self._log_cuda_memory("before_optimizer_step")
         self._log_optimizer_state("before_optimizer_step")
         self._log_optimizer_param_counts("before_optimizer_step")
-        result = super().optimizer_step(*args, **kwargs)
+
+        ddp_model = model
+        if isinstance(ddp_model, torch.nn.parallel.DistributedDataParallel):
+            rank0_print(
+                "[NAN_DEBUG][ddp] "
+                f"find_unused_parameters={getattr(ddp_model, 'find_unused_parameters', 'unknown')} "
+                f"static_graph={getattr(ddp_model, 'static_graph', 'unknown')}"
+            )
+
+        accelerator = getattr(self, "accelerator", None)
+        scaler = getattr(accelerator, "scaler", None) if accelerator is not None else None
+        rank0_print(f"[NAN_DEBUG][amp] autocast_enabled_before_opt_step={torch.is_autocast_enabled()}")
+        if scaler is not None:
+            rank0_print(f"[NAN_DEBUG][amp] scaler_present=True scale_before={float(scaler.get_scale()):.6e}")
+        else:
+            rank0_print("[NAN_DEBUG][amp] scaler_present=False")
+
+        if model is not None and os.getenv("ROSS3D_DEBUG_CLIP_GRAD", "0") == "1":
+            rank0_print("[NAN_DEBUG][transition] grad_clip_start")
+            total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            rank0_print(f"[NAN_DEBUG][transition] grad_clip_end total_norm={float(total_norm):.6e}")
+
+        guard_skip = bool(getattr(self, "_nan_debug_skip_optimizer_step", False))
+        env_skip = os.getenv("ROSS3D_SKIP_OPT_STEP", "0") == "1"
+        if env_skip or guard_skip:
+            reason = "env" if env_skip else "nonfinite_guard"
+            rank0_print(f"[NAN_DEBUG][transition] optimizer_step_skipped=True reason={reason}")
+            result = None
+            self._nan_debug_optimizer_step_executed_last = False
+            self._nan_debug_skip_optimizer_step = False
+        else:
+            rank0_print("[NAN_DEBUG][transition] optimizer_step_skipped=False executing=True")
+            result = super().optimizer_step(*args, **kwargs)
+            self._nan_debug_optimizer_step_executed_last = True
+
+        rank0_print(f"[NAN_DEBUG][amp] autocast_enabled_after_opt_step={torch.is_autocast_enabled()}")
+        if scaler is not None:
+            rank0_print(f"[NAN_DEBUG][amp] scale_after={float(scaler.get_scale()):.6e}")
+        if model is not None:
+            self._log_target_finiteness_boundary("after_optimizer_step")
+            self._check_named_params_finiteness(model.named_parameters(), "after_optimizer_step")
+            self._log_target_param_stats(model.named_parameters(), "after_optimizer_step")
         self._log_nonfinite_grad_param_debug("after_optimizer_step")
         self._log_cuda_memory("after_optimizer_step")
         self._log_optimizer_state("after_optimizer_step")
@@ -1089,9 +1681,35 @@ class Ross3DTrainer(Trainer):
         else:
             super(Ross3DTrainer, self)._save(output_dir, state_dict)
 
+    def _log_loss_gradient_attribution(self, outputs) -> None:
+        if os.getenv("ROSS3D_NAN_DEBUG_LOSS_ATTRIB", "0") != "1":
+            return
+        if not self._nan_debug_rank0_enabled():
+            return
+        if not isinstance(outputs, dict):
+            return
+        targets = self._get_target_debug_params()
+        if len(targets) == 0:
+            return
+
+        loss_keys = ["lm_loss", "occ_temp_loss", "occ_geom_loss", "vm_loss", "bev_loss", "cycle_loss", "loss"]
+        for key in loss_keys:
+            loss_term = outputs.get(key, None)
+            if loss_term is None or (not torch.is_tensor(loss_term)):
+                continue
+            grads = torch.autograd.grad(loss_term, [p for _, p in targets], retain_graph=True, allow_unused=True)
+            for (name, _), g in zip(targets, grads):
+                grad_state, g_nan, g_inf, gmin, gmax, gshape = self._format_grad_state(g)
+                rank0_print(
+                    "[NAN_DEBUG][loss_attrib] "
+                    f"loss={key} target={name} grad_state={grad_state} "
+                    f"nan_count={g_nan} inf_count={g_inf} min={gmin} max={gmax} shape={gshape}"
+                )
+
     def compute_loss(self, model, inputs, return_outputs=False, *args, **kwargs):
         loss, outputs = self._compute_loss_with_global_step(model, inputs, return_outputs=True)
         self._log_loss_finiteness(loss, outputs)
+        self._log_loss_gradient_attribution(outputs)
 
         log_dict = {}
         self._cycle_loss_active = outputs.get("cycle_loss", None) is not None

@@ -44,6 +44,13 @@ from ross3d.utils import rank0_print, rank_print
 import random
 
 
+if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
+    _compile_disable = torch.compiler.disable
+else:
+    def _compile_disable(fn):
+        return fn
+
+
 class SimCLRStylePatchProjector(nn.Module):
     def __init__(self, d_model: int, d_proj: int):
         super().__init__()
@@ -70,9 +77,13 @@ class Ross3DMetaModel:
             self.vision_resampler = build_vision_resampler(config, vision_tower=self.vision_tower)
             self.mm_projector = build_vision_projector(config, vision_cfg=self.vision_tower.config)
             self.mask_token = nn.Parameter(torch.empty(config.hidden_size, dtype=self.dtype))
+            self._audit_special_param_finiteness("post_constructor_mask_token_register")
 
             if "unpad" in getattr(config, "mm_patch_merge_type", ""):
                 self.image_newline = nn.Parameter(torch.empty(config.hidden_size, dtype=self.dtype))
+                self._audit_special_param_finiteness("post_constructor_image_newline_register")
+            self._audit_special_param_finiteness("post_constructor_init")
+            self._audit_special_param_aliases("post_constructor_init")
 
         d_model = getattr(config, "hidden_size", None)
         occ_geom_enabled = bool(getattr(config, "enable_occ_geom_loss", False))
@@ -145,6 +156,78 @@ class Ross3DMetaModel:
         #     (self.vision_tower.config.image_size // self.vision_tower.config.patch_size)
         #     / float(self.config.mm_spatial_pool_stride)) ** 2
 
+        self._audit_special_param_finiteness("post_model_init_complete")
+        self._audit_special_param_aliases("post_model_init_complete")
+
+    def _audit_special_param_finiteness(self, stage: str) -> None:
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
+            return
+        if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+        for pname in ["mask_token", "image_newline"]:
+            p = getattr(self, pname, None)
+            if p is None:
+                continue
+            t = p.detach()
+            finite = torch.isfinite(t)
+            finite_any = bool(finite.any().item())
+            finite_all = bool(finite.all().item())
+            nan_count = int(torch.isnan(t).sum().item())
+            inf_count = int(torch.isinf(t).sum().item())
+            if finite_any:
+                vals = t[finite]
+                tmin = float(vals.min().item())
+                tmax = float(vals.max().item())
+            else:
+                tmin, tmax = None, None
+            rank0_print(
+                "[NAN_DEBUG][param_audit] "
+                f"stage={stage} name={pname} shape={tuple(t.shape)} dtype={t.dtype} device={t.device} "
+                f"finite_all={finite_all} nan_count={nan_count} inf_count={inf_count} min={tmin} max={tmax}"
+            )
+
+    def _audit_special_param_aliases(self, stage: str) -> None:
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
+            return
+        if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+        named = dict(self.named_parameters()) if hasattr(self, "named_parameters") else {}
+        for pname in ["mask_token", "image_newline"]:
+            p = getattr(self, pname, None)
+            if p is None:
+                continue
+            pptr = int(p.data_ptr())
+            try:
+                psptr = int(p.untyped_storage().data_ptr())
+            except Exception:
+                psptr = None
+            alias_name = None
+            for oname, other in named.items():
+                if other is p:
+                    continue
+                if int(other.data_ptr()) == pptr:
+                    alias_name = oname
+                    break
+            rank0_print(
+                "[NAN_DEBUG][param_alias] "
+                f"stage={stage} name={pname} data_ptr={pptr} storage_ptr={psptr} "
+                f"is_view={p._base is not None} alias_with={alias_name}"
+            )
+
+    def _sanitize_mask_token_if_nonfinite(self, stage: str) -> None:
+        if os.getenv("ROSS3D_SANITIZE_MASK_TOKEN_ON_NONFINITE", "0") != "1":
+            return
+        m = getattr(self, "mask_token", None)
+        if m is None:
+            return
+        finite_all = bool(torch.isfinite(m.detach()).all().item())
+        if finite_all:
+            return
+        self._audit_special_param_finiteness(f"sanitize_before/{stage}")
+        with torch.no_grad():
+            torch.nn.init.normal_(m, mean=0.0, std=0.02)
+        self._audit_special_param_finiteness(f"sanitize_after/{stage}")
+        rank0_print(f"[NAN_DEBUG][sanitize] stage={stage} action=reinit_mask_token")
 
     def get_vision_tower(self):
         vision_tower = getattr(self, "vision_tower", None)
@@ -217,11 +300,12 @@ class Ross3DMetaModel:
                     torch.randn(self.config.hidden_size, dtype=self.dtype) * embed_std
                 )
 
+        self._audit_special_param_finiteness("initialize_vision_modules.start")
         if getattr(self, "mm_projector", None) is None:
             self.mm_projector = build_vision_projector(self.config, vision_cfg=vision_tower.config)
 
             embed_std = 1 / torch.sqrt(torch.tensor(self.config.hidden_size, dtype=self.dtype))
-            self.mask_token = nn.Parameter(torch.randn(config.hidden_size, dtype=self.dtype) * embed_std,
+            self.mask_token = nn.Parameter(torch.randn(self.config.hidden_size, dtype=self.dtype) * embed_std,
                                            requires_grad=True)
 
             if "unpad" in mm_patch_merge_type:
@@ -233,7 +317,25 @@ class Ross3DMetaModel:
                 p.requires_grad = True
 
         if pretrain_mm_mlp_adapter is not None:
+            self._audit_special_param_finiteness("initialize_vision_modules.before_checkpoint_load")
             mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location="cpu")
+            mask_ckpt_keys = [k for k in mm_projector_weights.keys() if ("mask_token" in k) or ("image_newline" in k)]
+            rank0_print(f"[NAN_DEBUG][ckpt_audit] path={pretrain_mm_mlp_adapter} has_mask_or_newline_keys={len(mask_ckpt_keys) > 0} keys={mask_ckpt_keys[:8]}")
+            for k in mask_ckpt_keys[:4]:
+                t = mm_projector_weights[k]
+                if torch.is_tensor(t):
+                    finite = torch.isfinite(t)
+                    finite_any = bool(finite.any().item())
+                    finite_all = bool(finite.all().item())
+                    nan_count = int(torch.isnan(t).sum().item())
+                    inf_count = int(torch.isinf(t).sum().item())
+                    if finite_any:
+                        vals = t[finite]
+                        tmin = float(vals.min().item())
+                        tmax = float(vals.max().item())
+                    else:
+                        tmin, tmax = None, None
+                    rank0_print(f"[NAN_DEBUG][ckpt_audit] key={k} shape={tuple(t.shape)} dtype={t.dtype} finite_all={finite_all} nan_count={nan_count} inf_count={inf_count} min={tmin} max={tmax}")
 
             def get_w(weights, keyword):
                 return {k.split(keyword + ".")[1]: v for k, v in weights.items() if keyword in k}
@@ -242,8 +344,13 @@ class Ross3DMetaModel:
             rank0_print(f"Loaded mm projector weights from {pretrain_mm_mlp_adapter}. Incompatible keys: {incompatible_keys}")
             incompatible_keys = self.vision_resampler.load_state_dict(get_w(mm_projector_weights, "vision_resampler"), strict=False)
             rank0_print(f"Loaded vision resampler weights from {pretrain_mm_mlp_adapter}. Incompatible keys: {incompatible_keys}")
+            self._audit_special_param_finiteness("initialize_vision_modules.after_checkpoint_load")
+            self._audit_special_param_aliases("initialize_vision_modules.after_checkpoint_load")
 
         self.config.ross_enable = False
+        self._audit_special_param_finiteness("initialize_vision_modules.after_precision_cast_or_to")
+        self._audit_special_param_aliases("initialize_vision_modules.after_precision_cast_or_to")
+        self._audit_special_param_finiteness("initialize_vision_modules.before_return")
         if getattr(model_args, 'mm_pixel_decoder', False):
             self.config.ross_enable = True
             ### build pixel decoder
@@ -528,6 +635,49 @@ class Ross3DMetaForCausalLM(ABC):
         return world_coords_discrete.detach()
 
 
+    @_compile_disable
+    def _mm_projector_eager(self, x: torch.Tensor) -> torch.Tensor:
+        return self.get_model().mm_projector(x)
+
+    def _run_mm_projector_debuggable(self, image_features: torch.Tensor) -> torch.Tensor:
+        model = self.get_model()
+        use_fp32 = os.getenv("ROSS3D_MM_PROJECTOR_FP32_DEBUG", "0") == "1"
+        internal_debug = os.getenv("ROSS3D_MM_PROJECTOR_INTERNAL_DEBUG", "0") == "1"
+        disable_compile = os.getenv("ROSS3D_DISABLE_MM_PROJECTOR_COMPILE", "0") == "1"
+
+        self._maybe_install_mm_backward_hooks()
+        projector_in = image_features.float() if use_fp32 else image_features
+        self._debug_tensor_finite_stats("projector_internal.forward/input", projector_in)
+        self._retain_and_track_grad("projector_input", projector_in)
+        self._retain_and_track_grad("mm_projector_input", projector_in)
+
+        if internal_debug and isinstance(model.mm_projector, nn.Sequential) and len(model.mm_projector) >= 3:
+            l0 = model.mm_projector[0](projector_in)
+            self._debug_tensor_finite_stats("projector_internal.forward/l0_out", l0)
+            self._retain_and_track_grad("projector_l0_out", l0)
+
+            act = model.mm_projector[1](l0)
+            self._debug_tensor_finite_stats("projector_internal.forward/act_out", act)
+            self._retain_and_track_grad("projector_act_out", act)
+
+            l2 = model.mm_projector[2](act)
+            self._debug_tensor_finite_stats("projector_internal.forward/l2_out", l2)
+            self._retain_and_track_grad("projector_l2_out", l2)
+            projector_out = l2
+        else:
+            if disable_compile:
+                projector_out = self._mm_projector_eager(projector_in)
+            else:
+                projector_out = model.mm_projector(projector_in)
+
+        self._debug_tensor_finite_stats("projector_internal.forward/output", projector_out)
+        self._retain_and_track_grad("projector_output", projector_out)
+        self._retain_and_track_grad("mm_projector_output", projector_out)
+
+        if use_fp32:
+            return projector_out.to(model.embed_tokens.weight.dtype)
+        return projector_out
+
     def encode_images(self, images, world_coords=None):
         nan_dbg_enabled = os.getenv("ROSS3D_NAN_DEBUG", "0") == "1"
 
@@ -565,7 +715,8 @@ class Ross3DMetaForCausalLM(ABC):
             resampler_out = self.get_model().vision_resampler(image_features, images=images)
             _nan_debug_stage("vision_resampler_out", resampler_out)
 
-        image_features = self.get_model().mm_projector(image_features)
+        image_features = self._run_mm_projector_debuggable(image_features)
+        self._trace_tensor_state("encode_images.mm_projector_out", image_features)
         _nan_debug_stage("mm_projector_out", image_features)
 
         return image_features
@@ -580,7 +731,7 @@ class Ross3DMetaForCausalLM(ABC):
 
         for idx, feat in enumerate(per_videos_or_images_features):
             
-            feat = self.get_model().mm_projector(feat)
+            feat = self._run_mm_projector_debuggable(feat)
             faster_video_feature = 0
             slower_img_feat = 0
             if idx in video_idx_in_batch and cur_mm_spatial_pool_stride > 1:
@@ -623,7 +774,8 @@ class Ross3DMetaForCausalLM(ABC):
         # [3584, 32, 14, 1, 14] --> [3584, 448, 1, 14] --> [3584, 448, 14]
         image_feature = image_feature.flatten(1, 2).flatten(2, 3)
         # [3584, 448, 15]
-        image_feature = torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
+        if os.getenv("ROSS3D_DISABLE_IMAGE_NEWLINE_INSERT", "0") != "1":
+            image_feature = torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
         if getattr(self.config, "add_faster_video", False):
             # import pdb; pdb.set_trace()
             # (3584, 832, 14) -> (3584, 64, 13, 14)
@@ -652,9 +804,342 @@ class Ross3DMetaForCausalLM(ABC):
 
     def add_token_per_frame(self, image_feature):
         image_feature = image_feature.permute(2, 0, 1).contiguous()
-        image_feature =  torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
+        if os.getenv("ROSS3D_DISABLE_IMAGE_NEWLINE_INSERT", "0") != "1":
+            image_feature =  torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
         image_feature = image_feature.permute(1, 2, 0).contiguous()
         return image_feature
+
+    def _nan_debug_rank0_enabled(self) -> bool:
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
+            return False
+        if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return False
+        return True
+
+    def _debug_tensor_finite_stats(self, tag: str, tensor: Optional[torch.Tensor]) -> None:
+        if (not self._nan_debug_rank0_enabled()) or tensor is None or (not torch.is_tensor(tensor)):
+            return
+        t = tensor.detach()
+        finite = torch.isfinite(t)
+        has_finite = bool(finite.any().item())
+        nan_count = int(torch.isnan(t).sum().item())
+        inf_count = int(torch.isinf(t).sum().item())
+        if has_finite:
+            vals = t[finite]
+            min_v = float(vals.min().item())
+            max_v = float(vals.max().item())
+        else:
+            min_v, max_v = None, None
+        finite_all = bool(finite.all().item())
+        rank0_print(
+            f"[NAN_DEBUG][{tag}] shape={tuple(t.shape)} dtype={t.dtype} "
+            f"finite_all={finite_all} finite_any={has_finite} "
+            f"nan_count={nan_count} inf_count={inf_count} min={min_v} max={max_v}"
+        )
+
+    def _trace_tensor_state(self, tag: str, tensor: Optional[torch.Tensor]) -> None:
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
+            return
+        if (not self._nan_debug_rank0_enabled()) or tensor is None or (not torch.is_tensor(tensor)):
+            return
+        t = tensor.detach()
+        finite = torch.isfinite(t)
+        finite_any = bool(finite.any().item())
+        finite_all = bool(finite.all().item())
+        nan_count = int(torch.isnan(t).sum().item())
+        inf_count = int(torch.isinf(t).sum().item())
+        if finite_any:
+            vals = t[finite]
+            tmin = float(vals.min().item())
+            tmax = float(vals.max().item())
+        else:
+            tmin, tmax = None, None
+        alias = None
+        try:
+            alias = int(t.untyped_storage().data_ptr())
+        except Exception:
+            alias = None
+        rank0_print(
+            f"[NAN_DEBUG][tensor_trace] tag={tag} shape={tuple(t.shape)} dtype={t.dtype} "
+            f"finite_all={finite_all} finite_any={finite_any} nan_count={nan_count} inf_count={inf_count} "
+            f"min={tmin} max={tmax} data_ptr={int(t.data_ptr())} storage_ptr={alias} "
+            f"is_view={t._base is not None} stride={tuple(t.stride())}"
+        )
+
+    def _nan_debug_validate_layout_snapshot(self, boundary: str) -> None:
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
+            return
+        snap = getattr(self, "_nan_debug_layout_snapshot", None)
+        if not snap:
+            return
+        old_feat = snap.get("old_image_feature")
+        packed = snap.get("cur_new_input_embeds")
+        boi_ids = snap.get("boi_ids")
+        eoi_ids = snap.get("eoi_ids")
+        newline_ids = snap.get("newline_ids")
+        newline_ref = snap.get("image_newline")
+        if old_feat is None or packed is None or boi_ids is None or eoi_ids is None:
+            return
+        try:
+            fp32_layout_tolerant = os.getenv("ROSS3D_MM_BRANCH_FP32_DEBUG", "0") == "1"
+            if fp32_layout_tolerant:
+                atol = float(os.getenv("ROSS3D_MM_LAYOUT_ATOL", "1e-2"))
+                rtol = float(os.getenv("ROSS3D_MM_LAYOUT_RTOL", "1e-2"))
+                first_match = torch.isclose(old_feat[:, 0].float(), packed[boi_ids].float(), atol=atol, rtol=rtol).all(dim=1)
+                last_match = torch.isclose(old_feat[:, -1].float(), packed[eoi_ids].float(), atol=atol, rtol=rtol).all(dim=1)
+            else:
+                first_match = torch.all(old_feat[:, 0] == packed[boi_ids], dim=1)
+                last_match = torch.all(old_feat[:, -1] == packed[eoi_ids], dim=1)
+            ok_first = bool(torch.all(first_match).item())
+            ok_last = bool(torch.all(last_match).item())
+            ok_newline = True
+            if newline_ids is not None and newline_ref is not None and len(newline_ids) > 0:
+                if fp32_layout_tolerant:
+                    newline_match = torch.isclose(
+                        newline_ref.unsqueeze(0).repeat(len(newline_ids), 1).float(),
+                        packed[newline_ids].float(),
+                        atol=atol,
+                        rtol=rtol,
+                    ).all(dim=1)
+                else:
+                    newline_match = torch.all(newline_ref.unsqueeze(0).repeat(len(newline_ids), 1) == packed[newline_ids], dim=1)
+                ok_newline = bool(torch.all(newline_match).item())
+            rank0_print(
+                f"[NAN_DEBUG][layout_snapshot] boundary={boundary} ok_first={ok_first} ok_last={ok_last} ok_newline={ok_newline}"
+            )
+            if os.getenv("ROSS3D_NAN_FAIL_FAST", "0") == "1" and (not ok_first or not ok_last or not ok_newline):
+                raise RuntimeError(
+                    f"[NAN_DEBUG] post-backward layout invalid at {boundary}: "
+                    f"ok_first={ok_first} ok_last={ok_last} ok_newline={ok_newline}"
+                )
+        except Exception as e:
+            rank0_print(f"[NAN_DEBUG][layout_snapshot] boundary={boundary} validate_error={e}")
+
+    def _check_tensor_finite_or_raise(self, tag: str, tensor: Optional[torch.Tensor]) -> None:
+        if os.getenv("ROSS3D_NAN_FAIL_FAST", "0") != "1":
+            return
+        if tensor is None or (not torch.is_tensor(tensor)):
+            return
+        if not bool(torch.isfinite(tensor).all().item()):
+            raise RuntimeError(
+                f"[NAN_DEBUG][{tag}] non-finite tensor detected "
+                f"shape={tuple(tensor.shape)} dtype={tensor.dtype}"
+            )
+
+    def _log_alias_info(self, tag: str, tensor: Optional[torch.Tensor], ref: Optional[torch.Tensor], ref_name: str) -> None:
+        if (not self._nan_debug_rank0_enabled()) or tensor is None or ref is None:
+            return
+        if (not torch.is_tensor(tensor)) or (not torch.is_tensor(ref)):
+            return
+        same_ptr = int(tensor.data_ptr()) == int(ref.data_ptr())
+        rank0_print(
+            f"[NAN_DEBUG][{tag}][ALIAS] tensor_ptr={int(tensor.data_ptr())} "
+            f"ref={ref_name} ref_ptr={int(ref.data_ptr())} same_ptr={same_ptr} "
+            f"tensor_base={tensor._base is not None}"
+        )
+        if os.getenv("ROSS3D_STRICT_ALIAS_CHECK", "0") == "1" and same_ptr:
+            raise RuntimeError(f"[NAN_DEBUG][{tag}] alias detected with {ref_name}")
+
+    def _clone_mm_insert_if_debug(self, tensor: torch.Tensor) -> torch.Tensor:
+        if os.getenv("ROSS3D_CLONE_MM_INSERTS_DEBUG", "0") == "1":
+            return tensor.clone()
+        return tensor
+
+    def _retain_and_track_grad(self, name: str, tensor: Optional[torch.Tensor]) -> None:
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
+            return
+        if os.getenv("ROSS3D_NAN_RETAIN_FIRST_BATCH_ONLY", "1") == "1":
+            if not bool(getattr(self, "_nan_debug_track_this_batch", False)):
+                return
+        if tensor is None or (not torch.is_tensor(tensor)) or (not tensor.requires_grad):
+            return
+        tensor.retain_grad()
+        store = getattr(self, "_nan_debug_retained_tensors", None)
+        if store is None:
+            store = {}
+            setattr(self, "_nan_debug_retained_tensors", store)
+        store[name] = tensor
+        order = getattr(self, "_nan_debug_retained_order", None)
+        if order is None:
+            order = []
+            setattr(self, "_nan_debug_retained_order", order)
+        if name not in order:
+            order.append(name)
+
+    def _log_grad_stats_for_tensor(self, tag: str, tensor: Optional[torch.Tensor]) -> None:
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
+            return
+        if not self._nan_debug_rank0_enabled():
+            return
+        if tensor is None or (not torch.is_tensor(tensor)):
+            rank0_print(f"[NAN_DEBUG][{tag}] grad_state=none")
+            return
+        grad = tensor.grad
+        if grad is None:
+            rank0_print(f"[NAN_DEBUG][{tag}] grad_state=none")
+            return
+        g = grad.detach()
+        finite = torch.isfinite(g)
+        finite_any = bool(finite.any().item())
+        finite_all = bool(finite.all().item())
+        nan_count = int(torch.isnan(g).sum().item())
+        inf_count = int(torch.isinf(g).sum().item())
+        if finite_any:
+            vals = g[finite]
+            gmin = float(vals.min().item())
+            gmax = float(vals.max().item())
+        else:
+            gmin, gmax = None, None
+        state = "finite" if finite_all else "nonfinite"
+        rank0_print(
+            f"[NAN_DEBUG][{tag}] grad_state={state} shape={tuple(g.shape)} dtype={g.dtype} "
+            f"nan_count={nan_count} inf_count={inf_count} min={gmin} max={gmax}"
+        )
+
+    def _maybe_log_projector_internal_backward(self, boundary_tag: str) -> None:
+        if os.getenv("ROSS3D_MM_PROJECTOR_INTERNAL_DEBUG", "0") != "1":
+            return
+        store = getattr(self, "_nan_debug_retained_tensors", {})
+        for key in ["projector_input", "projector_l0_out", "projector_act_out", "projector_l2_out", "projector_output"]:
+            self._log_grad_stats_for_tensor(f"projector_internal.backward/{boundary_tag}/{key}", store.get(key, None))
+
+    def _maybe_log_multimodal_backward_chain(self, boundary_tag: str) -> None:
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
+            return
+        chain = [
+            "mm_projector_input",
+            "encoded_image_features",
+            "mm_projector_output",
+            "image_features_after_split_idx0",
+            "image_feat_after_mask_idx0",
+            "image_feat_after_world_pe_idx0",
+            "image_feature_after_add_token_per_grid_idx0",
+            "cur_new_input_embeds_after_cat",
+            "boi_slice",
+            "eoi_slice",
+            "newline_slice",
+        ]
+        store = getattr(self, "_nan_debug_retained_tensors", {})
+        last_finite = None
+        first_nonfinite = None
+        for key in chain:
+            t = store.get(key, None)
+            self._log_grad_stats_for_tensor(f"mm_chain/{boundary_tag}/{key}", t)
+            g = None if t is None else t.grad
+            if g is None:
+                continue
+            finite_all = bool(torch.isfinite(g.detach()).all().item())
+            if finite_all:
+                last_finite = key
+            elif first_nonfinite is None:
+                first_nonfinite = key
+        rank0_print(
+            f"[NAN_DEBUG][mm_chain/{boundary_tag}] last_finite={last_finite} first_nonfinite={first_nonfinite}"
+        )
+
+    def _maybe_install_mm_backward_hooks(self) -> None:
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
+            return
+        if getattr(self, "_nan_debug_mm_backward_hooks_installed", False):
+            return
+        model = self.get_model()
+        handles = []
+
+        def _make_hook(name: str):
+            def _hook(module, grad_input, grad_output):
+                if not self._nan_debug_rank0_enabled():
+                    return
+                def _state(g):
+                    if g is None or (not torch.is_tensor(g)):
+                        return "none"
+                    return "finite" if bool(torch.isfinite(g.detach()).all().item()) else "nonfinite"
+                in_state = [_state(g) for g in grad_input]
+                out_state = [_state(g) for g in grad_output]
+                rank0_print(f"[NAN_DEBUG][full_bw_hook] module={name} grad_input={in_state} grad_output={out_state}")
+            return _hook
+
+        if hasattr(model, "mm_projector") and isinstance(model.mm_projector, nn.Sequential):
+            if len(model.mm_projector) > 0 and isinstance(model.mm_projector[0], nn.Module):
+                handles.append(model.mm_projector[0].register_full_backward_hook(_make_hook("mm_projector.0")))
+            if len(model.mm_projector) > 2 and isinstance(model.mm_projector[2], nn.Module):
+                handles.append(model.mm_projector[2].register_full_backward_hook(_make_hook("mm_projector.2")))
+
+        if hasattr(model, "world_position_embedding") and isinstance(model.world_position_embedding, nn.Module):
+            handles.append(model.world_position_embedding.register_full_backward_hook(_make_hook("world_position_embedding")))
+
+        self._nan_debug_mm_backward_hook_handles = handles
+        self._nan_debug_mm_backward_hooks_installed = True
+
+    def _maybe_log_newline_packed_grad(self, boundary_tag: str) -> None:
+        if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
+            return
+        records = getattr(self, "_nan_debug_packed_grad_records", None)
+        if not records:
+            return
+        for ridx, rec in enumerate(records[:4]):
+            packed = rec.get("packed")
+            self._log_grad_stats_for_tensor(f"newline_grad/{boundary_tag}/packed_idx{ridx}", packed)
+            if packed is None or packed.grad is None:
+                continue
+            g = packed.grad.detach()
+            for k in ["newline_ids", "boi_ids", "eoi_ids"]:
+                idx = rec.get(k, None)
+                if idx is None or len(idx) == 0:
+                    rank0_print(f"[NAN_DEBUG][newline_grad/{boundary_tag}] {k}_state=none")
+                    continue
+                idx_t = torch.as_tensor(idx, device=g.device, dtype=torch.long)
+                idx_t = idx_t[(idx_t >= 0) & (idx_t < g.shape[0])]
+                if idx_t.numel() == 0:
+                    rank0_print(f"[NAN_DEBUG][newline_grad/{boundary_tag}] {k}_state=empty")
+                    continue
+                part = g[idx_t]
+                finite = torch.isfinite(part)
+                finite_any = bool(finite.any().item())
+                finite_all = bool(finite.all().item())
+                nan_count = int(torch.isnan(part).sum().item())
+                inf_count = int(torch.isinf(part).sum().item())
+                if finite_any:
+                    vals = part[finite]
+                    pmin = float(vals.min().item())
+                    pmax = float(vals.max().item())
+                else:
+                    pmin, pmax = None, None
+                state = "finite" if finite_all else "nonfinite"
+                rank0_print(
+                    f"[NAN_DEBUG][newline_grad/{boundary_tag}] region={k} grad_state={state} "
+                    f"shape={tuple(part.shape)} nan_count={nan_count} inf_count={inf_count} min={pmin} max={pmax}"
+                )
+
+            boi = rec.get("boi_ids", None)
+            eoi = rec.get("eoi_ids", None)
+            if boi is not None and eoi is not None and len(boi) == len(eoi) and len(boi) > 0:
+                image_ranges = []
+                for b, e in zip(boi, eoi):
+                    b_i = int(b)
+                    e_i = int(e)
+                    if e_i >= b_i:
+                        image_ranges.extend(range(b_i, e_i + 1))
+                if len(image_ranges) > 0:
+                    idx_t = torch.as_tensor(sorted(set(image_ranges)), device=g.device, dtype=torch.long)
+                    idx_t = idx_t[(idx_t >= 0) & (idx_t < g.shape[0])]
+                    if idx_t.numel() > 0:
+                        part = g[idx_t]
+                        finite = torch.isfinite(part)
+                        finite_any = bool(finite.any().item())
+                        finite_all = bool(finite.all().item())
+                        nan_count = int(torch.isnan(part).sum().item())
+                        inf_count = int(torch.isinf(part).sum().item())
+                        if finite_any:
+                            vals = part[finite]
+                            pmin = float(vals.min().item())
+                            pmax = float(vals.max().item())
+                        else:
+                            pmin, pmax = None, None
+                        state = "finite" if finite_all else "nonfinite"
+                        rank0_print(
+                            f"[NAN_DEBUG][newline_grad/{boundary_tag}] region=image_token grad_state={state} "
+                            f"shape={tuple(part.shape)} nan_count={nan_count} inf_count={inf_count} min={pmin} max={pmax}"
+                        )
 
     def replace_with_mask_token(self, x, mask_ratio):
         # x: [num_frames, num_patches, embed_dim]
@@ -677,14 +1162,99 @@ class Ross3DMetaForCausalLM(ABC):
         x_masked = torch.gather(x, dim=0, index=ids_keep.unsqueeze(-1).unsqueeze(-1).repeat(1, num_patches, embed_dim))
 
         # append mask tokens
+        if self._nan_debug_rank0_enabled():
+            ratio = float(len_mask) / max(float(num_frames), 1.0)
+            rank0_print(
+                f"[NAN_DEBUG][mask_replace] len_mask={len_mask} len_keep={len_keep} num_frames={num_frames} "
+                f"mask_ratio={ratio:.6f} inserted={len_mask > 0}"
+            )
         mask_tokens = self.get_model().mask_token.unsqueeze(0).repeat(len_mask, num_patches, 1)
+        self._log_alias_info("replace_with_mask_token.mask_tokens", mask_tokens, self.get_model().mask_token, "mask_token")
+        mask_tokens = self._clone_mm_insert_if_debug(mask_tokens)
+        self._debug_tensor_finite_stats("replace_with_mask_token.mask_tokens", mask_tokens)
         x_ = torch.cat([x_masked, mask_tokens], dim=0)
         x_ = torch.gather(x_, dim=0, index=ids_restore.unsqueeze(-1).unsqueeze(-1).repeat(1, num_patches, embed_dim))  # unshuffle
+        self._debug_tensor_finite_stats("replace_with_mask_token.output", x_)
+        if self._nan_debug_rank0_enabled() and x_.numel() > 0 and x.shape == x_.shape:
+            changed = bool((x_ - x).abs().max().item() > 0.0)
+            rank0_print(f"[NAN_DEBUG][mask_replace] output_changed={changed}")
+        self._check_tensor_finite_or_raise("replace_with_mask_token.output", x_)
 
         return x_, mask
 
 
+    @_compile_disable
+    def _prepare_inputs_labels_for_multimodal_eager(
+        self,
+        input_ids,
+        position_ids,
+        attention_mask,
+        past_key_values,
+        labels,
+        images,
+        modalities=["image"],
+        image_sizes=None,
+        video_dict=None,
+        use_object_proposals: bool = False,
+        replace_with_mask_token: bool = False,
+    ):
+        return self._prepare_inputs_labels_for_multimodal_impl(
+            input_ids,
+            position_ids,
+            attention_mask,
+            past_key_values,
+            labels,
+            images,
+            modalities=modalities,
+            image_sizes=image_sizes,
+            video_dict=video_dict,
+            use_object_proposals=use_object_proposals,
+            replace_with_mask_token=replace_with_mask_token,
+        )
+
     def prepare_inputs_labels_for_multimodal(
+        self,
+        input_ids,
+        position_ids,
+        attention_mask,
+        past_key_values,
+        labels,
+        images,
+        modalities=["image"],
+        image_sizes=None,
+        video_dict=None,
+        use_object_proposals: bool = False,
+        replace_with_mask_token: bool = False,
+    ):
+        if os.getenv("ROSS3D_DISABLE_PREPARE_MM_COMPILE", "0") == "1":
+            return self._prepare_inputs_labels_for_multimodal_eager(
+                input_ids,
+                position_ids,
+                attention_mask,
+                past_key_values,
+                labels,
+                images,
+                modalities=modalities,
+                image_sizes=image_sizes,
+                video_dict=video_dict,
+                use_object_proposals=use_object_proposals,
+                replace_with_mask_token=replace_with_mask_token,
+            )
+        return self._prepare_inputs_labels_for_multimodal_impl(
+            input_ids,
+            position_ids,
+            attention_mask,
+            past_key_values,
+            labels,
+            images,
+            modalities=modalities,
+            image_sizes=image_sizes,
+            video_dict=video_dict,
+            use_object_proposals=use_object_proposals,
+            replace_with_mask_token=replace_with_mask_token,
+        )
+
+    def _prepare_inputs_labels_for_multimodal_impl(
         self, 
         input_ids, 
         position_ids, 
@@ -698,6 +1268,12 @@ class Ross3DMetaForCausalLM(ABC):
         use_object_proposals: bool = False,
         replace_with_mask_token: bool = False,
     ):
+        mm_branch_fp32 = os.getenv("ROSS3D_MM_BRANCH_FP32_DEBUG", "0") == "1"
+        base_model = self.get_model()
+        if hasattr(base_model, "_sanitize_mask_token_if_nonfinite") and os.getenv("ROSS3D_SANITIZE_MASK_TOKEN_PRE_FORWARD_ONLY", "0") != "1":
+            base_model._sanitize_mask_token_if_nonfinite("prepare_mm.begin")
+        self._debug_tensor_finite_stats("prepare_mm.mask_token.begin", getattr(self.get_model(), "mask_token", None))
+        self._debug_tensor_finite_stats("prepare_mm.image_newline.begin", getattr(self.get_model(), "image_newline", None))
         object_boxes = None
         if use_object_proposals:
             object_boxes = video_dict["objects"][0]
@@ -848,9 +1424,13 @@ class Ross3DMetaForCausalLM(ABC):
             _nan_debug_tensor("concat_images_before_encode", concat_images)
             split_sizes = [image.shape[0] for image in images_list]
             encoded_image_features = self.encode_images(concat_images)  # [num_frames, num_tokens, embed_dim]
+            if mm_branch_fp32:
+                encoded_image_features = encoded_image_features.float()
+            self._trace_tensor_state("prepare_mm.encoded_image_features", encoded_image_features)
             _nan_debug_tensor("encoded_image_features", encoded_image_features)
+            self._retain_and_track_grad("encoded_image_features", encoded_image_features)
 
-            # image_features,all_faster_video_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
+            all_faster_video_features = [None] * len(split_sizes)
 
             # This is a list, each element is [num_images, patch * patch, dim]
             # rank_print(f"Concat images : {concat_images.shape}")
@@ -859,9 +1439,13 @@ class Ross3DMetaForCausalLM(ABC):
             for idx, image_feat in enumerate(encoded_image_features):
                 if idx in video_idx_in_batch:
                     image_features.append(self.get_2dPool(image_feat, self.config.mm_spatial_pool_stride))
+                    if getattr(self.config, "add_faster_video", False) and self.config.mm_spatial_pool_stride > 1:
+                        all_faster_video_features[idx] = self.get_2dPool(image_feat, self.config.mm_spatial_pool_stride // 2)
                 else:
                     image_features.append(image_feat)
                 _nan_debug_tensor(f"image_features_after_split_idx{idx}", image_features[-1])
+                if idx == 0:
+                    self._retain_and_track_grad("image_features_after_split_idx0", image_features[-1])
             assert len(image_features) == 1 # only support batch_size=1
             # image_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
             # rank_print(f"Encoded image feats : {[x.shape for x in image_features]}")
@@ -911,6 +1495,8 @@ class Ross3DMetaForCausalLM(ABC):
                     else:
                         image_feat, mask = self.replace_with_mask_token(image_feat, 0.)
                     _nan_debug_tensor(f"image_feat_after_mask_idx{idx}", image_feat)
+                    if idx == 0:
+                        self._retain_and_track_grad("image_feat_after_mask_idx0", image_feat)
 
                     # coords: num_frames, num_tokens, 3
                     if os.getenv("ROSS3D_DTYPE_DEBUG", "0") == "1":
@@ -934,6 +1520,9 @@ class Ross3DMetaForCausalLM(ABC):
                     else:
                         image_feat = image_feat + self.get_model().world_position_embedding(coords.detach()).to(image_feat.dtype)
                     _nan_debug_tensor(f"image_feat_after_world_pe_idx{idx}", image_feat)
+                    self._trace_tensor_state(f"prepare_mm.image_feat_after_world_pe_idx{idx}", image_feat)
+                    if idx == 0:
+                        self._retain_and_track_grad("image_feat_after_world_pe_idx0", image_feat)
                     new_image_features.append(image_feat)
                     masks.append(mask)
 
@@ -963,6 +1552,9 @@ class Ross3DMetaForCausalLM(ABC):
                                 newline_ids,
                             ) = self.add_token_per_grid(image_feature)
                             _nan_debug_tensor(f"image_feature_after_add_token_per_grid_idx{image_idx}", image_feature)
+                            self._trace_tensor_state(f"prepare_mm.image_feature_after_add_token_per_grid_idx{image_idx}", image_feature)
+                            if image_idx == 0:
+                                self._retain_and_track_grad("image_feature_after_add_token_per_grid_idx0", image_feature)
                             _nan_debug_tensor(f"old_image_feature_after_add_token_per_grid_idx{image_idx}", old_image_feature)
                             if getattr(self.config, "add_faster_video", False):
                                 faster_video_feature = self.add_token_per_grid(all_faster_video_features[image_idx])
@@ -987,7 +1579,7 @@ class Ross3DMetaForCausalLM(ABC):
                         elif mm_newline_position == "one_token":
                             # one-token
                             image_feature = image_feature.flatten(0, 1)
-                            if 'unpad' in mm_patch_merge_type:
+                            if 'unpad' in mm_patch_merge_type and os.getenv("ROSS3D_DISABLE_IMAGE_NEWLINE_INSERT", "0") != "1":
                                 image_feature = torch.cat((
                                     image_feature,
                                     self.model.image_newline[None].to(image_feature.device)
@@ -1038,13 +1630,25 @@ class Ross3DMetaForCausalLM(ABC):
                             if times > 1.1:
                                 image_feature = image_feature[None]
                                 image_feature = nn.functional.interpolate(image_feature, [int(h // times), int(w // times)], mode="bilinear")[0]
-                            image_feature = torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
+                            if os.getenv("ROSS3D_DISABLE_IMAGE_NEWLINE_INSERT", "0") != "1":
+                                newline_token = self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)
+                                self._log_alias_info("prepare_mm.newline_token.anyres", newline_token, self.model.image_newline, "image_newline")
+                                newline_token = self._clone_mm_insert_if_debug(newline_token)
+                                image_feature = torch.cat((image_feature, newline_token), dim=-1)
+                            self._debug_tensor_finite_stats("prepare_mm.image_feature_after_newline_anyres", image_feature)
+                            self._check_tensor_finite_or_raise("prepare_mm.image_feature_after_newline_anyres", image_feature)
                             image_feature = image_feature.flatten(1, 2).transpose(0, 1)
                         elif "unpad" in mm_patch_merge_type:
                             image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
                             image_feature = image_feature.flatten(1, 2).flatten(2, 3)
                             image_feature = unpad_image(image_feature, image_sizes[image_idx])
-                            image_feature = torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
+                            if os.getenv("ROSS3D_DISABLE_IMAGE_NEWLINE_INSERT", "0") != "1":
+                                newline_token = self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)
+                                self._log_alias_info("prepare_mm.newline_token.unpad", newline_token, self.model.image_newline, "image_newline")
+                                newline_token = self._clone_mm_insert_if_debug(newline_token)
+                                image_feature = torch.cat((image_feature, newline_token), dim=-1)
+                            self._debug_tensor_finite_stats("prepare_mm.image_feature_after_newline_unpad", image_feature)
+                            self._check_tensor_finite_or_raise("prepare_mm.image_feature_after_newline_unpad", image_feature)
                             image_feature = image_feature.flatten(1, 2).transpose(0, 1)
                         else:
                             image_feature = image_feature.permute(0, 2, 1, 3, 4).contiguous()
@@ -1057,7 +1661,12 @@ class Ross3DMetaForCausalLM(ABC):
                     else:  # single image operations
                         image_feature = image_feature[0]
                         if "unpad" in mm_patch_merge_type:
-                            image_feature = torch.cat((image_feature, self.model.image_newline[None]), dim=0)
+                            if os.getenv("ROSS3D_DISABLE_IMAGE_NEWLINE_INSERT", "0") != "1":
+                                newline_token = self._clone_mm_insert_if_debug(self.model.image_newline[None])
+                                self._log_alias_info("prepare_mm.newline_token.flat", newline_token, self.model.image_newline, "image_newline")
+                                image_feature = torch.cat((image_feature, newline_token), dim=0)
+                            self._debug_tensor_finite_stats("prepare_mm.image_feature_after_newline_flat", image_feature)
+                            self._check_tensor_finite_or_raise("prepare_mm.image_feature_after_newline_flat", image_feature)
 
                         new_image_features.append(image_feature)
                 image_features = new_image_features
@@ -1065,6 +1674,8 @@ class Ross3DMetaForCausalLM(ABC):
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
             image_features = self.encode_images(images)
+            if mm_branch_fp32:
+                image_features = image_features.float()
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, "tune_mm_mlp_adapter", False) and getattr(self.config, "mm_use_im_start_end", False):
@@ -1099,6 +1710,8 @@ class Ross3DMetaForCausalLM(ABC):
         tokenizer_model_max_length = getattr(self.config, "tokenizer_model_max_length", None)
         # rank_print("Inserting Images embedding")
         for batch_idx, cur_input_ids in enumerate(input_ids):
+            track_first = (batch_idx == 0) and (not bool(getattr(self, "_nan_debug_first_batch_captured", False)))
+            self._nan_debug_track_this_batch = track_first
             num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
             # rank0_print(num_images)
             if num_images == 0:
@@ -1141,8 +1754,17 @@ class Ross3DMetaForCausalLM(ABC):
                         dtype=cur_input_embeds.dtype,
                     )
 
-                    cur_input_embeds[query_coord_tokens] += (
-                        self.get_model().world_position_embedding(box_tensor)[:, 0]
+                    rank0_print(
+                        f"[NAN_DEBUG][query_coord_update] "
+                        f"is_leaf={cur_input_embeds.is_leaf} "
+                        f"requires_grad={cur_input_embeds.requires_grad} "
+                        f"shape={tuple(cur_input_embeds.shape)} "
+                        f"dtype={cur_input_embeds.dtype}"
+                    )
+                    cur_input_embeds = cur_input_embeds.clone()
+                    cur_input_embeds[query_coord_tokens] = (
+                        cur_input_embeds[query_coord_tokens]
+                        + self.get_model().world_position_embedding(box_tensor)[:, 0]
                     )
                 # else: no valid world-position info for this sample → skip instead of crashing
 
@@ -1190,6 +1812,8 @@ class Ross3DMetaForCausalLM(ABC):
                         cur_new_world_coords.append(new_coords)
 
                     cur_image_idx += 1
+                    if mm_branch_fp32:
+                        cur_image_features = cur_image_features.to(cur_input_embeds.dtype)
                     cur_new_input_embeds.append(cur_image_features)
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
 
@@ -1197,21 +1821,68 @@ class Ross3DMetaForCausalLM(ABC):
             cur_new_input_embeds = [x.to(target_device) for x in cur_new_input_embeds]
             for seq_idx, cur_seq in enumerate(cur_new_input_embeds):
                 _nan_debug_tensor(f"cur_new_input_embeds_list_before_cat_idx{seq_idx}", cur_seq, batch_idx=batch_idx)
+                self._trace_tensor_state(f"prepare_mm.cur_new_input_embeds_list_before_cat_idx{seq_idx}", cur_seq)
 
             # import pdb; pdb.set_trace()
+            if os.getenv("ROSS3D_CLONE_MM_INSERTS_DEBUG", "0") == "1":
+                cur_new_input_embeds = [x.clone() for x in cur_new_input_embeds]
+            for seq_idx, cur_seq in enumerate(cur_new_input_embeds):
+                self._check_tensor_finite_or_raise(f"prepare_mm.cur_new_input_embeds_before_cat_idx{seq_idx}", cur_seq)
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
             _nan_debug_tensor("cur_new_input_embeds_after_cat", cur_new_input_embeds, batch_idx=batch_idx)
+            self._debug_tensor_finite_stats("prepare_mm.cur_new_input_embeds_after_cat", cur_new_input_embeds)
+            self._trace_tensor_state("prepare_mm.cur_new_input_embeds_after_cat", cur_new_input_embeds)
+            self._check_tensor_finite_or_raise("prepare_mm.cur_new_input_embeds_after_cat", cur_new_input_embeds)
+            self._retain_and_track_grad(f"packed_embeds_batch{batch_idx}", cur_new_input_embeds)
+            if batch_idx == 0:
+                self._retain_and_track_grad("cur_new_input_embeds_after_cat", cur_new_input_embeds)
 
             boi_ids_tensor = torch.LongTensor(boi_ids)
             eoi_ids_tensor = torch.LongTensor(eoi_ids)
             newline_ids_tensor = torch.LongTensor(newline_ids)
+            records = getattr(self, "_nan_debug_packed_grad_records", None)
+            if records is None:
+                records = []
+                setattr(self, "_nan_debug_packed_grad_records", records)
+            records.append({
+                "packed": cur_new_input_embeds,
+                "newline_ids": list(newline_ids),
+                "boi_ids": list(boi_ids),
+                "eoi_ids": list(eoi_ids),
+            })
 
-            first_match = torch.all(old_image_feature[:, 0] == cur_new_input_embeds[boi_ids_tensor], dim=1)
-            last_match = torch.all(old_image_feature[:, -1] == cur_new_input_embeds[eoi_ids_tensor], dim=1)
-            newline_match = torch.all(
-                self.model.image_newline.unsqueeze(0).repeat(len(newline_ids), 1) == cur_new_input_embeds[newline_ids_tensor],
-                dim=1,
-            )
+            boi_slice_check = cur_new_input_embeds[boi_ids_tensor]
+            eoi_slice_check = cur_new_input_embeds[eoi_ids_tensor]
+            newline_slice_check = cur_new_input_embeds[newline_ids_tensor]
+            fp32_layout_tolerant = os.getenv("ROSS3D_MM_BRANCH_FP32_DEBUG", "0") == "1"
+            if fp32_layout_tolerant:
+                atol = float(os.getenv("ROSS3D_MM_LAYOUT_ATOL", "1e-2"))
+                rtol = float(os.getenv("ROSS3D_MM_LAYOUT_RTOL", "1e-2"))
+                first_match = torch.isclose(
+                    old_image_feature[:, 0].float(),
+                    boi_slice_check.float(),
+                    atol=atol,
+                    rtol=rtol,
+                ).all(dim=1)
+                last_match = torch.isclose(
+                    old_image_feature[:, -1].float(),
+                    eoi_slice_check.float(),
+                    atol=atol,
+                    rtol=rtol,
+                ).all(dim=1)
+                newline_match = torch.isclose(
+                    self.model.image_newline.unsqueeze(0).repeat(len(newline_ids), 1).float(),
+                    newline_slice_check.float(),
+                    atol=atol,
+                    rtol=rtol,
+                ).all(dim=1)
+            else:
+                first_match = torch.all(old_image_feature[:, 0] == boi_slice_check, dim=1)
+                last_match = torch.all(old_image_feature[:, -1] == eoi_slice_check, dim=1)
+                newline_match = torch.all(
+                    self.model.image_newline.unsqueeze(0).repeat(len(newline_ids), 1) == newline_slice_check,
+                    dim=1,
+                )
 
             ok_first = bool(torch.all(first_match).item())
             ok_last = bool(torch.all(last_match).item())
@@ -1219,9 +1890,28 @@ class Ross3DMetaForCausalLM(ABC):
 
             _nan_debug_tensor("old_image_feature_before_assert", old_image_feature, batch_idx=batch_idx)
             _nan_debug_tensor("cur_new_input_embeds_before_assert", cur_new_input_embeds, batch_idx=batch_idx)
-            _nan_debug_tensor("cur_new_input_embeds_boi_before_assert", cur_new_input_embeds[boi_ids_tensor], batch_idx=batch_idx)
-            _nan_debug_tensor("cur_new_input_embeds_eoi_before_assert", cur_new_input_embeds[eoi_ids_tensor], batch_idx=batch_idx)
-            _nan_debug_tensor("cur_new_input_embeds_newline_before_assert", cur_new_input_embeds[newline_ids_tensor], batch_idx=batch_idx)
+            boi_slice = boi_slice_check
+            eoi_slice = eoi_slice_check
+            newline_slice = newline_slice_check if len(newline_ids) > 0 else None
+            _nan_debug_tensor("cur_new_input_embeds_boi_before_assert", boi_slice, batch_idx=batch_idx)
+            self._trace_tensor_state("prepare_mm.boi_slice", boi_slice)
+            _nan_debug_tensor("cur_new_input_embeds_eoi_before_assert", eoi_slice, batch_idx=batch_idx)
+            self._trace_tensor_state("prepare_mm.eoi_slice", eoi_slice)
+            _nan_debug_tensor("cur_new_input_embeds_newline_before_assert", newline_slice, batch_idx=batch_idx)
+            self._trace_tensor_state("prepare_mm.newline_slice", newline_slice)
+            if batch_idx == 0:
+                self._retain_and_track_grad("boi_slice", boi_slice)
+                self._retain_and_track_grad("eoi_slice", eoi_slice)
+                self._retain_and_track_grad("newline_slice", newline_slice)
+                self._nan_debug_layout_snapshot = {
+                    "old_image_feature": old_image_feature,
+                    "cur_new_input_embeds": cur_new_input_embeds,
+                    "boi_ids": boi_ids_tensor,
+                    "eoi_ids": eoi_ids_tensor,
+                    "newline_ids": newline_ids_tensor if len(newline_ids) > 0 else None,
+                    "image_newline": getattr(self.model, "image_newline", None),
+                }
+                self._nan_debug_first_batch_captured = True
             _nan_debug_tensor("model_image_newline_before_assert", self.model.image_newline, batch_idx=batch_idx)
 
             if (not ok_first or not ok_last or not ok_newline) and os.getenv("ROSS3D_PACK_DEBUG", "0") == "1":
@@ -1332,7 +2022,11 @@ class Ross3DMetaForCausalLM(ABC):
                             f"actual_finite_ratio={float(torch.isfinite(n_actual).float().mean().item()):.6f}"
                         )
 
-            assert ok_first and ok_last and ok_newline
+            if not (ok_first and ok_last and ok_newline):
+                raise RuntimeError(
+                    f"Bad multimodal layout: ok_first={ok_first}, "
+                    f"ok_last={ok_last}, ok_newline={ok_newline}"
+                )
 
             cur_new_labels = torch.cat(cur_new_labels)
 
@@ -1413,6 +2107,12 @@ class Ross3DMetaForCausalLM(ABC):
 
         # import pdb; pdb.set_trace()
         # rank0_print("Finish preparing")
+        self._debug_tensor_finite_stats("prepare_mm.mask_token.end", getattr(self.get_model(), "mask_token", None))
+        self._debug_tensor_finite_stats("prepare_mm.image_newline.end", getattr(self.get_model(), "image_newline", None))
+        self._debug_tensor_finite_stats("prepare_mm.new_input_embeds.end", new_input_embeds)
+        self._check_tensor_finite_or_raise("prepare_mm.mask_token.end", getattr(self.get_model(), "mask_token", None))
+        self._check_tensor_finite_or_raise("prepare_mm.image_newline.end", getattr(self.get_model(), "image_newline", None))
+        self._check_tensor_finite_or_raise("prepare_mm.new_input_embeds.end", new_input_embeds)
         try:
             return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, object_features, object_boxes, boi_ids, eoi_ids, newline_ids, masks[0]
         except:

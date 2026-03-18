@@ -16,6 +16,7 @@
 from typing import List, Optional, Tuple, Union, Dict
 import os
 import torch
+import torch._dynamo
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
@@ -523,6 +524,7 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
                 cycle_loss = self.compute_cycle_consistency_loss(**cycle_kwargs)
             loss = loss + getattr(self.config, "cycle_consist_weight", 1.0) * cycle_loss
 
+
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
@@ -602,6 +604,82 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
         return inputs
 
     
+    @torch._dynamo.disable
+    def _run_lm_eager(self, **kwargs):
+        return self.model(**kwargs)
+
+    def _should_log_rank0(self) -> bool:
+        if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return False
+        return True
+
+    def _get_lm_attn_impl(self) -> Optional[str]:
+        for cfg in [getattr(self, "config", None), getattr(self.model, "config", None)]:
+            if cfg is None:
+                continue
+            impl = getattr(cfg, "_attn_implementation", None)
+            if impl is not None:
+                return impl
+        return None
+
+    def _set_lm_attn_impl(self, impl: str) -> None:
+        for cfg in [getattr(self, "config", None), getattr(self.model, "config", None)]:
+            if cfg is None:
+                continue
+            setattr(cfg, "_attn_implementation", impl)
+
+    def _lm_boundary_grad_debug_enabled(self) -> bool:
+        return os.getenv("ROSS3D_LM_BOUNDARY_GRAD_DEBUG", "0") == "1"
+
+    def _log_tensor_grad_stats(self, tag: str, tensor: Optional[torch.Tensor]) -> None:
+        if not self._lm_boundary_grad_debug_enabled():
+            return
+        if not self._should_log_rank0():
+            return
+        if tensor is None or (not torch.is_tensor(tensor)):
+            rank_print(f"[NAN_DEBUG][lm_boundary] tag={tag} grad_state=none")
+            return
+        grad = tensor.grad
+        if grad is None:
+            rank_print(f"[NAN_DEBUG][lm_boundary] tag={tag} grad_state=none")
+            return
+        g = grad.detach()
+        finite = torch.isfinite(g)
+        finite_any = bool(finite.any().item())
+        finite_all = bool(finite.all().item())
+        nan_count = int(torch.isnan(g).sum().item())
+        inf_count = int(torch.isinf(g).sum().item())
+        if finite_any:
+            vals = g[finite]
+            gmin = float(vals.min().item())
+            gmax = float(vals.max().item())
+        else:
+            gmin, gmax = None, None
+        rank_print(
+            f"[NAN_DEBUG][lm_boundary] tag={tag} grad_finite_all={finite_all} "
+            f"nan_count={nan_count} inf_count={inf_count} min={gmin} max={gmax} "
+            f"dtype={g.dtype} shape={tuple(g.shape)}"
+        )
+
+    def _retain_lm_boundary_grad(self, name: str, tensor: Optional[torch.Tensor]) -> None:
+        if not self._lm_boundary_grad_debug_enabled():
+            return
+        if tensor is None or (not torch.is_tensor(tensor)) or (not tensor.requires_grad):
+            return
+        tensor.retain_grad()
+        store = getattr(self, "_nan_debug_lm_boundary_tensors", None)
+        if store is None:
+            store = {}
+            setattr(self, "_nan_debug_lm_boundary_tensors", store)
+        store[name] = tensor
+
+    def _log_lm_boundary_grad_summary(self, boundary_tag: str) -> None:
+        if not self._lm_boundary_grad_debug_enabled():
+            return
+        store = getattr(self, "_nan_debug_lm_boundary_tensors", {})
+        for key in ["lm_inputs_embeds", "lm_hidden_states", "ground_hidden", "lm_scores"]:
+            self._log_tensor_grad_stats(f"{boundary_tag}/{key}", store.get(key, None))
+
     def predict_box(
         self,
         input_ids: torch.LongTensor = None,
@@ -650,7 +728,19 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
                 f"inputs_embeds={getattr(inputs_embeds, 'dtype', None)} "
                 f"embed_tokens_weight={self.model.embed_tokens.weight.dtype}"
             )
-        outputs = self.model(
+        disable_lm_compile = os.getenv("ROSS3D_DISABLE_LM_COMPILE", "0") == "1"
+        disable_flash_attn = os.getenv("ROSS3D_DISABLE_FLASH_ATTN", "0") == "1"
+        prev_attn_impl = self._get_lm_attn_impl()
+        if disable_flash_attn:
+            self._set_lm_attn_impl("sdpa")
+        if self._should_log_rank0():
+            rank_print(
+                "[NAN_DEBUG][predict_box][lm_call] "
+                f"compile_mode={'eager' if disable_lm_compile else 'compiled'} "
+                f"attn_impl={self._get_lm_attn_impl()} disable_flash_attn={disable_flash_attn}"
+            )
+
+        lm_kwargs = dict(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -661,8 +751,18 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+        self._retain_lm_boundary_grad("lm_inputs_embeds", inputs_embeds)
+        try:
+            if disable_lm_compile:
+                outputs = self._run_lm_eager(**lm_kwargs)
+            else:
+                outputs = self.model(**lm_kwargs)
+        finally:
+            if disable_flash_attn and (prev_attn_impl is not None):
+                self._set_lm_attn_impl(prev_attn_impl)
 
         hidden_states = outputs[0]
+        self._retain_lm_boundary_grad("lm_hidden_states", hidden_states)
         if self._dtype_debug_should_log():
             rank_print(
                 "[DTYPE_DEBUG][predict_box][after self.model] "
@@ -672,6 +772,7 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
         ground_locations = (labels >= self.config.ground_token_ids[0]) & (labels <= self.config.ground_token_ids[-1])
         ground_hidden = hidden_states[ground_locations].squeeze(1)
         self._nan_debug_tensor_stats("ground_hidden", ground_hidden)
+        self._retain_lm_boundary_grad("ground_hidden", ground_hidden)
 
         hook_state = {"fired": False}
 
@@ -703,6 +804,7 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             ground_hidden = self.ground_head(ground_hidden).squeeze(0) 
             scores = (ground_hidden * object_features).sum(dim=-1)
             self._nan_debug_tensor_stats("scores_mlp", scores)
+            self._retain_lm_boundary_grad("lm_scores", scores)
             _register_nonfinite_grad_hook("scores_mlp", scores)
         elif self.ground_head_type == 'score':
             obj_feat = self.ground_head_obj(object_features.to(ground_hidden.dtype)) # B, C
@@ -716,6 +818,7 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             scores = self.ground_head_score(mul_feat) # B, 1
             scores = scores.squeeze(1)
             self._nan_debug_tensor_stats("scores_score", scores)
+            self._retain_lm_boundary_grad("lm_scores", scores)
             _register_nonfinite_grad_hook("scores_score", scores)
 
         elif self.ground_head_type == "infonce":
@@ -734,6 +837,7 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             query_feat = F.normalize(query_feat)
             scores = (obj_feat * query_feat).sum(dim=-1)
             self._nan_debug_tensor_stats("scores_infonce", scores)
+            self._retain_lm_boundary_grad("lm_scores", scores)
             _register_nonfinite_grad_hook("scores_infonce", scores)
 
         loss = hidden_states.new_zeros(())
