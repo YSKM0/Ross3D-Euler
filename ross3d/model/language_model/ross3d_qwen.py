@@ -55,6 +55,8 @@ class Ross3DQwenConfig(Qwen2Config):
         self.cycle_detach_hidden_states = kwargs.get("cycle_detach_hidden_states", True)
         self.use_3d_coordinate = kwargs.get("use_3d_coordinate", True)
         self.occupancy_projector_dim = kwargs.get("occupancy_projector_dim", None)
+        self.occ_debug_memory = kwargs.get("occ_debug_memory", False)
+        self.occ_detach_hidden_states = kwargs.get("occ_detach_hidden_states", False)
         self.enable_occ_geom_loss = kwargs.get("enable_occ_geom_loss", False)
         self.occ_geom_loss_weight = kwargs.get("occ_geom_loss_weight", 0.0)
         self.occ_geom_mask_weight = kwargs.get("occ_geom_mask_weight", 1.0)
@@ -458,12 +460,18 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
         occ_temp_enabled = bool(getattr(self.config, "enable_occ_temp_loss", False))
         occ_aux_enabled = occ_geom_enabled or occ_temp_enabled
         if self.training and occ_aux_enabled and (video_dict is not None):
+            occ_hidden_states = hidden_states
+            if getattr(self.config, "occ_detach_hidden_states", False):
+                occ_hidden_states = hidden_states.detach()
             occupancy_aux_outputs = self.extract_occupancy_object_embeddings(
-                hidden_states=hidden_states,
+                hidden_states=occ_hidden_states,
                 boi_ids=boi_ids,
                 eoi_ids=eoi_ids,
                 newline_ids=newline_ids,
                 video_dict=video_dict,
+                need_patch_embeddings=occ_geom_enabled,
+                need_geom_metadata=occ_geom_enabled,
+                need_temp_metadata=occ_temp_enabled,
             )
 
         occ_geom_loss = None
@@ -539,7 +547,6 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             vm_loss=vm_loss,
             bev_loss=bev_loss,
             cycle_loss=cycle_loss, # Hanwliu
-            occupancy_aux_outputs=occupancy_aux_outputs,
             occ_geom_loss=occ_geom_loss,
             occ_temp_loss=occ_temp_loss,
         )

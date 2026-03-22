@@ -1363,6 +1363,22 @@ class Ross3DMetaForCausalLM(ABC):
             modalities = [modalities]
 
         nan_dbg_enabled = os.getenv("ROSS3D_NAN_DEBUG", "0") == "1"
+        # Keep per-step debug tensor state from leaking across training steps.
+        if nan_dbg_enabled:
+            setattr(self, "_nan_debug_packed_grad_records", [])
+            setattr(self, "_nan_debug_layout_snapshot", None)
+            setattr(self, "_nan_debug_retained_tensors", {})
+            setattr(self, "_nan_debug_retained_order", [])
+        else:
+            if hasattr(self, "_nan_debug_packed_grad_records"):
+                setattr(self, "_nan_debug_packed_grad_records", [])
+            if hasattr(self, "_nan_debug_layout_snapshot"):
+                setattr(self, "_nan_debug_layout_snapshot", None)
+            if hasattr(self, "_nan_debug_retained_tensors"):
+                setattr(self, "_nan_debug_retained_tensors", {})
+            if hasattr(self, "_nan_debug_retained_order"):
+                setattr(self, "_nan_debug_retained_order", [])
+
         def _nan_debug_should_log() -> bool:
             if not nan_dbg_enabled:
                 return False
@@ -1840,16 +1856,17 @@ class Ross3DMetaForCausalLM(ABC):
             boi_ids_tensor = torch.LongTensor(boi_ids)
             eoi_ids_tensor = torch.LongTensor(eoi_ids)
             newline_ids_tensor = torch.LongTensor(newline_ids)
-            records = getattr(self, "_nan_debug_packed_grad_records", None)
-            if records is None:
-                records = []
-                setattr(self, "_nan_debug_packed_grad_records", records)
-            records.append({
-                "packed": cur_new_input_embeds,
-                "newline_ids": list(newline_ids),
-                "boi_ids": list(boi_ids),
-                "eoi_ids": list(eoi_ids),
-            })
+            if nan_dbg_enabled:
+                records = getattr(self, "_nan_debug_packed_grad_records", None)
+                if records is None:
+                    records = []
+                    setattr(self, "_nan_debug_packed_grad_records", records)
+                records.append({
+                    "packed": cur_new_input_embeds,
+                    "newline_ids": list(newline_ids),
+                    "boi_ids": list(boi_ids),
+                    "eoi_ids": list(eoi_ids),
+                })
 
             boi_slice_check = cur_new_input_embeds[boi_ids_tensor]
             eoi_slice_check = cur_new_input_embeds[eoi_ids_tensor]
@@ -1903,14 +1920,15 @@ class Ross3DMetaForCausalLM(ABC):
                 self._retain_and_track_grad("boi_slice", boi_slice)
                 self._retain_and_track_grad("eoi_slice", eoi_slice)
                 self._retain_and_track_grad("newline_slice", newline_slice)
-                self._nan_debug_layout_snapshot = {
-                    "old_image_feature": old_image_feature,
-                    "cur_new_input_embeds": cur_new_input_embeds,
-                    "boi_ids": boi_ids_tensor,
-                    "eoi_ids": eoi_ids_tensor,
-                    "newline_ids": newline_ids_tensor if len(newline_ids) > 0 else None,
-                    "image_newline": getattr(self.model, "image_newline", None),
-                }
+                if nan_dbg_enabled:
+                    self._nan_debug_layout_snapshot = {
+                        "old_image_feature": old_image_feature,
+                        "cur_new_input_embeds": cur_new_input_embeds,
+                        "boi_ids": boi_ids_tensor,
+                        "eoi_ids": eoi_ids_tensor,
+                        "newline_ids": newline_ids_tensor if len(newline_ids) > 0 else None,
+                        "image_newline": getattr(self.model, "image_newline", None),
+                    }
                 self._nan_debug_first_batch_captured = True
             _nan_debug_tensor("model_image_newline_before_assert", self.model.image_newline, batch_idx=batch_idx)
 
@@ -2201,6 +2219,9 @@ class Ross3DMetaForCausalLM(ABC):
         newline_ids: torch.Tensor,
         video_dict: Optional[Dict[str, torch.Tensor]] = None,
         eps: float = 1e-6,
+        need_patch_embeddings: bool = True,
+        need_geom_metadata: bool = True,
+        need_temp_metadata: bool = True,
     ) -> Optional[Dict[str, Union[torch.Tensor, List[int], List[str], str]]]:
         if not hasattr(self.model, "occupancy_patch_projector") or not hasattr(self.model, "occupancy_object_norm"):
             return None
@@ -2212,6 +2233,7 @@ class Ross3DMetaForCausalLM(ABC):
 
         patch_feats = self._extract_frame_patch_hidden_states(hidden_states, boi_ids, eoi_ids, newline_ids)
         projected_patch_feats = self.model.occupancy_patch_projector(patch_feats)
+        self._log_occ_cuda_memory("aux_after_patch_projector")
 
         frame_ids = video_dict.get("frame_ids", [str(i) for i in range(projected_patch_feats.shape[0])])
         scene_id = video_dict.get("scene_id", None)
@@ -2273,17 +2295,20 @@ class Ross3DMetaForCausalLM(ABC):
         present = torch.zeros((T, O), device=device, dtype=torch.bool)
 
         if O == 0:
-            return {
-                "patch_embeddings": projected_patch_feats,
-                "obj_ids_union": torch.zeros((0,), device=device, dtype=torch.long),
-                "obj_labels_union": [],
-                "obj_cat_ids_union": torch.zeros((0,), device=device, dtype=torch.long),
+            outputs = {
                 "object_embeddings": z_raw,
-                "object_occupancy_sums": den,
                 "present": present,
-                "frame_ids": frame_ids,
-                "scene_id": scene_id,
             }
+            if need_patch_embeddings:
+                outputs["patch_embeddings"] = projected_patch_feats
+            if need_geom_metadata:
+                outputs["obj_ids_union"] = torch.zeros((0,), device=device, dtype=torch.long)
+                outputs["obj_labels_union"] = []
+                outputs["frame_ids"] = frame_ids
+                outputs["scene_id"] = scene_id
+            if need_temp_metadata:
+                outputs["obj_cat_ids_union"] = torch.zeros((0,), device=device, dtype=torch.long)
+            return outputs
 
         id_to_union_col = {oid: u for u, oid in enumerate(obj_ids_union)}
 
@@ -2331,6 +2356,8 @@ class Ross3DMetaForCausalLM(ABC):
             den[fidx, union_cols] = occ_sum_valid
             present[fidx, union_cols] = True
 
+        self._log_occ_cuda_memory(f"aux_after_object_embeddings T={T} P={P} O={O} Dp={Dp}")
+
         obj_labels_union = []
         for oid in obj_ids_union:
             label = obj_id_to_label.get(oid, f"__unknown_obj_{oid}")
@@ -2342,17 +2369,38 @@ class Ross3DMetaForCausalLM(ABC):
                 label_to_cat_id[label] = len(label_to_cat_id)
             obj_cat_ids.append(label_to_cat_id[label])
 
-        return {
-            "patch_embeddings": projected_patch_feats,
-            "obj_ids_union": torch.tensor(obj_ids_union, device=device, dtype=torch.long),
-            "obj_labels_union": obj_labels_union,
-            "obj_cat_ids_union": torch.tensor(obj_cat_ids, device=device, dtype=torch.long),
+        outputs = {
             "object_embeddings": z_raw,
-            "object_occupancy_sums": den,
             "present": present,
-            "frame_ids": frame_ids,
-            "scene_id": scene_id,
         }
+        if need_patch_embeddings:
+            outputs["patch_embeddings"] = projected_patch_feats
+        if need_geom_metadata:
+            outputs["obj_ids_union"] = torch.tensor(obj_ids_union, device=device, dtype=torch.long)
+            outputs["obj_labels_union"] = obj_labels_union
+            outputs["frame_ids"] = frame_ids
+            outputs["scene_id"] = scene_id
+        if need_temp_metadata:
+            outputs["obj_cat_ids_union"] = torch.tensor(obj_cat_ids, device=device, dtype=torch.long)
+        return outputs
+
+    @torch._dynamo.disable
+    def _log_occ_cuda_memory(self, tag: str) -> None:
+        if not getattr(self.config, "verbose_logging", False):
+            return
+        if not getattr(self.config, "occ_debug_memory", False):
+            return
+        if not torch.cuda.is_available():
+            return
+        allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+        reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+        max_alloc = torch.cuda.max_memory_allocated() / (1024 ** 3)
+        rank0_print(
+            "[occupancy][cuda_mem] "
+            f"{tag}: allocated={allocated:.2f}GB, "
+            f"reserved={reserved:.2f}GB, "
+            f"max_allocated={max_alloc:.2f}GB"
+        )
 
     def _build_patch_centers_normalized(self, occ_anno: Dict[str, Any], device, dtype) -> torch.Tensor:
         preprocess = occ_anno.get("vision_tower_preprocess", {})
@@ -2557,11 +2605,13 @@ class Ross3DMetaForCausalLM(ABC):
         union_id_to_col = {oid: i for i, oid in enumerate(union_list)}
 
         eps = float(getattr(self.config, "occ_geom_eps", 1e-6))
+        chunk_size = max(1, int(getattr(self.config, "occ_geom_chunk_size", 8)))
         mask_loss_sum = torch.zeros((), device=device, dtype=dtype)
         box_loss_sum = torch.zeros((), device=device, dtype=dtype)
         ctr_loss_sum = torch.zeros((), device=device, dtype=dtype)
         vis_loss_sum = torch.zeros((), device=device, dtype=dtype)
         mask_count = box_count = ctr_count = vis_count = 0
+        self._log_occ_cuda_memory(f"geom_start T={T} P={P} O={int(E.shape[1])} Dp={Dp}")
 
         for f in range(T):
             occ_anno = patch_occupancy[f]
@@ -2585,11 +2635,11 @@ class Ross3DMetaForCausalLM(ABC):
             if int(resize[0]) <= 0 or int(resize[1]) <= 0:
                 continue
 
-            patch_centers = self._build_patch_centers_normalized(occ_anno, device=device, dtype=dtype)
-            occ_target = self._build_frame_object_occupancy_targets(occ_anno, obj_ids_union, device=device, dtype=dtype)
+            with torch.no_grad():
+                patch_centers = self._build_patch_centers_normalized(occ_anno, device=device, dtype=dtype)
+                occ_target = self._build_frame_object_occupancy_targets(occ_anno, obj_ids_union, device=device, dtype=dtype)
 
             union_cols = []
-            vis_objs = []
             tgt_boxes = []
             tgt_centers = []
             tgt_center_visible = []
@@ -2609,7 +2659,6 @@ class Ross3DMetaForCausalLM(ABC):
                     continue
 
                 union_cols.append(ucol)
-                vis_objs.append(vis_obj)
                 tgt_boxes.append(bbox_norm)
                 tgt_centers.append(center_norm)
                 tgt_center_visible.append(center_visible)
@@ -2619,82 +2668,101 @@ class Ross3DMetaForCausalLM(ABC):
 
             union_cols_t = torch.tensor(union_cols, device=device, dtype=torch.long)
             x_f = X[f]
-            e_f = E[f, union_cols_t, :]
-            Ov = e_f.shape[0]
-
             x_feat = self.model.occ_geom_patch_norm(x_f)
-            e_query = self.model.occ_geom_obj_query(e_f)
+            with torch.no_grad():
+                target_boxes_t = torch.tensor(tgt_boxes, device=device, dtype=dtype)
+                target_vis_t = torch.tensor(
+                    [1.0 if flag else 0.0 for flag in tgt_center_visible],
+                    device=device,
+                    dtype=dtype,
+                )
 
-            x_expand = x_feat.unsqueeze(0).expand(Ov, -1, -1)
-            e_expand = e_query.unsqueeze(1).expand(-1, P, -1)
-            rel_input = torch.cat([e_expand, x_expand, e_expand * x_expand], dim=-1)
-            h = self.model.occ_geom_relation(rel_input)
+            Ov = union_cols_t.shape[0]
+            self._log_occ_cuda_memory(f"geom_frame_start f={f} Ov={Ov}")
+            for start in range(0, Ov, chunk_size):
+                end = min(start + chunk_size, Ov)
+                chunk_cols_t = union_cols_t[start:end]
+                e_chunk = E[f, chunk_cols_t, :]
+                e_query = self.model.occ_geom_obj_query(e_chunk)
 
-            mask_logits = self.model.occ_geom_mask_head(h).squeeze(-1)
-            mask_prob = torch.sigmoid(mask_logits)
-            alpha = mask_prob / (mask_prob.sum(dim=1, keepdim=True) + eps)
-            g = torch.sum(alpha.unsqueeze(-1) * h, dim=1)
+                x_expand = x_feat.unsqueeze(0).expand(end - start, -1, -1)
+                e_expand = e_query.unsqueeze(1).expand(-1, P, -1)
+                rel_input = torch.cat([e_expand, x_expand, e_expand * x_expand], dim=-1)
+                h = self.model.occ_geom_relation(rel_input)
+                if start == 0:
+                    self._log_occ_cuda_memory(f"geom_after_first_chunk_relation f={f} Oc={end - start} Ov={Ov}")
 
-            soft_center = torch.sum(alpha.unsqueeze(-1) * patch_centers.unsqueeze(0), dim=1)
-            pred_cx = soft_center[:, 0]
-            pred_cy = soft_center[:, 1]
+                mask_logits = self.model.occ_geom_mask_head(h).squeeze(-1)
+                mask_prob = torch.sigmoid(mask_logits)
+                alpha = mask_prob / (mask_prob.sum(dim=1, keepdim=True) + eps)
+                g = torch.sum(alpha.unsqueeze(-1) * h, dim=1)
 
-            pred_size = torch.sigmoid(self.model.occ_geom_size_head(g))
-            pred_w = pred_size[:, 0]
-            pred_h = pred_size[:, 1]
+                soft_center = torch.sum(alpha.unsqueeze(-1) * patch_centers.unsqueeze(0), dim=1)
+                pred_cx = soft_center[:, 0]
+                pred_cy = soft_center[:, 1]
 
-            pred_box = torch.stack([
-                pred_cx - 0.5 * pred_w,
-                pred_cy - 0.5 * pred_h,
-                pred_cx + 0.5 * pred_w,
-                pred_cy + 0.5 * pred_h,
-            ], dim=-1).clamp(0.0, 1.0)
+                pred_size = torch.sigmoid(self.model.occ_geom_size_head(g))
+                pred_w = pred_size[:, 0]
+                pred_h = pred_size[:, 1]
 
-            pred_vis_logit = self.model.occ_geom_vis_head(g).squeeze(-1)
-            center_logprob = F.log_softmax(self.model.occ_geom_center_head(h).squeeze(-1), dim=1)
+                pred_box = torch.stack([
+                    pred_cx - 0.5 * pred_w,
+                    pred_cy - 0.5 * pred_h,
+                    pred_cx + 0.5 * pred_w,
+                    pred_cy + 0.5 * pred_h,
+                ], dim=-1).clamp(0.0, 1.0)
 
-            for k in range(Ov):
-                ucol = union_cols[k]
-                target_mask = occ_target[:, ucol]
-                loss_mask_bce = F.binary_cross_entropy_with_logits(mask_logits[k], target_mask, reduction="mean")
-                pred_mask = torch.sigmoid(mask_logits[k])
-                dice_num = 2.0 * (pred_mask * target_mask).sum()
-                dice_den = pred_mask.sum() + target_mask.sum() + eps
-                loss_mask_dice = 1.0 - (dice_num / dice_den)
-                loss_mask_obj = loss_mask_bce + float(getattr(self.config, "occ_geom_mask_dice_weight", 0.5)) * loss_mask_dice
-                mask_loss_sum = mask_loss_sum + loss_mask_obj
-                mask_count += 1
+                pred_vis_logit = self.model.occ_geom_vis_head(g).squeeze(-1)
+                center_logprob = F.log_softmax(self.model.occ_geom_center_head(h).squeeze(-1), dim=1)
 
-                target_box = torch.tensor(tgt_boxes[k], device=device, dtype=pred_box.dtype)
-                loss_box_l1 = F.smooth_l1_loss(pred_box[k], target_box, reduction="mean")
-                loss_box_giou = 1.0 - self._generalized_iou_xyxy(
-                    pred_box[k].unsqueeze(0),
-                    target_box.unsqueeze(0),
-                    eps=eps,
-                ).mean()
-                loss_box_obj = loss_box_l1 + float(getattr(self.config, "occ_geom_box_giou_weight", 1.0)) * loss_box_giou
-                box_loss_sum = box_loss_sum + loss_box_obj
-                box_count += 1
+                for local_k, global_k in enumerate(range(start, end)):
+                    ucol = union_cols[global_k]
+                    target_mask = occ_target[:, ucol]
+                    loss_mask_bce = F.binary_cross_entropy_with_logits(mask_logits[local_k], target_mask, reduction="mean")
+                    pred_mask = torch.sigmoid(mask_logits[local_k])
+                    dice_num = 2.0 * (pred_mask * target_mask).sum()
+                    dice_den = pred_mask.sum() + target_mask.sum() + eps
+                    loss_mask_dice = 1.0 - (dice_num / dice_den)
+                    loss_mask_obj = loss_mask_bce + float(getattr(self.config, "occ_geom_mask_dice_weight", 0.5)) * loss_mask_dice
+                    mask_loss_sum = mask_loss_sum + loss_mask_obj
+                    mask_count += 1
 
-                target_vis = torch.tensor(1.0 if tgt_center_visible[k] else 0.0, device=device, dtype=pred_vis_logit.dtype)
-                loss_vis_obj = F.binary_cross_entropy_with_logits(pred_vis_logit[k], target_vis, reduction="mean")
-                vis_loss_sum = vis_loss_sum + loss_vis_obj
-                vis_count += 1
+                    target_box = target_boxes_t[global_k].to(dtype=pred_box.dtype)
+                    loss_box_l1 = F.smooth_l1_loss(pred_box[local_k], target_box, reduction="mean")
+                    loss_box_giou = 1.0 - self._generalized_iou_xyxy(
+                        pred_box[local_k].unsqueeze(0),
+                        target_box.unsqueeze(0),
+                        eps=eps,
+                    ).mean()
+                    loss_box_obj = loss_box_l1 + float(getattr(self.config, "occ_geom_box_giou_weight", 1.0)) * loss_box_giou
+                    box_loss_sum = box_loss_sum + loss_box_obj
+                    box_count += 1
 
-                if tgt_center_visible[k] and (tgt_centers[k] is not None):
-                    cxn, cyn = float(tgt_centers[k][0]), float(tgt_centers[k][1])
-                    dx = patch_centers[:, 0] - cxn
-                    dy = patch_centers[:, 1] - cyn
-                    bbox_norm = tgt_boxes[k]
-                    bw = max(float(bbox_norm[2] - bbox_norm[0]), 1e-6)
-                    bh = max(float(bbox_norm[3] - bbox_norm[1]), 1e-6)
-                    sigma_x = max(1.0 / float(W), float(getattr(self.config, "occ_geom_center_alpha", 0.1)) * bw)
-                    sigma_y = max(1.0 / float(H), float(getattr(self.config, "occ_geom_center_alpha", 0.1)) * bh)
-                    target_ctr = torch.exp(-0.5 * (dx * dx / (sigma_x * sigma_x) + dy * dy / (sigma_y * sigma_y)))
-                    target_ctr = target_ctr / (target_ctr.sum() + eps)
-                    loss_ctr_obj = F.kl_div(center_logprob[k].unsqueeze(0), target_ctr.unsqueeze(0), reduction="batchmean", log_target=False)
-                    ctr_loss_sum = ctr_loss_sum + loss_ctr_obj
-                    ctr_count += 1
+                    target_vis = target_vis_t[global_k].to(dtype=pred_vis_logit.dtype)
+                    loss_vis_obj = F.binary_cross_entropy_with_logits(pred_vis_logit[local_k], target_vis, reduction="mean")
+                    vis_loss_sum = vis_loss_sum + loss_vis_obj
+                    vis_count += 1
+
+                    if tgt_center_visible[global_k] and (tgt_centers[global_k] is not None):
+                        with torch.no_grad():
+                            cxn, cyn = float(tgt_centers[global_k][0]), float(tgt_centers[global_k][1])
+                            dx = patch_centers[:, 0] - cxn
+                            dy = patch_centers[:, 1] - cyn
+                            bbox_norm = tgt_boxes[global_k]
+                            bw = max(float(bbox_norm[2] - bbox_norm[0]), 1e-6)
+                            bh = max(float(bbox_norm[3] - bbox_norm[1]), 1e-6)
+                            sigma_x = max(1.0 / float(W), float(getattr(self.config, "occ_geom_center_alpha", 0.1)) * bw)
+                            sigma_y = max(1.0 / float(H), float(getattr(self.config, "occ_geom_center_alpha", 0.1)) * bh)
+                            target_ctr = torch.exp(-0.5 * (dx * dx / (sigma_x * sigma_x) + dy * dy / (sigma_y * sigma_y)))
+                            target_ctr = target_ctr / (target_ctr.sum() + eps)
+                        loss_ctr_obj = F.kl_div(
+                            center_logprob[local_k].unsqueeze(0),
+                            target_ctr.unsqueeze(0),
+                            reduction="batchmean",
+                            log_target=False,
+                        )
+                        ctr_loss_sum = ctr_loss_sum + loss_ctr_obj
+                        ctr_count += 1
 
         if mask_count == 0 and box_count == 0 and ctr_count == 0 and vis_count == 0:
             return torch.zeros((), device=device, dtype=dtype)
@@ -2710,6 +2778,7 @@ class Ross3DMetaForCausalLM(ABC):
             + float(getattr(self.config, "occ_geom_ctr_weight", 1.0)) * loss_ctr
             + float(getattr(self.config, "occ_geom_vis_weight", 1.0)) * loss_vis
         )
+        self._log_occ_cuda_memory("geom_end")
         return geom_loss.float()
 
     def compute_occupancy_temporal_loss(
@@ -2752,6 +2821,7 @@ class Ross3DMetaForCausalLM(ABC):
 
         U = self.model.occ_temp_projector(Z)
         U = F.normalize(U, dim=-1)
+        self._log_occ_cuda_memory(f"temp_after_projector T={T} O={O}")
 
         counts = present.long().sum(dim=0)
         if counts.shape[0] != O:
@@ -2766,6 +2836,7 @@ class Ross3DMetaForCausalLM(ABC):
         sum_u = (U * present_f).sum(dim=0)
         proto_all = sum_u / counts.clamp(min=1).to(U.dtype).unsqueeze(-1)
         proto_all = F.normalize(proto_all, dim=-1)
+        self._log_occ_cuda_memory("temp_after_proto")
 
         loss_sum = torch.zeros((), device=device, dtype=dtype)
         anchor_count = 0
@@ -2819,6 +2890,7 @@ class Ross3DMetaForCausalLM(ABC):
 
         if anchor_count == 0:
             return torch.zeros((), device=device, dtype=dtype)
+        self._log_occ_cuda_memory(f"temp_end anchor_count={anchor_count}")
         return (loss_sum / float(anchor_count)).float()
 
     def compute_vm_loss(

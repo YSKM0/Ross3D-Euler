@@ -217,6 +217,14 @@ class ModelArguments:
         default=None,
         metadata={"help": "Projection dim for occupancy auxiliary patch projector (defaults to hidden_size)."},
     )
+    occ_debug_memory: bool = field(
+        default=False,
+        metadata={"help": "Log CUDA memory stats at key points in occupancy auxiliary losses."},
+    )
+    occ_detach_hidden_states: bool = field(
+        default=False,
+        metadata={"help": "Detach LLM hidden states before occupancy auxiliary losses."},
+    )
 
     enable_occ_geom_loss: bool = field(
         default=False,
@@ -1638,6 +1646,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args, load_so
     overwrite_config["enable_occ_geom_loss"] = model_args.enable_occ_geom_loss
     overwrite_config["enable_occ_temp_loss"] = model_args.enable_occ_temp_loss
     overwrite_config["occupancy_projector_dim"] = model_args.occupancy_projector_dim
+    overwrite_config["occ_detach_hidden_states"] = model_args.occ_detach_hidden_states
 
     if overwrite_config:
         assert cfg_pretrained is not None, "cfg_pretrained is None"
@@ -1713,6 +1722,8 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args, load_so
     setattr(model.config, "cycle_detach_hidden_states", model_args.cycle_detach_hidden_states)
     setattr(model.config, "use_3d_coordinate", model_args.use_3d_coordinate)
     setattr(model.config, "occupancy_projector_dim", model_args.occupancy_projector_dim)
+    setattr(model.config, "occ_debug_memory", model_args.occ_debug_memory)
+    setattr(model.config, "occ_detach_hidden_states", model_args.occ_detach_hidden_states)
     setattr(model.config, "enable_occ_geom_loss", model_args.enable_occ_geom_loss)
     setattr(model.config, "occ_geom_loss_weight", model_args.occ_geom_loss_weight)
     setattr(model.config, "occ_geom_mask_weight", model_args.occ_geom_mask_weight)

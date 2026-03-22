@@ -1731,6 +1731,10 @@ class Ross3DTrainer(Trainer):
         # Hanwliu
         if "cycle_loss" in outputs:
             log_dict["cycle_loss"] = round(outputs["cycle_loss"].item(), 4)
+        if outputs.get("occ_geom_loss", None) is not None:
+            log_dict["occ_geom_loss"] = round(outputs["occ_geom_loss"].item(), 4)
+        if outputs.get("occ_temp_loss", None) is not None:
+            log_dict["occ_temp_loss"] = round(outputs["occ_temp_loss"].item(), 4)
 
         if len(log_dict) > 0:
             self.log(log_dict)
