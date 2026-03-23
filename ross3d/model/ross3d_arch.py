@@ -1770,13 +1770,6 @@ class Ross3DMetaForCausalLM(ABC):
                         dtype=cur_input_embeds.dtype,
                     )
 
-                    rank0_print(
-                        f"[NAN_DEBUG][query_coord_update] "
-                        f"is_leaf={cur_input_embeds.is_leaf} "
-                        f"requires_grad={cur_input_embeds.requires_grad} "
-                        f"shape={tuple(cur_input_embeds.shape)} "
-                        f"dtype={cur_input_embeds.dtype}"
-                    )
                     cur_input_embeds = cur_input_embeds.clone()
                     cur_input_embeds[query_coord_tokens] = (
                         cur_input_embeds[query_coord_tokens]
