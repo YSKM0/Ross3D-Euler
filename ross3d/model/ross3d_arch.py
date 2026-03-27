@@ -91,6 +91,7 @@ class Ross3DMetaModel:
             self.vision_resampler = build_vision_resampler(config, vision_tower=self.vision_tower)
             self.mm_projector = build_vision_projector(config, vision_cfg=self.vision_tower.config)
             self.mask_token = nn.Parameter(torch.empty(config.hidden_size, dtype=self.dtype))
+            self._init_mask_token_(self.mask_token)
             self._audit_special_param_finiteness("post_constructor_mask_token_register")
 
             if "unpad" in getattr(config, "mm_patch_merge_type", ""):
@@ -173,6 +174,18 @@ class Ross3DMetaModel:
         self._audit_special_param_finiteness("post_model_init_complete")
         self._audit_special_param_aliases("post_model_init_complete")
 
+    def _init_mask_token_(self, mask_token: torch.Tensor, deterministic: bool = False) -> None:
+        std = 1 / torch.sqrt(torch.tensor(self.config.hidden_size, dtype=torch.float32))
+        with torch.no_grad():
+            if deterministic:
+                seed = int(os.getenv("ROSS3D_MASK_TOKEN_SANITIZE_SEED", "0"))
+                cpu_gen = torch.Generator(device="cpu")
+                cpu_gen.manual_seed(seed)
+                init_cpu = torch.randn(mask_token.shape, generator=cpu_gen, dtype=torch.float32) * std
+                mask_token.copy_(init_cpu.to(device=mask_token.device, dtype=mask_token.dtype))
+            else:
+                torch.nn.init.normal_(mask_token, mean=0.0, std=float(std.item()))
+
     def _audit_special_param_finiteness(self, stage: str) -> None:
         if os.getenv("ROSS3D_NAN_DEBUG", "0") != "1":
             return
@@ -229,8 +242,6 @@ class Ross3DMetaModel:
             )
 
     def _sanitize_mask_token_if_nonfinite(self, stage: str) -> None:
-        if os.getenv("ROSS3D_SANITIZE_MASK_TOKEN_ON_NONFINITE", "0") != "1":
-            return
         m = getattr(self, "mask_token", None)
         if m is None:
             return
@@ -238,10 +249,11 @@ class Ross3DMetaModel:
         if finite_all:
             return
         self._audit_special_param_finiteness(f"sanitize_before/{stage}")
-        with torch.no_grad():
-            torch.nn.init.normal_(m, mean=0.0, std=0.02)
+        self._init_mask_token_(m, deterministic=True)
         self._audit_special_param_finiteness(f"sanitize_after/{stage}")
-        rank0_print(f"[NAN_DEBUG][sanitize] stage={stage} action=reinit_mask_token")
+        if not bool(getattr(self, "_mask_token_sanitize_logged_once", False)):
+            rank0_print(f"[NAN_DEBUG][sanitize] stage={stage} action=reinit_mask_token deterministic=True")
+            self._mask_token_sanitize_logged_once = True
 
     def get_vision_tower(self):
         vision_tower = getattr(self, "vision_tower", None)
@@ -315,12 +327,14 @@ class Ross3DMetaModel:
                 )
 
         self._audit_special_param_finiteness("initialize_vision_modules.start")
+        self._sanitize_mask_token_if_nonfinite("initialize_vision_modules.start")
         if getattr(self, "mm_projector", None) is None:
             self.mm_projector = build_vision_projector(self.config, vision_cfg=vision_tower.config)
 
             embed_std = 1 / torch.sqrt(torch.tensor(self.config.hidden_size, dtype=self.dtype))
             self.mask_token = nn.Parameter(torch.randn(self.config.hidden_size, dtype=self.dtype) * embed_std,
                                            requires_grad=True)
+            self._sanitize_mask_token_if_nonfinite("initialize_vision_modules.mm_projector_new")
 
             if "unpad" in mm_patch_merge_type:
                 self.image_newline = nn.Parameter(torch.randn(self.config.hidden_size, dtype=self.dtype) * embed_std,
@@ -358,12 +372,14 @@ class Ross3DMetaModel:
             rank0_print(f"Loaded mm projector weights from {pretrain_mm_mlp_adapter}. Incompatible keys: {incompatible_keys}")
             incompatible_keys = self.vision_resampler.load_state_dict(get_w(mm_projector_weights, "vision_resampler"), strict=False)
             rank0_print(f"Loaded vision resampler weights from {pretrain_mm_mlp_adapter}. Incompatible keys: {incompatible_keys}")
+            self._sanitize_mask_token_if_nonfinite("initialize_vision_modules.after_checkpoint_load")
             self._audit_special_param_finiteness("initialize_vision_modules.after_checkpoint_load")
             self._audit_special_param_aliases("initialize_vision_modules.after_checkpoint_load")
 
         self.config.ross_enable = False
         self._audit_special_param_finiteness("initialize_vision_modules.after_precision_cast_or_to")
         self._audit_special_param_aliases("initialize_vision_modules.after_precision_cast_or_to")
+        self._sanitize_mask_token_if_nonfinite("initialize_vision_modules.before_return")
         self._audit_special_param_finiteness("initialize_vision_modules.before_return")
         if getattr(model_args, 'mm_pixel_decoder', False):
             self.config.ross_enable = True
@@ -1041,6 +1057,12 @@ class Ross3DMetaForCausalLM(ABC):
             return
         if tensor is None or (not torch.is_tensor(tensor)):
             return
+        if os.getenv("ROSS3D_SKIP_MASK_TOKEN_NAN_CHECK", "0") == "1":
+            mask_token = getattr(self.get_model(), "mask_token", None)
+            if torch.is_tensor(mask_token) and int(tensor.data_ptr()) == int(mask_token.data_ptr()):
+                if self._nan_debug_rank0_enabled():
+                    rank0_print(f"[NAN_DEBUG][{tag}] skip_mask_token_nan_check=True")
+                return
         if not bool(torch.isfinite(tensor).all().item()):
             raise RuntimeError(
                 f"[NAN_DEBUG][{tag}] non-finite tensor detected "

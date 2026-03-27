@@ -380,6 +380,21 @@ class Qwen2FlashAttention2(Qwen2Attention):
 
             # overwrite attention_mask with padding_mask
             attention_mask = kwargs.pop("padding_mask")
+
+        disable_flash_attn = os.getenv("ROSS3D_DISABLE_FLASH_ATTN", "0") == "1"
+        if disable_flash_attn:
+            if (not torch._dynamo.is_compiling()) and (not getattr(self, "_ross3d_flash_disable_log_once", False)):
+                logger.warning_once("ROSS3D_DISABLE_FLASH_ATTN=1 -> using non-FlashAttention fallback for Qwen2FlashAttention2.")
+                self._ross3d_flash_disable_log_once = True
+            return super().forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                **kwargs,
+            )
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)

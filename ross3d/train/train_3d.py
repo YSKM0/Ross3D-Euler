@@ -2168,6 +2168,17 @@ def train(attn_implementation=None):
         model.config.mm_spatial_pool_stride = model_args.mm_spatial_pool_stride 
 
         ### Deciding train which part of the model
+        def _enforce_mask_token_grad_rule() -> None:
+            base_model = model.get_model() if hasattr(model, "get_model") else None
+            mask_token = getattr(base_model, "mask_token", None) if base_model is not None else None
+            if mask_token is None:
+                return
+            masking_enabled = (
+                float(getattr(model.config, "view_mask_ratio", 0.0)) > 0.0
+                or float(getattr(model.config, "view_mask_prob", 0.0)) > 0.0
+            )
+            mask_token.requires_grad_(masking_enabled)
+
         if training_args.lora_enable:
             # We update embed_tokens as the size of embedding has changed.
             for name, param in model.named_parameters():
@@ -2219,7 +2230,7 @@ def train(attn_implementation=None):
                     pass
                 
                 model.get_model().image_newline.requires_grad_(True)
-                model.get_model().mask_token.requires_grad_(True)
+                _enforce_mask_token_grad_rule()
 
                 # Parse the mm_tunable_parts to decide which parts to unfreeze
                 tunable_parts = model_args.mm_tunable_parts.split(",")
@@ -2241,6 +2252,9 @@ def train(attn_implementation=None):
                     for name, param in model.named_parameters():
                         if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name and "mm_inv_projector" not in name and "mm_pixel_decoder" not in name:
                             param.requires_grad_(True)
+
+        # Final authority: mask_token trainability must follow masking config, after all unfreeze logic.
+        _enforce_mask_token_grad_rule()
 
         if training_args.verbose_logging:
             inv_projector = getattr(model.get_model(), "mm_inv_projector", None)

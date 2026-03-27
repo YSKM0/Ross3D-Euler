@@ -647,7 +647,11 @@ class Ross3DTrainer(Trainer):
                         rank0_print(f"[NAN_DEBUG][hook] first_nonfinite_grad_event={self._nan_debug_first_nonfinite_grad_hook}")
                     return grad
                 return _hook
-            self._nan_debug_target_grad_handles.append(param.register_hook(_make_hook(name)))
+            if param.requires_grad:
+                self._nan_debug_target_grad_handles.append(param.register_hook(_make_hook(name)))
+            else:
+                if self._nan_debug_rank0_enabled():
+                    rank0_print(f"[NAN_DEBUG][hook_skip] name={name} requires_grad=False")
 
         self._nan_debug_target_grad_hooks_installed = True
 
@@ -1591,6 +1595,19 @@ class Ross3DTrainer(Trainer):
         if self.optimizer is None:
             decay_parameters = get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS)
             decay_parameters = [name for name in decay_parameters if "bias" not in name]
+            masking_enabled = (
+                float(getattr(getattr(opt_model, "config", None), "view_mask_ratio", 0.0)) > 0.0
+                or float(getattr(getattr(opt_model, "config", None), "view_mask_prob", 0.0)) > 0.0
+            )
+            skip_mask_token = not masking_enabled
+
+            def _use_param(name, param):
+                if not param.requires_grad:
+                    return False
+                if skip_mask_token and ("mask_token" in name):
+                    return False
+                return True
+
             lr_mapper = {}
             if self.args.mm_projector_lr is not None:
                 lr_mapper["mm_projector"] = self.args.mm_projector_lr
@@ -1602,11 +1619,11 @@ class Ross3DTrainer(Trainer):
                 special_lr_parameters = [name for name, _ in opt_model.named_parameters() if any(module_keyword in name for module_keyword in lr_mapper)]
                 optimizer_grouped_parameters = [
                     {
-                        "params": [p for n, p in opt_model.named_parameters() if (n in decay_parameters and n not in special_lr_parameters and p.requires_grad)],
+                        "params": [p for n, p in opt_model.named_parameters() if (n in decay_parameters and n not in special_lr_parameters and _use_param(n, p))],
                         "weight_decay": self.args.weight_decay,
                     },
                     {
-                        "params": [p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n not in special_lr_parameters and p.requires_grad)],
+                        "params": [p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n not in special_lr_parameters and _use_param(n, p))],
                         "weight_decay": 0.0,
                     },
                 ]
@@ -1615,12 +1632,12 @@ class Ross3DTrainer(Trainer):
                     optimizer_grouped_parameters.extend(
                         [
                             {
-                                "params": [p for n, p in opt_model.named_parameters() if (n in decay_parameters and n in module_parameters and p.requires_grad)],
+                                "params": [p for n, p in opt_model.named_parameters() if (n in decay_parameters and n in module_parameters and _use_param(n, p))],
                                 "weight_decay": self.args.weight_decay,
                                 "lr": lr,
                             },
                             {
-                                "params": [p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n in module_parameters and p.requires_grad)],
+                                "params": [p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n in module_parameters and _use_param(n, p))],
                                 "weight_decay": 0.0,
                                 "lr": lr,
                             },
@@ -1629,11 +1646,11 @@ class Ross3DTrainer(Trainer):
             else:
                 optimizer_grouped_parameters = [
                     {
-                        "params": [p for n, p in opt_model.named_parameters() if (n in decay_parameters and p.requires_grad)],
+                        "params": [p for n, p in opt_model.named_parameters() if (n in decay_parameters and _use_param(n, p))],
                         "weight_decay": self.args.weight_decay,
                     },
                     {
-                        "params": [p for n, p in opt_model.named_parameters() if (n not in decay_parameters and p.requires_grad)],
+                        "params": [p for n, p in opt_model.named_parameters() if (n not in decay_parameters and _use_param(n, p))],
                         "weight_decay": 0.0,
                     },
                 ]
@@ -1656,6 +1673,10 @@ class Ross3DTrainer(Trainer):
                     )
 
             if os.getenv("ROSS3D_NAN_DEBUG", "0") == "1":
+                rank0_print(
+                    "[NAN_DEBUG][optimizer_groups] "
+                    f"masking_enabled={masking_enabled} skip_mask_token={skip_mask_token}"
+                )
                 param_ptr_seen = set()
                 duplicated = 0
                 for group in optimizer_grouped_parameters:
