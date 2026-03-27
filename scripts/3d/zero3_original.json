@@ -5,8 +5,8 @@
   "zero_optimization": {
     "stage": 3,
 
-    "offload_optimizer": { "device": "none", "pin_memory": true },
-    "offload_param": { "device": "none", "pin_memory": true },
+    "offload_optimizer": { "device": "none", "pin_memory": false },
+    "offload_param": { "device": "none", "pin_memory": false },
 
     "overlap_comm": false,
     "ignore_unused_parameters": true,
@@ -23,10 +23,10 @@
 
     "gather_16bit_weights_on_model_save": true,
 
-    "use_all_reduce_for_fetch_params": false
+    "use_all_reduce_for_fetch_params": true
   },
 
-    "activation_checkpointing": {
+  "activation_checkpointing": {
     "partition_activations": true,
     "contiguous_memory_optimization": true,
     "synchronize_checkpoint_boundary": true
