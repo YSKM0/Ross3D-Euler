@@ -64,6 +64,16 @@ local_rank = None
 IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= version.parse("0.14")
 
 
+def rlog(msg):
+    if os.getenv("ROSS3D_RLOG_DEBUG", "0") != "1":
+        return
+    if torch._dynamo.is_compiling():
+        return
+    import torch.distributed as dist
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    print(f"[RANK {rank}] {msg}", flush=True)
+
+
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
@@ -1529,9 +1539,10 @@ class DataCollatorForSupervisedDataset(object):
         if "prompt" in instances[0]:
             batch["prompts"] = [instance["prompt"] for instance in instances]
         
-        if "box_label" in instances[0]:
+        has_box_label = "box_label" in instances[0]
+        if has_box_label:
             batch["box_labels"] = [instance["box_label"]  for instance in instances]
-            batch["use_object_proposals"] = True
+        batch["use_object_proposals"] = has_box_label
 
         return batch
 

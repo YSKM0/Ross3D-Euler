@@ -15,6 +15,7 @@
 
 from typing import List, Optional, Tuple, Union, Dict
 import os
+import time
 import torch
 import torch._dynamo
 import torch.nn as nn
@@ -32,6 +33,16 @@ from ross3d.model.ross3d_arch import Ross3DMetaModel, Ross3DMetaForCausalLM, Cau
 from transformers import Qwen2Config
 from .qwen2.modeling_qwen2 import Qwen2Model, Qwen2ForCausalLM
 from ross3d.utils import rank_print
+
+
+def rlog(msg):
+    if os.getenv("ROSS3D_RLOG_DEBUG", "0") != "1":
+        return
+    if torch._dynamo.is_compiling():
+        return
+    import torch.distributed as dist
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    print(f"[RANK {rank}] {msg}", flush=True)
 
 
 class Ross3DQwenConfig(Qwen2Config):
@@ -172,6 +183,102 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
     def get_model(self):
         return self.model
 
+    @torch._dynamo.disable
+    def _forward_predict_box_path(self, **kwargs):
+        return self.predict_box(**kwargs)
+
+    def _forward_lm_occ_path(self, **kwargs):
+        return self.inner_forward(**kwargs)
+
+    @torch._dynamo.disable
+    def _timed_call(self, fn, *args, **kwargs):
+        t0 = time.time()
+        out = fn(*args, **kwargs)
+        return out, (time.time() - t0)
+
+    @torch._dynamo.disable
+    def _emit_compact_step_logs(
+        self,
+        global_step,
+        branch,
+        scene_id,
+        num_objects,
+        union_count,
+        used_patch_proj,
+        used_obj_norm,
+        used_geom_any,
+        used_temp_proj,
+        extract_return_reason,
+        geom_return_reason,
+        temp_return_reason,
+        extract_time,
+        geom_time,
+        temp_time,
+        used_vm=False,
+        used_bev=False,
+        used_cycle=False,
+        used_occ_geom_any=False,
+        used_occ_temp=False,
+    ):
+        sig_max = int(os.getenv("ROSS3D_STEP_SIG_MAX", "10"))
+        if int(global_step) >= sig_max:
+            return
+        rlog(
+            f"STEP_SIG "
+            f"step={global_step} "
+            f"branch={branch} "
+            f"scene_id={scene_id} "
+            f"num_objects={num_objects} "
+            f"union_objects={union_count} "
+            f"used_patch_proj={int(used_patch_proj)} "
+            f"used_obj_norm={int(used_obj_norm)} "
+            f"used_geom_any={int(used_geom_any)} "
+            f"used_temp_proj={int(used_temp_proj)} "
+            f"used_vm={int(used_vm)} "
+            f"used_bev={int(used_bev)} "
+            f"used_cycle={int(used_cycle)} "
+            f"used_occ_geom_any={int(used_occ_geom_any)} "
+            f"used_occ_temp={int(used_occ_temp)} "
+            f"extract_return={extract_return_reason if extract_return_reason is not None else 'none'} "
+            f"geom_return={geom_return_reason if geom_return_reason is not None else 'none'} "
+            f"temp_return={temp_return_reason if temp_return_reason is not None else 'none'}"
+        )
+        rlog(
+            f"STEP_TIMING "
+            f"step={global_step} "
+            f"extract_s={extract_time:.4f} "
+            f"geom_s={geom_time:.4f} "
+            f"temp_s={temp_time:.4f}"
+        )
+
+    @torch._dynamo.disable
+    def _emit_layout_sig(self, global_step, branch, inputs_embeds, boi_ids, eoi_ids, newline_ids, scene_id="NA"):
+        if os.getenv("ROSS3D_RLOG_DEBUG", "0") != "1":
+            return
+        max_steps = int(os.getenv("ROSS3D_LAYOUT_SIG_STEPS", "10"))
+        if int(global_step) >= max_steps:
+            return
+        seq_len = int(inputs_embeds.shape[1]) if torch.is_tensor(inputs_embeds) and inputs_embeds.dim() >= 2 else -1
+        boi_list = boi_ids if isinstance(boi_ids, (list, tuple)) else []
+        eoi_list = eoi_ids if isinstance(eoi_ids, (list, tuple)) else []
+        if torch.is_tensor(newline_ids):
+            nl_list = newline_ids.tolist()
+        elif isinstance(newline_ids, (list, tuple)):
+            nl_list = list(newline_ids)
+        else:
+            nl_list = []
+        boi_count = len(boi_list)
+        eoi_count = len(eoi_list)
+        newline_count = len(nl_list)
+        ok_first = boi_count > 0 and all((x is not None) and (0 <= int(x) < seq_len) for x in boi_list)
+        ok_last = eoi_count > 0 and all((x is not None) and (0 <= int(x) < seq_len) for x in eoi_list)
+        ok_newline = all((x is not None) and (0 <= int(x) < seq_len) for x in nl_list)
+        rlog(
+            f"LAYOUT_SIG step={global_step} branch={branch} scene_id={scene_id} "
+            f"seq_len={seq_len} boi_count={boi_count} eoi_count={eoi_count} newline_count={newline_count} "
+            f"ok_first={ok_first} ok_last={ok_last} ok_newline={ok_newline}"
+        )
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -194,8 +301,10 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
         box_labels = None,
         global_step: Optional[int] = 0,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        rlog(f"COMPILE_BRANCH step={global_step} branch={'predict_box' if use_object_proposals else 'lm_occ'}")
 
         if inputs_embeds is None:
+            rlog("FWD_BEFORE_PREPARE_MM")
             if not self.training or getattr(self.config, "view_mask_prob", 0) == 0:
                 replace_with_mask_token = False
             else:
@@ -227,11 +336,46 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
                 use_object_proposals=use_object_proposals,
                 replace_with_mask_token=replace_with_mask_token,
             )
+            self._emit_layout_sig(
+                global_step=global_step,
+                branch="predict_box" if use_object_proposals else "lm_occ",
+                inputs_embeds=inputs_embeds,
+                boi_ids=boi_ids,
+                eoi_ids=eoi_ids,
+                newline_ids=newline_ids,
+                scene_id=video_dict.get("scene_id", "NA") if isinstance(video_dict, dict) else "NA",
+            )
         else:
+            object_features, object_boxes = None, None
             boi_ids, eoi_ids, newline_ids, mask = None, None, None, None
 
+        has_object_proposals = (object_features is not None) or (object_boxes is not None)
+        if torch.is_tensor(object_features):
+            num_objects = int(object_features.shape[0])
+        elif isinstance(object_features, (list, tuple)):
+            num_objects = len(object_features)
+        else:
+            num_objects = "NA"
+        if torch.is_tensor(object_boxes):
+            num_boxes = int(object_boxes.shape[0])
+        elif isinstance(object_boxes, (list, tuple)):
+            num_boxes = len(object_boxes)
+        else:
+            num_boxes = "NA"
+        scene_id = video_dict.get("scene_id", "NA") if isinstance(video_dict, dict) else "NA"
+        rlog(
+            f"BRANCH_GATE "
+            f"use_object_proposals={use_object_proposals} "
+            f"has_object_proposals={has_object_proposals} "
+            f"num_objects={num_objects} "
+            f"num_boxes={num_boxes} "
+            f"scene_id={scene_id}"
+        )
+        rlog(f"FWD_BRANCH step={global_step} use_object_proposals={use_object_proposals}")
+
+        rlog("FWD_BEFORE_USE_OBJECT_PROPOSALS_CHECK")
         if use_object_proposals:
-            return self.predict_box(
+            out = self._forward_predict_box_path(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -253,9 +397,33 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
                 global_step=global_step,
                 video_dict=video_dict,
             )
+            self._emit_compact_step_logs(
+                global_step=global_step,
+                branch="predict_box",
+                scene_id="NA",
+                num_objects="NA",
+                union_count="NA",
+                used_patch_proj=False,
+                used_obj_norm=False,
+                used_geom_any=False,
+                used_temp_proj=False,
+                extract_return_reason=None,
+                geom_return_reason=None,
+                temp_return_reason=None,
+                extract_time=0.0,
+                geom_time=0.0,
+                temp_time=0.0,
+                used_vm=False,
+                used_bev=False,
+                used_cycle=False,
+                used_occ_geom_any=False,
+                used_occ_temp=False,
+            )
+            return out
 
 
         if dpo_forward:
+            rlog("FWD_BEFORE_LM_MODEL_CALL")
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -267,13 +435,15 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
             )
+            rlog("FWD_AFTER_LM_MODEL_CALL")
 
             hidden_states = outputs[0]
             logits = self.lm_head(hidden_states)
+            rlog("FWD_EXIT")
             return logits, labels
 
         else:
-            return self.inner_forward(
+            out = self._forward_lm_occ_path(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -292,6 +462,7 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
                 global_step=global_step,
                 video_dict=video_dict,
             )
+            return out
 
 
     def _dtype_debug_should_log(self) -> bool:
@@ -392,6 +563,8 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        scene_id = "NA"
+        num_objects = "NA"
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         if self._dtype_debug_should_log():
@@ -403,6 +576,7 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
                 f"labels={getattr(labels, 'dtype', None)} "
                 f"occ_enabled={(bool(getattr(self.config, 'enable_occ_geom_loss', False)) or bool(getattr(self.config, 'enable_occ_temp_loss', False)))}"
             )
+        rlog("FWD_BEFORE_LM_MODEL_CALL")
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -414,6 +588,7 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+        rlog("FWD_AFTER_LM_MODEL_CALL")
 
         hidden_states = outputs[0]
         if self._dtype_debug_should_log():
@@ -441,6 +616,8 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             lm_loss = loss.detach().clone()
 
         vm_loss, bev_loss = None, None
+        used_vm = False
+        used_bev = False
         vm_enabled = getattr(self.config, "enable_vm_loss", True)
         bev_enabled = getattr(self.config, "enable_bev_loss", True)
         if self.training and getattr(self.config, 'ross_enable', False) and vm_enabled and (
@@ -450,56 +627,124 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             # vm_loss = self.compute_vm_loss_v2(images, hidden_states, boi_ids, eoi_ids, newline_ids, mask)
             vm_loss = self.compute_vm_loss(images, hidden_states, boi_ids, eoi_ids, newline_ids, mask)
             loss = loss + vm_loss
+            used_vm = True
             if getattr(self.config, 'ross_multi_task', False) and bev_enabled:
                 bev_loss = self.compute_vm_loss_bev(images, hidden_states, boi_ids, eoi_ids, newline_ids,
                                                     video_dict["bev_image"], mask)
                 loss = loss + bev_loss
+                used_bev = True
 
         occupancy_aux_outputs = None
+        used_patch_proj = False
+        used_obj_norm = False
+        used_geom_any = False
+        used_temp_proj = False
+        extract_return_reason = None
+        geom_return_reason = None
+        temp_return_reason = None
+        extract_time = 0.0
+        geom_time = 0.0
+        temp_time = 0.0
         occ_geom_enabled = bool(getattr(self.config, "enable_occ_geom_loss", False))
         occ_temp_enabled = bool(getattr(self.config, "enable_occ_temp_loss", False))
         occ_aux_enabled = occ_geom_enabled or occ_temp_enabled
+        scene_id = video_dict.get("scene_id", "NA") if isinstance(video_dict, dict) else "NA"
+        has_occ_targets = bool(isinstance(video_dict, dict) and video_dict.get("patch_occupancy", None) is not None)
+        has_temporal_targets = bool(isinstance(video_dict, dict) and video_dict.get("frame_ids", None) is not None)
+        if isinstance(video_dict, dict) and ("objects" in video_dict) and len(video_dict["objects"]) > 0:
+            try:
+                num_objects = int(video_dict["objects"][0].shape[0])
+            except Exception:
+                num_objects = "NA"
+        else:
+            num_objects = "NA"
+        if isinstance(video_dict, dict) and ("frame_ids" in video_dict):
+            num_occ_frames = len(video_dict["frame_ids"])
+        else:
+            num_occ_frames = "NA"
         if self.training and occ_aux_enabled and (video_dict is not None):
             occ_hidden_states = hidden_states
             if getattr(self.config, "occ_detach_hidden_states", False):
                 occ_hidden_states = hidden_states.detach()
-            occupancy_aux_outputs = self.extract_occupancy_object_embeddings(
+            occupancy_aux_outputs, extract_time = self._timed_call(
+                self.extract_occupancy_object_embeddings,
                 hidden_states=occ_hidden_states,
                 boi_ids=boi_ids,
                 eoi_ids=eoi_ids,
                 newline_ids=newline_ids,
                 video_dict=video_dict,
+                global_step=global_step,
                 need_patch_embeddings=occ_geom_enabled,
                 need_geom_metadata=occ_geom_enabled,
                 need_temp_metadata=occ_temp_enabled,
             )
+            used_patch_proj = bool(getattr(self, "_occ_dbg_used_patch_proj", False))
+            used_obj_norm = bool(getattr(self, "_occ_dbg_used_obj_norm", False))
+            extract_return_reason = getattr(self, "_occ_dbg_extract_return_reason", None)
 
         occ_geom_loss = None
+        occ_obj_emb = occupancy_aux_outputs.get("object_embeddings", None) if isinstance(occupancy_aux_outputs, dict) else None
+        occ_target = None
+        rlog("OCC_BEFORE_GEOM_LOSS")
+        rlog(
+            f"OCC_META step={global_step} "
+            f"scene_id={scene_id} "
+            f"has_occ_targets={has_occ_targets} "
+            f"has_temporal_targets={has_temporal_targets} "
+            f"num_objects={num_objects} "
+            f"num_occ_frames={num_occ_frames} "
+            f"occ_obj_emb_shape={tuple(occ_obj_emb.shape) if occ_obj_emb is not None else 'None'} "
+            f"occ_target_shape={tuple(occ_target.shape) if occ_target is not None else 'None'}"
+        )
         if (
             self.training
             and occ_geom_enabled
             and (occupancy_aux_outputs is not None)
             and (video_dict is not None)
         ):
-            occ_geom_loss = self.compute_occupancy_geometry_loss(
+            occ_geom_loss, geom_time = self._timed_call(
+                self.compute_occupancy_geometry_loss,
                 occupancy_aux_outputs=occupancy_aux_outputs,
                 video_dict=video_dict,
-            ).float()
+                global_step=global_step,
+            )
+            occ_geom_loss = occ_geom_loss.float()
+            used_geom_any = bool(getattr(self, "_occ_dbg_used_geom_any", False))
+            geom_return_reason = getattr(self, "_occ_dbg_geom_return_reason", None)
             loss = loss + getattr(self.config, "occ_geom_loss_weight", 0.0) * occ_geom_loss
+        rlog("OCC_AFTER_GEOM_LOSS")
 
         occ_temp_loss = None
+        rlog("OCC_BEFORE_TEMP_LOSS")
+        rlog(
+            f"OCC_META step={global_step} "
+            f"scene_id={scene_id} "
+            f"has_occ_targets={has_occ_targets} "
+            f"has_temporal_targets={has_temporal_targets} "
+            f"num_objects={num_objects} "
+            f"num_occ_frames={num_occ_frames} "
+            f"occ_obj_emb_shape={tuple(occ_obj_emb.shape) if occ_obj_emb is not None else 'None'} "
+            f"occ_target_shape={tuple(occ_target.shape) if occ_target is not None else 'None'}"
+        )
         if (
             self.training
             and occ_temp_enabled
             and (occupancy_aux_outputs is not None)
         ):
-            occ_temp_loss = self.compute_occupancy_temporal_loss(
+            occ_temp_loss, temp_time = self._timed_call(
+                self.compute_occupancy_temporal_loss,
                 occupancy_aux_outputs=occupancy_aux_outputs,
-            ).float()
+                global_step=global_step,
+            )
+            occ_temp_loss = occ_temp_loss.float()
+            used_temp_proj = bool(getattr(self, "_occ_dbg_used_temp_proj", False))
+            temp_return_reason = getattr(self, "_occ_dbg_temp_return_reason", None)
             loss = loss + getattr(self.config, "occ_temp_loss_weight", 0.0) * occ_temp_loss
+        rlog("OCC_AFTER_TEMP_LOSS")
 
         # Hanwliu
         cycle_loss = None
+        used_cycle = False
         if self.training and (
             getattr(self.config, "cycle_consist_v2", False)
             or getattr(self.config, "cycle_consist", False)
@@ -531,6 +776,44 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             else:
                 cycle_loss = self.compute_cycle_consistency_loss(**cycle_kwargs)
             loss = loss + getattr(self.config, "cycle_consist_weight", 1.0) * cycle_loss
+            used_cycle = True
+        union_count = "NA"
+        if isinstance(occupancy_aux_outputs, dict):
+            obj_ids_union = occupancy_aux_outputs.get("obj_ids_union", None)
+            if torch.is_tensor(obj_ids_union):
+                union_count = int(obj_ids_union.shape[0])
+        used_geom = bool(used_geom_any)
+        rlog(
+            f"COMPILE_OCC_SIG step={global_step} "
+            f"num_objects={num_objects} "
+            f"union_objects={union_count} "
+            f"used_patch_proj={used_patch_proj} "
+            f"used_obj_norm={used_obj_norm} "
+            f"used_temp_proj={used_temp_proj} "
+            f"used_geom={used_geom}"
+        )
+        self._emit_compact_step_logs(
+            global_step=global_step,
+            branch="lm_occ",
+            scene_id=scene_id,
+            num_objects=num_objects if 'num_objects' in locals() else 'NA',
+            union_count=union_count if 'union_count' in locals() else 'NA',
+            used_patch_proj=used_patch_proj,
+            used_obj_norm=used_obj_norm,
+            used_geom_any=used_geom_any,
+            used_temp_proj=used_temp_proj,
+            extract_return_reason=extract_return_reason,
+            geom_return_reason=geom_return_reason,
+            temp_return_reason=temp_return_reason,
+            extract_time=extract_time,
+            geom_time=geom_time,
+            temp_time=temp_time,
+            used_vm=used_vm,
+            used_bev=used_bev,
+            used_cycle=used_cycle,
+            used_occ_geom_any=bool(occ_geom_loss is not None),
+            used_occ_temp=bool(occ_temp_loss is not None),
+        )
 
 
         if not return_dict:
@@ -740,13 +1023,6 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
         prev_attn_impl = self._get_lm_attn_impl()
         if disable_flash_attn:
             self._set_lm_attn_impl("sdpa")
-        if self._should_log_rank0():
-            rank_print(
-                "[NAN_DEBUG][predict_box][lm_call] "
-                f"compile_mode={'eager' if disable_lm_compile else 'compiled'} "
-                f"attn_impl={self._get_lm_attn_impl()} disable_flash_attn={disable_flash_attn}"
-            )
-
         lm_kwargs = dict(
             input_ids=input_ids,
             attention_mask=attention_mask,

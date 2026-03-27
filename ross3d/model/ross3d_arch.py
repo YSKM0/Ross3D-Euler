@@ -44,6 +44,20 @@ from ross3d.utils import rank0_print, rank_print
 import random
 
 
+def rlog(msg):
+    if os.getenv("ROSS3D_RLOG_DEBUG", "0") != "1":
+        return
+    if torch._dynamo.is_compiling():
+        return
+    import torch.distributed as dist
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    print(f"[RANK {rank}] {msg}", flush=True)
+
+
+def tshape(x):
+    return "None" if x is None else tuple(x.shape)
+
+
 if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
     _compile_disable = torch.compiler.disable
 else:
@@ -774,7 +788,8 @@ class Ross3DMetaForCausalLM(ABC):
         # [3584, 32, 14, 1, 14] --> [3584, 448, 1, 14] --> [3584, 448, 14]
         image_feature = image_feature.flatten(1, 2).flatten(2, 3)
         # [3584, 448, 15]
-        if os.getenv("ROSS3D_DISABLE_IMAGE_NEWLINE_INSERT", "0") != "1":
+        newline_insert_enabled = os.getenv("ROSS3D_DISABLE_IMAGE_NEWLINE_INSERT", "0") != "1"
+        if newline_insert_enabled:
             image_feature = torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
         if getattr(self.config, "add_faster_video", False):
             # import pdb; pdb.set_trace()
@@ -788,17 +803,123 @@ class Ross3DMetaForCausalLM(ABC):
             return image_feature
         # import pdb; pdb.set_trace()
         image_feature = image_feature.flatten(1, 2).transpose(0, 1)
-        newline_ids = [resize_w + i * (resize_w + 1) for i in range(num_frames * num_tokens // resize_w)]
+        if newline_insert_enabled:
+            newline_ids = [resize_w + i * (resize_w + 1) for i in range(num_frames * num_tokens // resize_w)]
+        else:
+            newline_ids = []
 
         for image_id in range(old_image_feature.shape[0]):
-            old_boi_id = image_id * num_tokens
-            old_eoi_id = old_boi_id + num_tokens - 1
-            boi_ids[image_id] = int(old_boi_id + old_boi_id // resize_w)
-            eoi_ids[image_id] = int(old_eoi_id + old_eoi_id // resize_w)
+            frame_stride = resize_h * (resize_w + (1 if newline_insert_enabled else 0))
+            frame_base = image_id * frame_stride
+            expected_boi = frame_base
+            expected_eoi = frame_base + (resize_h - 1) * (resize_w + (1 if newline_insert_enabled else 0)) + (resize_w - 1)
+            boi_ids[image_id] = int(expected_boi)
+            eoi_ids[image_id] = int(expected_eoi)
             # skip strict equality when grids are non-square; rely on position math instead
             if resize_h == resize_w:
-                assert (old_image_feature[image_id, 0] == image_feature[boi_ids[image_id]]).sum() == feature_dim
-                assert (old_image_feature[image_id, -1] == image_feature[eoi_ids[image_id]]).sum() == feature_dim
+                boi_idx = boi_ids[image_id]
+                eoi_idx = eoi_ids[image_id]
+                in_bounds_boi = 0 <= boi_idx < image_feature.shape[0]
+                in_bounds_eoi = 0 <= eoi_idx < image_feature.shape[0]
+                if (not in_bounds_boi) or (not in_bounds_eoi):
+                    raise RuntimeError(
+                        "[prepare_mm][add_token_per_grid] index out of bounds "
+                        f"image_id={image_id} boi_idx={boi_idx} eoi_idx={eoi_idx} "
+                        f"packed_len={image_feature.shape[0]} resize_h={resize_h} resize_w={resize_w}"
+                    )
+
+                lhs_first = old_image_feature[image_id, 0]
+                rhs_first = image_feature[boi_idx]
+                lhs_last = old_image_feature[image_id, -1]
+                rhs_last = image_feature[eoi_idx]
+                atol = 1e-3 if lhs_first.dtype in (torch.float16, torch.bfloat16) else 1e-5
+                rtol = 1e-3 if lhs_first.dtype in (torch.float16, torch.bfloat16) else 1e-5
+                first_match = torch.isclose(lhs_first, rhs_first, atol=atol, rtol=rtol)
+                last_match = torch.isclose(lhs_last, rhs_last, atol=atol, rtol=rtol)
+                ok_first = bool(torch.all(first_match).item())
+                ok_last = bool(torch.all(last_match).item())
+                if (not ok_first) or (not ok_last):
+                    def _tensor_finite_stats(x):
+                        finite = torch.isfinite(x)
+                        finite_all = bool(finite.all().item())
+                        nan_count = int(torch.isnan(x).sum().item())
+                        inf_count = int(torch.isinf(x).sum().item())
+                        if bool(finite.any().item()):
+                            max_abs = float(x[finite].abs().max().item())
+                        else:
+                            max_abs = float("nan")
+                        return finite_all, nan_count, inf_count, max_abs
+
+                    first_eq_count = int(first_match.sum().item())
+                    last_eq_count = int(last_match.sum().item())
+                    first_diff = (lhs_first - rhs_first).abs()
+                    last_diff = (lhs_last - rhs_last).abs()
+                    first_finite = torch.isfinite(first_diff)
+                    last_finite = torch.isfinite(last_diff)
+                    first_max_diff = float(first_diff[first_finite].max().item()) if bool(first_finite.any().item()) else float("nan")
+                    last_max_diff = float(last_diff[last_finite].max().item()) if bool(last_finite.any().item()) else float("nan")
+                    lhs_first_stats = _tensor_finite_stats(lhs_first)
+                    rhs_first_stats = _tensor_finite_stats(rhs_first)
+                    lhs_last_stats = _tensor_finite_stats(lhs_last)
+                    rhs_last_stats = _tensor_finite_stats(rhs_last)
+                    mapping_preview = []
+                    preview_n = min(20, frame_stride)
+                    for pidx in range(preview_n):
+                        row = pidx // (resize_w + (1 if newline_insert_enabled else 0))
+                        col = pidx % (resize_w + (1 if newline_insert_enabled else 0))
+                        token_kind = "newline" if (newline_insert_enabled and col == resize_w) else "patch"
+                        mapping_preview.append(f"{frame_base + pidx}:{token_kind}@({row},{col})")
+                    patch_candidates = [0, 1, max(0, resize_w - 1), resize_w, max(0, num_tokens - 1)]
+                    patch_diag = []
+                    for patch_idx in patch_candidates:
+                        if patch_idx < 0 or patch_idx >= num_tokens:
+                            continue
+                        prow = patch_idx // resize_w
+                        pcol = patch_idx % resize_w
+                        packed_idx = frame_base + prow * (resize_w + (1 if newline_insert_enabled else 0)) + pcol
+                        if 0 <= packed_idx < image_feature.shape[0]:
+                            cand = image_feature[packed_idx]
+                            cand_match = torch.isclose(old_image_feature[image_id, patch_idx], cand, atol=atol, rtol=rtol)
+                            cand_eq = int(cand_match.sum().item())
+                            cand_diff = (old_image_feature[image_id, patch_idx] - cand).abs()
+                            cand_fin = torch.isfinite(cand_diff)
+                            cand_max = float(cand_diff[cand_fin].max().item()) if bool(cand_fin.any().item()) else float("nan")
+                            lhs_stats = _tensor_finite_stats(old_image_feature[image_id, patch_idx])
+                            rhs_stats = _tensor_finite_stats(cand)
+                            patch_diag.append(
+                                f"patch={patch_idx}->packed={packed_idx} eq={cand_eq}/{feature_dim} max_abs_diff={cand_max:.6e} "
+                                f"lhs_finite={lhs_stats[0]} rhs_finite={rhs_stats[0]}"
+                            )
+                    if os.getenv("ROSS3D_RLOG_DEBUG", "0") == "1":
+                        rlog(
+                            "[prepare_mm][grid_assert] "
+                            f"image_id={image_id} feature_dim={feature_dim} "
+                            f"old_shape={tuple(old_image_feature.shape)} packed_shape={tuple(image_feature.shape)} "
+                            f"boi_idx={boi_idx} eoi_idx={eoi_idx} "
+                            f"expected_boi={expected_boi} expected_eoi={expected_eoi} "
+                            f"in_bounds_boi={in_bounds_boi} in_bounds_eoi={in_bounds_eoi} "
+                            f"first_eq={first_eq_count}/{feature_dim} last_eq={last_eq_count}/{feature_dim} "
+                            f"first_max_abs_diff={first_max_diff:.6e} last_max_abs_diff={last_max_diff:.6e} "
+                            f"mm_patch_merge_type={getattr(self.config, 'mm_patch_merge_type', 'NA')} "
+                            f"mm_newline_position={getattr(self.config, 'mm_newline_position', 'NA')} "
+                            f"num_frames={num_frames} num_tokens={num_tokens} resize_h={resize_h} resize_w={resize_w} "
+                            f"newline_insert_enabled={newline_insert_enabled} "
+                            f"image_sizes={image_sizes}"
+                        )
+                        rlog(
+                            "[prepare_mm][grid_assert][finite] "
+                            f"lhs_first={lhs_first_stats} rhs_first={rhs_first_stats} "
+                            f"lhs_last={lhs_last_stats} rhs_last={rhs_last_stats}"
+                        )
+                        rlog("[prepare_mm][grid_assert][mapping_preview] " + " ".join(mapping_preview))
+                        if len(patch_diag) > 0:
+                            rlog("[prepare_mm][grid_assert][patch_diag] " + " | ".join(patch_diag))
+                    raise RuntimeError(
+                        "[prepare_mm][add_token_per_grid] BOI/EOI alignment mismatch "
+                        f"image_id={image_id} first_eq={first_eq_count}/{feature_dim} "
+                        f"last_eq={last_eq_count}/{feature_dim} "
+                        f"first_max_abs_diff={first_max_diff:.6e} last_max_abs_diff={last_max_diff:.6e}"
+                    )
 
         return image_feature, boi_ids, eoi_ids, old_image_feature, newline_ids
 
@@ -1226,21 +1347,7 @@ class Ross3DMetaForCausalLM(ABC):
         use_object_proposals: bool = False,
         replace_with_mask_token: bool = False,
     ):
-        if os.getenv("ROSS3D_DISABLE_PREPARE_MM_COMPILE", "0") == "1":
-            return self._prepare_inputs_labels_for_multimodal_eager(
-                input_ids,
-                position_ids,
-                attention_mask,
-                past_key_values,
-                labels,
-                images,
-                modalities=modalities,
-                image_sizes=image_sizes,
-                video_dict=video_dict,
-                use_object_proposals=use_object_proposals,
-                replace_with_mask_token=replace_with_mask_token,
-            )
-        return self._prepare_inputs_labels_for_multimodal_impl(
+        return self._prepare_inputs_labels_for_multimodal_eager(
             input_ids,
             position_ids,
             attention_mask,
@@ -2204,6 +2311,7 @@ class Ross3DMetaForCausalLM(ABC):
 
         return feats
 
+    @torch._dynamo.disable
     def extract_occupancy_object_embeddings(
         self,
         hidden_states: torch.Tensor,
@@ -2211,21 +2319,42 @@ class Ross3DMetaForCausalLM(ABC):
         eoi_ids: List[int],
         newline_ids: torch.Tensor,
         video_dict: Optional[Dict[str, torch.Tensor]] = None,
+        global_step: Optional[int] = "NA",
         eps: float = 1e-6,
         need_patch_embeddings: bool = True,
         need_geom_metadata: bool = True,
         need_temp_metadata: bool = True,
     ) -> Optional[Dict[str, Union[torch.Tensor, List[int], List[str], str]]]:
+        first_extract_fail = None
+        used_patch_proj = False
+        used_obj_norm = False
+
+        def _extract_return(reason: str, value):
+            nonlocal first_extract_fail
+            if first_extract_fail is None:
+                first_extract_fail = reason
+            setattr(self, "_occ_dbg_extract_return_reason", reason)
+            setattr(self, "_occ_dbg_used_patch_proj", bool(used_patch_proj))
+            setattr(self, "_occ_dbg_used_obj_norm", bool(used_obj_norm))
+            rlog(f"OCC_DECISION step={global_step} fn=extract guard={reason} pass=0")
+            rlog(f"FIRST_FAIL step={global_step} fn=extract first_fail={first_extract_fail or 'none'}")
+            return value
+
         if not hasattr(self.model, "occupancy_patch_projector") or not hasattr(self.model, "occupancy_object_norm"):
-            return None
+            return _extract_return("missing_projector", None)
         if video_dict is None:
-            return None
+            return _extract_return("video_dict_none", None)
         patch_occupancy = video_dict.get("patch_occupancy", None)
         if patch_occupancy is None:
-            return None
+            return _extract_return("patch_occupancy_none", None)
+        rlog(f"OCC_DECISION step={global_step} fn=extract guard=global_guards pass=1")
 
         patch_feats = self._extract_frame_patch_hidden_states(hidden_states, boi_ids, eoi_ids, newline_ids)
+        rlog(f"PARAM_USE step={global_step} module=occupancy_patch_projector used=1")
+        used_patch_proj = True
         projected_patch_feats = self.model.occupancy_patch_projector(patch_feats)
+        rlog(f"PATCH_PROJECTOR_OUTPUT shape={tshape(projected_patch_feats)}")
+        rlog("EXTRACT_AFTER_PATCH_PROJECTOR")
         self._log_occ_cuda_memory("aux_after_patch_projector")
 
         frame_ids = video_dict.get("frame_ids", [str(i) for i in range(projected_patch_feats.shape[0])])
@@ -2239,9 +2368,11 @@ class Ross3DMetaForCausalLM(ABC):
         detected_ids_per_frame = []
         all_detected_ids = set()
         obj_id_to_label = {}
+        rlog("EXTRACT_BEFORE_FRAME_LOOP")
         for fidx in range(T):
             occ_anno = patch_occupancy[fidx] if fidx < len(patch_occupancy) else None
             vis_anno = visible_bboxes[fidx] if fidx < len(visible_bboxes) else None
+            n_visible = len(vis_anno.get("detected", [])) if vis_anno is not None else 0
 
             # collect labels from visible_bboxes first
             if vis_anno is not None:
@@ -2262,6 +2393,7 @@ class Ross3DMetaForCausalLM(ABC):
 
             if occ_anno is None:
                 detected_ids_per_frame.append([])
+                rlog(f"EXTRACT_FRAME_SUMMARY frame={fidx} visible_boxes={n_visible} valid_ids=0 kept=0")
                 continue
 
             detected_objects = occ_anno.get("detected_objects", [])
@@ -2279,18 +2411,18 @@ class Ross3DMetaForCausalLM(ABC):
                         continue
             detected_ids_per_frame.append(detected_ids)
             all_detected_ids.update(detected_ids)
-
+        rlog("EXTRACT_AFTER_FRAME_LOOP")
         obj_ids_union = sorted(all_detected_ids)
         O = len(obj_ids_union)
+        rlog(f"OCC_DECISION step={global_step} fn=extract guard=has_union_objects pass={1 if O > 0 else 0}")
 
-        z_raw = torch.zeros((T, O, Dp), device=device, dtype=dtype)
-        den = torch.zeros((T, O), device=device, dtype=dtype)
-        present = torch.zeros((T, O), device=device, dtype=torch.bool)
+        empty_embeddings = torch.zeros((T, O, Dp), device=device, dtype=dtype)
+        empty_present = torch.zeros((T, O), device=device, dtype=torch.bool)
 
         if O == 0:
             outputs = {
-                "object_embeddings": z_raw,
-                "present": present,
+                "object_embeddings": empty_embeddings,
+                "present": empty_present,
             }
             if need_patch_embeddings:
                 outputs["patch_embeddings"] = projected_patch_feats
@@ -2301,53 +2433,58 @@ class Ross3DMetaForCausalLM(ABC):
                 outputs["scene_id"] = scene_id
             if need_temp_metadata:
                 outputs["obj_cat_ids_union"] = torch.zeros((0,), device=device, dtype=torch.long)
-            return outputs
+            return _extract_return("no_union_objects", outputs)
 
         id_to_union_col = {oid: u for u, oid in enumerate(obj_ids_union)}
 
+        valid_frame_count = 0
+        _object_norm_logged = False
+        z_frames = []
+        present_frames = []
         for fidx in range(T):
             occ_anno = patch_occupancy[fidx] if fidx < len(patch_occupancy) else None
-            if occ_anno is None:
-                continue
-
-            detected_ids = detected_ids_per_frame[fidx]
-            patches = occ_anno.get("patches", [])
-            if len(detected_ids) == 0 or len(patches) == 0:
-                continue
-
-            occ_matrix = torch.zeros((P, len(detected_ids)), device=device, dtype=dtype)
-            id_to_local_col = {oid: j for j, oid in enumerate(detected_ids)}
-
-            for patch in patches:
-                pidx = int(patch.get("patch_index", -1))
-                if pidx < 0 or pidx >= P:
-                    continue
-                patch_occ = patch.get("occupancy", {})
-                for k, v in patch_occ.items():
-                    try:
-                        oid = int(k)
-                    except Exception:
+            occ_matrix_union = torch.zeros((P, O), device=device, dtype=dtype)
+            if occ_anno is not None:
+                patches = occ_anno.get("patches", [])
+                for patch in patches:
+                    pidx = int(patch.get("patch_index", -1))
+                    if pidx < 0 or pidx >= P:
                         continue
-                    if oid not in id_to_local_col:
-                        continue
-                    occ_matrix[pidx, id_to_local_col[oid]] = float(v)
+                    patch_occ = patch.get("occupancy", {})
+                    for k, v in patch_occ.items():
+                        try:
+                            oid = int(k)
+                        except Exception:
+                            continue
+                        if oid not in id_to_union_col:
+                            continue
+                        occ_matrix_union[pidx, id_to_union_col[oid]] = float(v)
 
-            occ_sum_local = occ_matrix.sum(dim=0)
-            valid_local = occ_sum_local > 0
-            if not valid_local.any():
-                continue
-
-            occ_valid = occ_matrix[:, valid_local]
-            occ_sum_valid = occ_sum_local[valid_local]
-            z_local = (occ_valid.T @ projected_patch_feats[fidx]) / (occ_sum_valid[:, None] + eps)
+            occ_sum_union = occ_matrix_union.sum(dim=0)
+            valid_union = occ_sum_union > 0
+            z_local = (occ_matrix_union.T @ projected_patch_feats[fidx]) / (occ_sum_union[:, None] + eps)
+            if not _object_norm_logged:
+                rlog(f"PARAM_USE step={global_step} module=occupancy_object_norm used=1")
+                used_obj_norm = True
             z_local = self.model.occupancy_object_norm(z_local)
+            if not _object_norm_logged:
+                _object_norm_logged = True
 
-            kept_local_ids = [detected_ids[j] for j, is_valid in enumerate(valid_local.tolist()) if is_valid]
-            union_cols = torch.tensor([id_to_union_col[oid] for oid in kept_local_ids], device=device, dtype=torch.long)
+            z_frame = torch.where(valid_union[:, None], z_local, torch.zeros_like(z_local))
+            present_frame = valid_union.to(dtype=torch.bool)
 
-            z_raw[fidx, union_cols, :] = z_local
-            den[fidx, union_cols] = occ_sum_valid
-            present[fidx, union_cols] = True
+            if valid_union.any():
+                valid_frame_count += 1
+            z_frames.append(z_frame)
+            present_frames.append(present_frame)
+
+        object_embeddings = torch.stack(z_frames, dim=0)
+        present = torch.stack(present_frames, dim=0)
+
+        if valid_frame_count == 0:
+            if first_extract_fail is None:
+                first_extract_fail = "no_valid_frames"
+            rlog(f"OCC_DECISION step={global_step} fn=extract guard=no_valid_frames pass=0")
 
         self._log_occ_cuda_memory(f"aux_after_object_embeddings T={T} P={P} O={O} Dp={Dp}")
 
@@ -2363,7 +2500,7 @@ class Ross3DMetaForCausalLM(ABC):
             obj_cat_ids.append(label_to_cat_id[label])
 
         outputs = {
-            "object_embeddings": z_raw,
+            "object_embeddings": object_embeddings,
             "present": present,
         }
         if need_patch_embeddings:
@@ -2375,6 +2512,10 @@ class Ross3DMetaForCausalLM(ABC):
             outputs["scene_id"] = scene_id
         if need_temp_metadata:
             outputs["obj_cat_ids_union"] = torch.tensor(obj_cat_ids, device=device, dtype=torch.long)
+        setattr(self, "_occ_dbg_extract_return_reason", None)
+        setattr(self, "_occ_dbg_used_patch_proj", bool(used_patch_proj))
+        setattr(self, "_occ_dbg_used_obj_norm", bool(used_obj_norm))
+        rlog(f"FIRST_FAIL step={global_step} fn=extract first_fail={first_extract_fail or 'none'}")
         return outputs
 
     @torch._dynamo.disable
@@ -2548,11 +2689,15 @@ class Ross3DMetaForCausalLM(ABC):
         giou = iou - (c_area - union) / (c_area + eps)
         return giou
 
+    @torch._dynamo.disable
     def compute_occupancy_geometry_loss(
         self,
         occupancy_aux_outputs: Dict[str, Any],
         video_dict: Dict[str, Any],
+        global_step: Optional[int] = "NA",
     ) -> torch.Tensor:
+        first_geom_fail = None
+        used_geom_any = False
         if not all(
             hasattr(self.model, name)
             for name in [
@@ -2565,9 +2710,32 @@ class Ross3DMetaForCausalLM(ABC):
                 "occ_geom_vis_head",
             ]
         ):
+            first_geom_fail = "module_set_available"
+            for _m in [
+                "occ_geom_patch_norm", "occ_geom_obj_query", "occ_geom_relation",
+                "occ_geom_mask_head", "occ_geom_center_head", "occ_geom_size_head", "occ_geom_vis_head"
+            ]:
+                rlog(f"PARAM_USE step={global_step} module={_m} used=0 reason=missing_module")
+            rlog(f"OCC_DECISION step={global_step} fn=geom guard=module_set_available pass=0")
+            setattr(self, "_occ_dbg_geom_return_reason", "missing_module")
+            setattr(self, "_occ_dbg_used_geom_any", False)
+            rlog(f"FIRST_FAIL step={global_step} fn=geom first_fail={first_geom_fail or 'none'}")
             return torch.zeros((), device=self.device if hasattr(self, "device") else None)
+        rlog(f"OCC_DECISION step={global_step} fn=geom guard=module_set_available pass=1")
         if occupancy_aux_outputs is None or video_dict is None:
+            if first_geom_fail is None:
+                first_geom_fail = "has_inputs"
+            for _m in [
+                "occ_geom_patch_norm", "occ_geom_obj_query", "occ_geom_relation",
+                "occ_geom_mask_head", "occ_geom_center_head", "occ_geom_size_head", "occ_geom_vis_head"
+            ]:
+                rlog(f"PARAM_USE step={global_step} module={_m} used=0 reason=missing_inputs")
+            rlog(f"OCC_DECISION step={global_step} fn=geom guard=has_inputs pass=0")
+            setattr(self, "_occ_dbg_geom_return_reason", "missing_inputs")
+            setattr(self, "_occ_dbg_used_geom_any", False)
+            rlog(f"FIRST_FAIL step={global_step} fn=geom first_fail={first_geom_fail or 'none'}")
             return torch.zeros((), device=self.device if hasattr(self, "device") else None)
+        rlog(f"OCC_DECISION step={global_step} fn=geom guard=has_inputs pass=1")
 
         X = occupancy_aux_outputs.get("patch_embeddings", None)
         E = occupancy_aux_outputs.get("object_embeddings", None)
@@ -2576,10 +2744,22 @@ class Ross3DMetaForCausalLM(ABC):
         frame_ids = occupancy_aux_outputs.get("frame_ids", None)
 
         if X is None or E is None or obj_ids_union is None or present is None:
+            if first_geom_fail is None:
+                first_geom_fail = "has_aux_tensors"
+            for _m in [
+                "occ_geom_patch_norm", "occ_geom_obj_query", "occ_geom_relation",
+                "occ_geom_mask_head", "occ_geom_center_head", "occ_geom_size_head", "occ_geom_vis_head"
+            ]:
+                rlog(f"PARAM_USE step={global_step} module={_m} used=0 reason=missing_aux_tensors")
+            rlog(f"OCC_DECISION step={global_step} fn=geom guard=has_aux_tensors pass=0")
+            setattr(self, "_occ_dbg_geom_return_reason", "missing_aux_tensors")
+            setattr(self, "_occ_dbg_used_geom_any", False)
+            rlog(f"FIRST_FAIL step={global_step} fn=geom first_fail={first_geom_fail or 'none'}")
             ref = X if X is not None else E
             if ref is None:
                 return torch.zeros(())
             return torch.zeros((), device=ref.device, dtype=ref.dtype)
+        rlog(f"OCC_DECISION step={global_step} fn=geom guard=has_aux_tensors pass=1")
 
         device = X.device
         dtype = X.dtype
@@ -2587,7 +2767,19 @@ class Ross3DMetaForCausalLM(ABC):
         patch_occupancy = video_dict.get("patch_occupancy", None)
         visible_bboxes = video_dict.get("visible_bboxes", None)
         if patch_occupancy is None or visible_bboxes is None:
+            if first_geom_fail is None:
+                first_geom_fail = "has_targets"
+            for _m in [
+                "occ_geom_patch_norm", "occ_geom_obj_query", "occ_geom_relation",
+                "occ_geom_mask_head", "occ_geom_center_head", "occ_geom_size_head", "occ_geom_vis_head"
+            ]:
+                rlog(f"PARAM_USE step={global_step} module={_m} used=0 reason=missing_targets")
+            rlog(f"OCC_DECISION step={global_step} fn=geom guard=has_targets pass=0")
+            setattr(self, "_occ_dbg_geom_return_reason", "missing_targets")
+            setattr(self, "_occ_dbg_used_geom_any", False)
+            rlog(f"FIRST_FAIL step={global_step} fn=geom first_fail={first_geom_fail or 'none'}")
             return torch.zeros((), device=device, dtype=dtype)
+        rlog(f"OCC_DECISION step={global_step} fn=geom guard=has_targets pass=1")
 
         T, P, Dp = X.shape
         assert len(patch_occupancy) == T, "patch_occupancy length must match T"
@@ -2604,6 +2796,7 @@ class Ross3DMetaForCausalLM(ABC):
         ctr_loss_sum = torch.zeros((), device=device, dtype=dtype)
         vis_loss_sum = torch.zeros((), device=device, dtype=dtype)
         mask_count = box_count = ctr_count = vis_count = 0
+        _geom_use_logged = False
         self._log_occ_cuda_memory(f"geom_start T={T} P={P} O={int(E.shape[1])} Dp={Dp}")
 
         for f in range(T):
@@ -2661,6 +2854,14 @@ class Ross3DMetaForCausalLM(ABC):
 
             union_cols_t = torch.tensor(union_cols, device=device, dtype=torch.long)
             x_f = X[f]
+            if not _geom_use_logged:
+                for _m in [
+                    "occ_geom_patch_norm", "occ_geom_obj_query", "occ_geom_relation",
+                    "occ_geom_mask_head", "occ_geom_center_head", "occ_geom_size_head", "occ_geom_vis_head"
+                ]:
+                    rlog(f"PARAM_USE step={global_step} module={_m} used=1")
+                _geom_use_logged = True
+                used_geom_any = True
             x_feat = self.model.occ_geom_patch_norm(x_f)
             with torch.no_grad():
                 target_boxes_t = torch.tensor(tgt_boxes, device=device, dtype=dtype)
@@ -2758,7 +2959,20 @@ class Ross3DMetaForCausalLM(ABC):
                         ctr_count += 1
 
         if mask_count == 0 and box_count == 0 and ctr_count == 0 and vis_count == 0:
+            if first_geom_fail is None:
+                first_geom_fail = "has_valid_targets"
+            if not _geom_use_logged:
+                for _m in [
+                    "occ_geom_patch_norm", "occ_geom_obj_query", "occ_geom_relation",
+                    "occ_geom_mask_head", "occ_geom_center_head", "occ_geom_size_head", "occ_geom_vis_head"
+                ]:
+                    rlog(f"PARAM_USE step={global_step} module={_m} used=0 reason=no_valid_targets")
+            rlog(f"OCC_DECISION step={global_step} fn=geom guard=has_valid_targets pass=0")
+            setattr(self, "_occ_dbg_geom_return_reason", "no_valid_targets")
+            setattr(self, "_occ_dbg_used_geom_any", bool(used_geom_any))
+            rlog(f"FIRST_FAIL step={global_step} fn=geom first_fail={first_geom_fail or 'none'}")
             return torch.zeros((), device=device, dtype=dtype)
+        rlog(f"OCC_DECISION step={global_step} fn=geom guard=has_valid_targets pass=1")
 
         loss_mask = mask_loss_sum / max(mask_count, 1)
         loss_box = box_loss_sum / max(box_count, 1)
@@ -2772,58 +2986,136 @@ class Ross3DMetaForCausalLM(ABC):
             + float(getattr(self.config, "occ_geom_vis_weight", 1.0)) * loss_vis
         )
         self._log_occ_cuda_memory("geom_end")
+        setattr(self, "_occ_dbg_geom_return_reason", None)
+        setattr(self, "_occ_dbg_used_geom_any", bool(used_geom_any))
+        rlog(f"FIRST_FAIL step={global_step} fn=geom first_fail={first_geom_fail or 'none'}")
         return geom_loss.float()
 
+    @torch._dynamo.disable
     def compute_occupancy_temporal_loss(
         self,
         occupancy_aux_outputs: Dict[str, Any],
+        global_step: Optional[int] = "NA",
     ) -> torch.Tensor:
+        first_temp_fail = None
+        used_temp_proj = False
         if not hasattr(self.model, "occ_temp_projector"):
+            first_temp_fail = "has_module"
+            rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=0 reason=missing_module")
+            rlog(f"OCC_DECISION step={global_step} fn=temp guard=has_module pass=0")
+            setattr(self, "_occ_dbg_temp_return_reason", "missing_module")
+            setattr(self, "_occ_dbg_used_temp_proj", False)
+            rlog(f"FIRST_FAIL step={global_step} fn=temp first_fail={first_temp_fail or 'none'}")
             return torch.zeros(())
+        rlog(f"OCC_DECISION step={global_step} fn=temp guard=has_module pass=1")
         if occupancy_aux_outputs is None:
+            if first_temp_fail is None:
+                first_temp_fail = "has_inputs"
+            rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=0 reason=missing_inputs")
+            rlog(f"OCC_DECISION step={global_step} fn=temp guard=has_inputs pass=0")
+            setattr(self, "_occ_dbg_temp_return_reason", "missing_inputs")
+            setattr(self, "_occ_dbg_used_temp_proj", False)
+            rlog(f"FIRST_FAIL step={global_step} fn=temp first_fail={first_temp_fail or 'none'}")
             return torch.zeros(())
+        rlog(f"OCC_DECISION step={global_step} fn=temp guard=has_inputs pass=1")
 
         Z = occupancy_aux_outputs.get("object_embeddings", None)
         present = occupancy_aux_outputs.get("present", None)
         obj_cat_ids_union = occupancy_aux_outputs.get("obj_cat_ids_union", None)
         if Z is None or present is None or obj_cat_ids_union is None:
+            if first_temp_fail is None:
+                first_temp_fail = "has_aux_tensors"
+            rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=0 reason=missing_aux_tensors")
+            rlog(f"OCC_DECISION step={global_step} fn=temp guard=has_aux_tensors pass=0")
+            setattr(self, "_occ_dbg_temp_return_reason", "missing_aux_tensors")
+            setattr(self, "_occ_dbg_used_temp_proj", False)
+            rlog(f"FIRST_FAIL step={global_step} fn=temp first_fail={first_temp_fail or 'none'}")
             ref = Z if Z is not None else present
             if ref is None:
                 return torch.zeros(())
             return torch.zeros((), device=ref.device, dtype=ref.dtype if hasattr(ref, 'dtype') else torch.float32)
+        rlog(f"OCC_DECISION step={global_step} fn=temp guard=has_aux_tensors pass=1")
 
         device = Z.device
         dtype = Z.dtype
         if Z.shape[:2] != present.shape:
+            if first_temp_fail is None:
+                first_temp_fail = "shape_match"
+            rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=0 reason=shape_mismatch")
+            rlog(f"OCC_DECISION step={global_step} fn=temp guard=shape_match pass=0")
+            setattr(self, "_occ_dbg_temp_return_reason", "shape_mismatch")
+            setattr(self, "_occ_dbg_used_temp_proj", False)
+            rlog(f"FIRST_FAIL step={global_step} fn=temp first_fail={first_temp_fail or 'none'}")
             return torch.zeros((), device=device, dtype=dtype)
+        rlog(f"OCC_DECISION step={global_step} fn=temp guard=shape_match pass=1")
 
         T, O, _ = Z.shape
         if T < 2 or O == 0:
+            if first_temp_fail is None:
+                first_temp_fail = "has_min_frames_and_objects"
+            rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=0 reason=insufficient_frames_or_objects")
+            rlog(f"OCC_DECISION step={global_step} fn=temp guard=has_min_frames_and_objects pass=0")
+            setattr(self, "_occ_dbg_temp_return_reason", "insufficient_frames_or_objects")
+            setattr(self, "_occ_dbg_used_temp_proj", False)
+            rlog(f"FIRST_FAIL step={global_step} fn=temp first_fail={first_temp_fail or 'none'}")
             return torch.zeros((), device=device, dtype=dtype)
+        rlog(f"OCC_DECISION step={global_step} fn=temp guard=has_min_frames_and_objects pass=1")
         if obj_cat_ids_union.shape[0] != O:
+            if first_temp_fail is None:
+                first_temp_fail = "category_shape_match"
+            rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=0 reason=category_shape_mismatch")
+            rlog(f"OCC_DECISION step={global_step} fn=temp guard=category_shape_match pass=0")
+            setattr(self, "_occ_dbg_temp_return_reason", "category_shape_mismatch")
+            setattr(self, "_occ_dbg_used_temp_proj", False)
+            rlog(f"FIRST_FAIL step={global_step} fn=temp first_fail={first_temp_fail or 'none'}")
             return torch.zeros((), device=device, dtype=dtype)
+        rlog(f"OCC_DECISION step={global_step} fn=temp guard=category_shape_match pass=1")
 
         same_min = float(getattr(self.config, "occ_temp_same_min_margin", 0.10))
         same_max = float(getattr(self.config, "occ_temp_same_max_margin", 0.25))
         diff_margin = float(getattr(self.config, "occ_temp_diff_margin", 0.30))
         if not (diff_margin > same_max > same_min > 0.0):
+            if first_temp_fail is None:
+                first_temp_fail = "margin_config_valid"
+            rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=0 reason=invalid_margins")
+            rlog(f"OCC_DECISION step={global_step} fn=temp guard=margin_config_valid pass=0")
+            setattr(self, "_occ_dbg_temp_return_reason", "invalid_margins")
+            setattr(self, "_occ_dbg_used_temp_proj", False)
+            rlog(f"FIRST_FAIL step={global_step} fn=temp first_fail={first_temp_fail or 'none'}")
             return torch.zeros((), device=device, dtype=dtype)
+        rlog(f"OCC_DECISION step={global_step} fn=temp guard=margin_config_valid pass=1")
 
         min_frames = int(getattr(self.config, "occ_temp_min_frames", 2))
         eps = float(getattr(self.config, "occ_temp_eps", 1e-6))
 
+        rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=1")
+        used_temp_proj = True
         U = self.model.occ_temp_projector(Z)
         U = F.normalize(U, dim=-1)
         self._log_occ_cuda_memory(f"temp_after_projector T={T} O={O}")
 
         counts = present.long().sum(dim=0)
         if counts.shape[0] != O:
+            if first_temp_fail is None:
+                first_temp_fail = "count_shape_match"
+            rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=0 reason=count_shape_mismatch")
+            setattr(self, "_occ_dbg_temp_return_reason", "count_shape_mismatch")
+            setattr(self, "_occ_dbg_used_temp_proj", bool(used_temp_proj))
+            rlog(f"FIRST_FAIL step={global_step} fn=temp first_fail={first_temp_fail or 'none'}")
             return torch.zeros((), device=device, dtype=dtype)
 
         valid_anchor_obj = counts >= min_frames
         valid_proto_obj = counts >= 1
         if not valid_anchor_obj.any():
+            if first_temp_fail is None:
+                first_temp_fail = "has_valid_anchors"
+            rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=0 reason=no_valid_anchors")
+            rlog(f"OCC_DECISION step={global_step} fn=temp guard=has_valid_anchors pass=0")
+            setattr(self, "_occ_dbg_temp_return_reason", "no_valid_anchors")
+            setattr(self, "_occ_dbg_used_temp_proj", bool(used_temp_proj))
+            rlog(f"FIRST_FAIL step={global_step} fn=temp first_fail={first_temp_fail or 'none'}")
             return torch.zeros((), device=device, dtype=dtype)
+        rlog(f"OCC_DECISION step={global_step} fn=temp guard=has_valid_anchors pass=1")
 
         present_f = present.unsqueeze(-1).to(U.dtype)
         sum_u = (U * present_f).sum(dim=0)
@@ -2882,8 +3174,16 @@ class Ross3DMetaForCausalLM(ABC):
                 anchor_count += 1
 
         if anchor_count == 0:
+            if first_temp_fail is None:
+                first_temp_fail = "anchor_count_nonzero"
+            setattr(self, "_occ_dbg_temp_return_reason", "anchor_count_zero")
+            setattr(self, "_occ_dbg_used_temp_proj", bool(used_temp_proj))
+            rlog(f"FIRST_FAIL step={global_step} fn=temp first_fail={first_temp_fail or 'none'}")
             return torch.zeros((), device=device, dtype=dtype)
         self._log_occ_cuda_memory(f"temp_end anchor_count={anchor_count}")
+        setattr(self, "_occ_dbg_temp_return_reason", None)
+        setattr(self, "_occ_dbg_used_temp_proj", bool(used_temp_proj))
+        rlog(f"FIRST_FAIL step={global_step} fn=temp first_fail={first_temp_fail or 'none'}")
         return (loss_sum / float(anchor_count)).float()
 
     def compute_vm_loss(
@@ -3122,6 +3422,7 @@ class Ross3DMetaForCausalLM(ABC):
 
 
     # Hanwliu
+    @torch._dynamo.disable
     def compute_cycle_consistency_loss(
         self,
         hidden_states: torch.Tensor,
@@ -3436,6 +3737,7 @@ class Ross3DMetaForCausalLM(ABC):
         loss = -torch.log(diag + eps).mean()
         return loss
 
+    @torch._dynamo.disable
     def compute_cycle_consistency_loss_v2(
         self,
         hidden_states: torch.Tensor,

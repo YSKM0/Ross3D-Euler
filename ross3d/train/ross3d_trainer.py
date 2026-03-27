@@ -10,7 +10,21 @@ from accelerate.utils import InitProcessGroupKwargs, GradientAccumulationPlugin
 from torch.utils.data import Dataset, Sampler, DataLoader
 
 from transformers import Trainer
-from transformers.trainer import is_sagemaker_mp_enabled, get_parameter_names, has_length, ALL_LAYERNORM_LAYERS, logger, is_accelerate_available, is_datasets_available, GradientAccumulationPlugin
+from transformers.trainer import (
+    is_sagemaker_mp_enabled,
+    get_parameter_names,
+    has_length,
+    ALL_LAYERNORM_LAYERS,
+    logger,
+    is_accelerate_available,
+    is_datasets_available,
+    is_xpu_available,
+    is_mlu_available,
+    is_npu_available,
+    is_torch_version,
+    is_mps_available,
+    OptimizerNames,
+)
 from transformers.trainer_utils import seed_worker
 from transformers.trainer_pt_utils import get_length_grouped_indices as get_length_grouped_indices_hf
 from transformers.trainer_pt_utils import AcceleratorConfig
@@ -20,6 +34,14 @@ from datetime import timedelta
 from pathlib import Path
 
 from ross3d.utils import rank0_print
+def rlog(msg):
+    if os.getenv("ROSS3D_RLOG_DEBUG", "0") != "1":
+        return
+    if torch._dynamo.is_compiling():
+        return
+    import torch.distributed as dist
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    print(f"[RANK {rank}] {msg}", flush=True)
 
 
 if is_accelerate_available():
@@ -321,6 +343,104 @@ class LengthGroupedSampler(Sampler):
 
 
 class Ross3DTrainer(Trainer):
+    def _maybe_install_backward_markers(self) -> None:
+        if getattr(self, "_rlog_backward_wrapped", False):
+            return
+        accelerator = getattr(self, "accelerator", None)
+        if accelerator is None or not hasattr(accelerator, "backward"):
+            return
+        orig_backward = accelerator.backward
+
+        def _wrapped_backward(*args, **kwargs):
+            rlog("BEFORE_BACKWARD")
+            out = orig_backward(*args, **kwargs)
+            rlog("AFTER_BACKWARD")
+            return out
+
+        accelerator.backward = _wrapped_backward
+        self._rlog_backward_wrapped = True
+
+    def _maybe_install_occ_grad_hooks(self) -> None:
+        if getattr(self, "_occ_hook_installed", False):
+            return
+        model = getattr(self, "model", None)
+        if model is None:
+            return
+        targets = {
+            "occupancy_patch_projector": "occ_patch_proj",
+            "occupancy_object_norm": "occ_obj_norm",
+            "occ_temp_projector": "occ_temp_proj",
+        }
+        self._occ_hook_fired = {v: 0 for v in targets.values()}
+        self._occ_hook_handles = []
+
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            for token, short_name in targets.items():
+                if token in name and short_name not in getattr(self, "_occ_hook_target_names", {}):
+                    if not hasattr(self, "_occ_hook_target_names"):
+                        self._occ_hook_target_names = {}
+                    self._occ_hook_target_names[short_name] = name
+
+                    def _make_hook(key):
+                        def _hook(_grad):
+                            self._occ_hook_fired[key] = 1
+                            return _grad
+                        return _hook
+
+                    self._occ_hook_handles.append(param.register_hook(_make_hook(short_name)))
+        self._occ_hook_installed = True
+
+    def _reset_occ_hook_fired(self) -> None:
+        if hasattr(self, "_occ_hook_fired"):
+            for key in self._occ_hook_fired:
+                self._occ_hook_fired[key] = 0
+
+    def _log_occ_hook_summary(self) -> None:
+        if os.getenv("ROSS3D_RLOG_DEBUG", "0") != "1":
+            return
+        step = int(getattr(self.state, "global_step", -1))
+        max_steps = int(os.getenv("ROSS3D_OCC_HOOK_STEPS", "20"))
+        if step >= max_steps:
+            return
+        fired = getattr(self, "_occ_hook_fired", {})
+        patch = int(fired.get("occ_patch_proj", 0))
+        norm = int(fired.get("occ_obj_norm", 0))
+        temp = int(fired.get("occ_temp_proj", 0))
+        rlog(f"OCC_HOOKS step={step} patch_proj={patch} obj_norm={norm} temp_proj={temp}")
+
+    def _log_suspect_module_grad_presence(self, tag: str) -> None:
+        if os.getenv("ROSS3D_RLOG_DEBUG", "0") != "1":
+            return
+        model = getattr(self, "model", None)
+        if model is None:
+            return
+        step = int(getattr(self.state, "global_step", -1))
+        max_steps = int(os.getenv("ROSS3D_GRAD_PRESENCE_STEPS", "10"))
+        if step >= max_steps:
+            return
+        suspects = [
+            "occupancy_patch_projector",
+            "occupancy_object_norm",
+            "occ_temp_projector",
+            "mm_inv_projector",
+            "mm_projector",
+            "vision_resampler",
+            "ground_head",
+        ]
+        status = {}
+        for name, param in model.named_parameters():
+            for key in suspects:
+                if key in name:
+                    prev = status.get(key, 0)
+                    if param.grad is not None:
+                        status[key] = 1
+                    elif key not in status:
+                        status[key] = prev
+        compact = " ".join(f"{k}={status.get(k, 0)}" for k in suspects)
+        rlog(f"GRAD_PRESENCE tag={tag} step={step} {compact}")
+
     def _maybe_init_cycle_grad_debug(self):
         model = getattr(self, "model", None)
         if model is None:
@@ -696,6 +816,17 @@ class Ross3DTrainer(Trainer):
 
             optimizer.zero_grad = _opt_zero_grad_wrapper
 
+        if optimizer is not None and hasattr(optimizer, "step"):
+            orig_opt_step = optimizer.step
+
+            def _opt_step_wrapper(*args, **kwargs):
+                rlog("BEFORE_OPTIM")
+                out = orig_opt_step(*args, **kwargs)
+                rlog("AFTER_OPTIM")
+                return out
+
+            optimizer.step = _opt_step_wrapper
+
         if model is not None and hasattr(model, "zero_grad"):
             orig_model_zero_grad = model.zero_grad
 
@@ -736,76 +867,17 @@ class Ross3DTrainer(Trainer):
         self._nan_debug_zero_grad_hooks_installed = True
 
     def training_step(self, model, inputs):
-        self._nan_guard_total_steps = int(getattr(self, "_nan_guard_total_steps", 0)) + 1
-        self._maybe_run_inplace_stale_state_audit()
+        rlog("STEP_START")
+        self._maybe_install_backward_markers()
+        self._maybe_install_occ_grad_hooks()
+        self._reset_occ_hook_fired()
         self._maybe_install_zero_grad_debug_hooks()
         self._maybe_install_target_grad_hooks()
-        self._audit_model_special_params("before_first_batch_forward")
-        self._log_target_finiteness_boundary("forward_entry")
-        if os.getenv("ROSS3D_MANUAL_ONE_BATCH_DEBUG", "0") == "1":
-            if not bool(getattr(self, "_nan_debug_manual_one_batch_done", False)):
-                self._nan_debug_manual_one_batch_done = True
-                manual_loss = self._manual_one_batch_root_cause_pass(model, inputs)
-                if os.getenv("ROSS3D_MANUAL_ONE_BATCH_STOP", "1") == "1":
-                    raise RuntimeError("[NAN_DEBUG] manual one-batch root-cause pass completed; stopping by request")
-                if manual_loss is not None:
-                    return manual_loss
-        self._maybe_freeze_nan_debug_modules()
         self._maybe_init_param_ready_debug()
         self._maybe_init_cycle_grad_debug()
-        if hasattr(self, "_param_ready_counts"):
-            for name in self._param_ready_counts:
-                self._param_ready_counts[name] = 0
-        if hasattr(self, "_cycle_grad_seen"):
-            self._cycle_grad_seen = False
-        before_snapshot = None
-        if os.getenv("ROSS3D_SKIP_OPT_STEP", "0") == "1" and os.getenv("ROSS3D_NAN_DEBUG", "0") == "1":
-            before_snapshot = self._capture_target_param_snapshot()
-        self._log_cuda_memory("before_training_step")
-        anomaly_enabled = os.getenv("ROSS3D_AUTOGRAD_ANOMALY", "0") == "1"
-        if self._nan_debug_rank0_enabled():
-            rank0_print(f"[NAN_DEBUG][anomaly_mode] enabled={anomaly_enabled}")
-        if anomaly_enabled:
-            with torch.autograd.set_detect_anomaly(True):
-                loss = super().training_step(model, inputs)
-            if autograd_one:
-                self._nan_debug_one_batch_anomaly_done = True
-            if mm_anomaly_one:
-                self._nan_debug_mm_anomaly_done = True
-        else:
-            loss = super().training_step(model, inputs)
-        self._log_target_finiteness_boundary("after_backward_raw")
-        nonfinite_guard = self._check_nonfinite_grads_after_backward_and_guard()
-        if self._nan_debug_rank0_enabled():
-            rank0_print(f"[NAN_DEBUG][after_backward] guard_nonfinite_detected={nonfinite_guard}")
-        self._audit_model_special_params("after_first_backward")
-        self._log_target_finiteness_boundary("after_backward")
-        self._check_named_params_finiteness(model.named_parameters(), "after_backward")
-        self._log_target_param_stats(model.named_parameters(), "after_backward")
-        if before_snapshot is not None:
-            self._log_target_param_mutation(before_snapshot, "after_backward")
-        self._log_cuda_memory("after_training_step")
-        self._log_grad_stats("after_training_step")
-        if hasattr(self, "_param_ready_counts") and self._param_ready_counts:
-            repeated = [name for name, count in self._param_ready_counts.items() if count > 1]
-            if repeated:
-                repeated_preview = ", ".join(repeated[:5])
-                rank0_print(
-                    "[checkpoint-debug] parameters with multiple grad hooks in step "
-                    f"{self.state.global_step}: {repeated_preview}"
-                )
-        if (
-            hasattr(self, "_cycle_grad_seen")
-            and getattr(getattr(self.model, "config", None), "cycle_debug_grad", False)
-        ):
-            rank0_print(
-                "[cycle_debug] "
-                f"step={self.state.global_step} "
-                f"cycle_loss_active={getattr(self, '_cycle_loss_active', False)} "
-                f"llm_grad_seen={self._cycle_grad_seen} "
-                f"param={getattr(self, '_cycle_grad_param', 'n/a')}"
-            )
-        self._log_target_finiteness_boundary("before_dataloader_next_batch")
+        loss = super().training_step(model, inputs)
+        self._log_occ_hook_summary()
+        self._log_suspect_module_grad_presence("after_backward")
         return loss
 
     def _capture_target_param_snapshot(self):
@@ -1752,12 +1824,15 @@ class Ross3DTrainer(Trainer):
         else:
             labels = None
         inputs["global_step"] = self.state.global_step
+        rlog("BEFORE_FORWARD")
         outputs = model(**inputs)
+        rlog("AFTER_FORWARD")
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.
         if self.args.past_index >= 0:
             self._past = outputs[self.args.past_index]
 
+        rlog("BEFORE_LOSS")
         if labels is not None:
             unwrapped_model = self.accelerator.unwrap_model(model)
             if _is_peft_model(unwrapped_model):
@@ -1777,4 +1852,5 @@ class Ross3DTrainer(Trainer):
             # We don't use .loss here since the model may return tuples instead of ModelOutput.
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
 
+        rlog("AFTER_LOSS")
         return (loss, outputs) if return_outputs else loss
