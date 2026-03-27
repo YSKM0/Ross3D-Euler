@@ -2536,29 +2536,47 @@ class Ross3DMetaForCausalLM(ABC):
             f"max_allocated={max_alloc:.2f}GB"
         )
 
-    def _build_patch_centers_normalized(self, occ_anno: Dict[str, Any], device, dtype) -> torch.Tensor:
+    def _build_patch_centers_normalized(
+        self,
+        occ_anno: Dict[str, Any],
+        device,
+        dtype,
+        target_grid: Optional[Tuple[int, int]] = None,
+    ) -> torch.Tensor:
         preprocess = occ_anno.get("vision_tower_preprocess", {})
         grid = preprocess.get("grid", None)
         if grid is None:
             raise ValueError("Missing vision_tower_preprocess.grid in occupancy annotation.")
-        H, W = int(grid[0]), int(grid[1])
+        src_h, src_w = int(grid[0]), int(grid[1])
+        if target_grid is None:
+            H, W = src_h, src_w
+        else:
+            H, W = int(target_grid[0]), int(target_grid[1])
         patches = occ_anno.get("patches", [])
         P = H * W
         patch_centers = torch.zeros((P, 2), device=device, dtype=dtype)
-        for patch in patches:
-            pidx = int(patch.get("patch_index", -1))
-            if pidx < 0 or pidx >= P:
-                continue
-            row = int(patch.get("row", pidx // W))
-            col = int(patch.get("col", pidx % W))
-            patch_centers[pidx, 0] = (col + 0.5) / float(W)
-            patch_centers[pidx, 1] = (row + 0.5) / float(H)
-        if len(patches) == 0:
-            rows = torch.arange(H, device=device, dtype=dtype)
-            cols = torch.arange(W, device=device, dtype=dtype)
-            rr, cc = torch.meshgrid(rows, cols, indexing="ij")
-            patch_centers[:, 0] = (cc.reshape(-1) + 0.5) / float(W)
-            patch_centers[:, 1] = (rr.reshape(-1) + 0.5) / float(H)
+        if target_grid is None:
+            for patch in patches:
+                pidx = int(patch.get("patch_index", -1))
+                if pidx < 0 or pidx >= P:
+                    continue
+                row = int(patch.get("row", pidx // W))
+                col = int(patch.get("col", pidx % W))
+                patch_centers[pidx, 0] = (col + 0.5) / float(W)
+                patch_centers[pidx, 1] = (row + 0.5) / float(H)
+            if len(patches) == 0:
+                rows = torch.arange(H, device=device, dtype=dtype)
+                cols = torch.arange(W, device=device, dtype=dtype)
+                rr, cc = torch.meshgrid(rows, cols, indexing="ij")
+                patch_centers[:, 0] = (cc.reshape(-1) + 0.5) / float(W)
+                patch_centers[:, 1] = (rr.reshape(-1) + 0.5) / float(H)
+            return patch_centers
+
+        rows = torch.arange(H, device=device, dtype=dtype)
+        cols = torch.arange(W, device=device, dtype=dtype)
+        rr, cc = torch.meshgrid(rows, cols, indexing="ij")
+        patch_centers[:, 0] = (cc.reshape(-1) + 0.5) / float(W)
+        patch_centers[:, 1] = (rr.reshape(-1) + 0.5) / float(H)
         return patch_centers
 
     def _convert_visible_bbox_to_geom_target(self, vis_obj: Dict[str, Any], vis_anno: Dict[str, Any], occ_anno: Dict[str, Any]):
@@ -2570,6 +2588,8 @@ class Ross3DMetaForCausalLM(ABC):
             return None, None, None
 
         preprocess = occ_anno.get("vision_tower_preprocess", {})
+        if not preprocess and isinstance(vis_anno, dict):
+            preprocess = vis_anno.get("vision_tower_preprocess", {})
         resize = preprocess.get("resize", None)
         grid = preprocess.get("grid", None)
         if resize is None or grid is None:
@@ -2612,12 +2632,23 @@ class Ross3DMetaForCausalLM(ABC):
         center_visible = bool(vis_obj.get("projected_center_in_bbox", False))
         return [x1n, y1n, x2n, y2n], center_norm, center_visible
 
-    def _build_frame_object_occupancy_targets(self, occ_anno: Dict[str, Any], obj_ids_union: torch.Tensor, device, dtype) -> torch.Tensor:
+    def _build_frame_object_occupancy_targets(
+        self,
+        occ_anno: Dict[str, Any],
+        obj_ids_union: torch.Tensor,
+        device,
+        dtype,
+        target_grid: Optional[Tuple[int, int]] = None,
+    ) -> torch.Tensor:
         preprocess = occ_anno.get("vision_tower_preprocess", {})
         grid = preprocess.get("grid", None)
         if grid is None:
             raise ValueError("Missing vision_tower_preprocess.grid in occupancy annotation.")
-        H, W = int(grid[0]), int(grid[1])
+        src_h, src_w = int(grid[0]), int(grid[1])
+        if target_grid is None:
+            H, W = src_h, src_w
+        else:
+            H, W = int(target_grid[0]), int(target_grid[1])
         P = H * W
         O = int(obj_ids_union.shape[0])
         occ_target = torch.zeros((P, O), device=device, dtype=dtype)
@@ -2643,9 +2674,21 @@ class Ross3DMetaForCausalLM(ABC):
 
         rows, cols, vals = [], [], []
         for patch in occ_anno.get("patches", []):
-            pidx = int(patch.get("patch_index", -1))
-            if pidx < 0 or pidx >= P:
-                continue
+            src_pidx = int(patch.get("patch_index", -1))
+            src_row = int(patch.get("row", src_pidx // max(src_w, 1)))
+            src_col = int(patch.get("col", src_pidx % max(src_w, 1)))
+            if target_grid is None:
+                pidx = src_pidx
+                if pidx < 0 or pidx >= P:
+                    continue
+            else:
+                if src_row < 0 or src_row >= src_h or src_col < 0 or src_col >= src_w:
+                    continue
+                cx = (src_col + 0.5) / float(src_w)
+                cy = (src_row + 0.5) / float(src_h)
+                tgt_col = min(max(int(cx * W), 0), W - 1)
+                tgt_row = min(max(int(cy * H), 0), H - 1)
+                pidx = tgt_row * W + tgt_col
             patch_occ = patch.get("occupancy", {})
             for k, v in patch_occ.items():
                 try:
@@ -2662,7 +2705,7 @@ class Ross3DMetaForCausalLM(ABC):
             row_t = torch.tensor(rows, device=device, dtype=torch.long)
             col_t = torch.tensor(cols, device=device, dtype=torch.long)
             val_t = torch.tensor(vals, device=device, dtype=dtype)
-            occ_target[row_t, col_t] = val_t
+            occ_target.index_put_((row_t, col_t), val_t, accumulate=False)
 
         return occ_target
 
@@ -2696,6 +2739,59 @@ class Ross3DMetaForCausalLM(ABC):
         video_dict: Dict[str, Any],
         global_step: Optional[int] = "NA",
     ) -> torch.Tensor:
+        occ_geom_debug = os.getenv("ROSS3D_OCC_GEOM_DEBUG", "0") == "1"
+        occ_geom_debug_max_steps = int(os.getenv("ROSS3D_OCC_GEOM_DEBUG_MAX_STEPS", "200"))
+        should_log_occ_geom = occ_geom_debug
+        if should_log_occ_geom:
+            try:
+                should_log_occ_geom = int(global_step) < occ_geom_debug_max_steps
+            except Exception:
+                should_log_occ_geom = True
+
+        scene_id = "NA"
+        if isinstance(video_dict, dict):
+            scene_id = video_dict.get("scene_id", "NA")
+
+        dbg_stats = {
+            "frames_total": 0,
+            "frames_with_both_annos": 0,
+            "frames_missing_preprocess": 0,
+            "frames_grid_mismatch_remapped": 0,
+            "frames_invalid_target_grid": 0,
+            "frames_valid_geom_meta": 0,
+            "frames_with_candidates": 0,
+            "vis_total": 0,
+            "vis_missing_object_id": 0,
+            "vis_in_union": 0,
+            "vis_present": 0,
+            "vis_bbox_valid": 0,
+            "vis_bbox_invalid": 0,
+            "selected_pairs": 0,
+        }
+
+        def _emit_occ_geom_debug(status: str, reason: Optional[str] = None):
+            if not should_log_occ_geom:
+                return
+            msg = (
+                f"[OCC_GEOM_DEBUG] step={global_step} scene_id={scene_id} status={status} "
+                f"reason={reason if reason is not None else 'none'} "
+                f"frames_total={dbg_stats['frames_total']} "
+                f"frames_with_both_annos={dbg_stats['frames_with_both_annos']} "
+                f"frames_missing_preprocess={dbg_stats['frames_missing_preprocess']} "
+                f"frames_grid_mismatch_remapped={dbg_stats['frames_grid_mismatch_remapped']} "
+                f"frames_invalid_target_grid={dbg_stats['frames_invalid_target_grid']} "
+                f"frames_valid_geom_meta={dbg_stats['frames_valid_geom_meta']} "
+                f"frames_with_candidates={dbg_stats['frames_with_candidates']} "
+                f"vis_total={dbg_stats['vis_total']} "
+                f"vis_missing_object_id={dbg_stats['vis_missing_object_id']} "
+                f"vis_in_union={dbg_stats['vis_in_union']} "
+                f"vis_present={dbg_stats['vis_present']} "
+                f"vis_bbox_valid={dbg_stats['vis_bbox_valid']} "
+                f"vis_bbox_invalid={dbg_stats['vis_bbox_invalid']} "
+                f"selected_pairs={dbg_stats['selected_pairs']}"
+            )
+            rank_print(msg)
+
         first_geom_fail = None
         used_geom_any = False
         if not all(
@@ -2720,6 +2816,7 @@ class Ross3DMetaForCausalLM(ABC):
             setattr(self, "_occ_dbg_geom_return_reason", "missing_module")
             setattr(self, "_occ_dbg_used_geom_any", False)
             rlog(f"FIRST_FAIL step={global_step} fn=geom first_fail={first_geom_fail or 'none'}")
+            _emit_occ_geom_debug("early_return", "missing_module")
             return torch.zeros((), device=self.device if hasattr(self, "device") else None)
         rlog(f"OCC_DECISION step={global_step} fn=geom guard=module_set_available pass=1")
         if occupancy_aux_outputs is None or video_dict is None:
@@ -2734,6 +2831,7 @@ class Ross3DMetaForCausalLM(ABC):
             setattr(self, "_occ_dbg_geom_return_reason", "missing_inputs")
             setattr(self, "_occ_dbg_used_geom_any", False)
             rlog(f"FIRST_FAIL step={global_step} fn=geom first_fail={first_geom_fail or 'none'}")
+            _emit_occ_geom_debug("early_return", "missing_inputs")
             return torch.zeros((), device=self.device if hasattr(self, "device") else None)
         rlog(f"OCC_DECISION step={global_step} fn=geom guard=has_inputs pass=1")
 
@@ -2755,6 +2853,7 @@ class Ross3DMetaForCausalLM(ABC):
             setattr(self, "_occ_dbg_geom_return_reason", "missing_aux_tensors")
             setattr(self, "_occ_dbg_used_geom_any", False)
             rlog(f"FIRST_FAIL step={global_step} fn=geom first_fail={first_geom_fail or 'none'}")
+            _emit_occ_geom_debug("early_return", "missing_aux_tensors")
             ref = X if X is not None else E
             if ref is None:
                 return torch.zeros(())
@@ -2778,6 +2877,7 @@ class Ross3DMetaForCausalLM(ABC):
             setattr(self, "_occ_dbg_geom_return_reason", "missing_targets")
             setattr(self, "_occ_dbg_used_geom_any", False)
             rlog(f"FIRST_FAIL step={global_step} fn=geom first_fail={first_geom_fail or 'none'}")
+            _emit_occ_geom_debug("early_return", "missing_targets")
             return torch.zeros((), device=device, dtype=dtype)
         rlog(f"OCC_DECISION step={global_step} fn=geom guard=has_targets pass=1")
 
@@ -2800,10 +2900,12 @@ class Ross3DMetaForCausalLM(ABC):
         self._log_occ_cuda_memory(f"geom_start T={T} P={P} O={int(E.shape[1])} Dp={Dp}")
 
         for f in range(T):
+            dbg_stats["frames_total"] += 1
             occ_anno = patch_occupancy[f]
             vis_anno = visible_bboxes[f]
             if occ_anno is None or vis_anno is None:
                 continue
+            dbg_stats["frames_with_both_annos"] += 1
 
             if frame_ids is not None and vis_anno.get("frame_id", None) is not None:
                 vis_fid = str(vis_anno.get("frame_id"))
@@ -2814,16 +2916,38 @@ class Ross3DMetaForCausalLM(ABC):
             grid = preprocess.get("grid", None)
             resize = preprocess.get("resize", None)
             if grid is None or resize is None:
-                continue
-            H, W = int(grid[0]), int(grid[1])
-            if H * W != P:
+                dbg_stats["frames_missing_preprocess"] += 1
                 continue
             if int(resize[0]) <= 0 or int(resize[1]) <= 0:
+                dbg_stats["frames_missing_preprocess"] += 1
                 continue
 
+            src_h, src_w = int(grid[0]), int(grid[1])
+            if src_h > 0 and src_w > 0 and (src_h * src_w == P):
+                tgt_h, tgt_w = src_h, src_w
+            else:
+                side = int(math.isqrt(P))
+                if side * side != P:
+                    dbg_stats["frames_invalid_target_grid"] += 1
+                    continue
+                tgt_h, tgt_w = side, side
+                dbg_stats["frames_grid_mismatch_remapped"] += 1
+            dbg_stats["frames_valid_geom_meta"] += 1
+
             with torch.no_grad():
-                patch_centers = self._build_patch_centers_normalized(occ_anno, device=device, dtype=dtype)
-                occ_target = self._build_frame_object_occupancy_targets(occ_anno, obj_ids_union, device=device, dtype=dtype)
+                patch_centers = self._build_patch_centers_normalized(
+                    occ_anno,
+                    device=device,
+                    dtype=dtype,
+                    target_grid=(tgt_h, tgt_w),
+                )
+                occ_target = self._build_frame_object_occupancy_targets(
+                    occ_anno,
+                    obj_ids_union,
+                    device=device,
+                    dtype=dtype,
+                    target_grid=(tgt_h, tgt_w),
+                )
 
             union_cols = []
             tgt_boxes = []
@@ -2831,18 +2955,24 @@ class Ross3DMetaForCausalLM(ABC):
             tgt_center_visible = []
 
             for vis_obj in vis_anno.get("detected", []):
+                dbg_stats["vis_total"] += 1
                 if "object_id" not in vis_obj:
+                    dbg_stats["vis_missing_object_id"] += 1
                     continue
                 oid = int(vis_obj["object_id"])
                 if oid not in union_id_to_col:
                     continue
+                dbg_stats["vis_in_union"] += 1
                 ucol = union_id_to_col[oid]
                 if not bool(present[f, ucol].item()):
                     continue
+                dbg_stats["vis_present"] += 1
 
                 bbox_norm, center_norm, center_visible = self._convert_visible_bbox_to_geom_target(vis_obj, vis_anno, occ_anno)
                 if bbox_norm is None:
+                    dbg_stats["vis_bbox_invalid"] += 1
                     continue
+                dbg_stats["vis_bbox_valid"] += 1
 
                 union_cols.append(ucol)
                 tgt_boxes.append(bbox_norm)
@@ -2851,6 +2981,8 @@ class Ross3DMetaForCausalLM(ABC):
 
             if len(union_cols) == 0:
                 continue
+            dbg_stats["frames_with_candidates"] += 1
+            dbg_stats["selected_pairs"] += len(union_cols)
 
             union_cols_t = torch.tensor(union_cols, device=device, dtype=torch.long)
             x_f = X[f]
@@ -2945,8 +3077,8 @@ class Ross3DMetaForCausalLM(ABC):
                             bbox_norm = tgt_boxes[global_k]
                             bw = max(float(bbox_norm[2] - bbox_norm[0]), 1e-6)
                             bh = max(float(bbox_norm[3] - bbox_norm[1]), 1e-6)
-                            sigma_x = max(1.0 / float(W), float(getattr(self.config, "occ_geom_center_alpha", 0.1)) * bw)
-                            sigma_y = max(1.0 / float(H), float(getattr(self.config, "occ_geom_center_alpha", 0.1)) * bh)
+                            sigma_x = max(1.0 / float(tgt_w), float(getattr(self.config, "occ_geom_center_alpha", 0.1)) * bw)
+                            sigma_y = max(1.0 / float(tgt_h), float(getattr(self.config, "occ_geom_center_alpha", 0.1)) * bh)
                             target_ctr = torch.exp(-0.5 * (dx * dx / (sigma_x * sigma_x) + dy * dy / (sigma_y * sigma_y)))
                             target_ctr = target_ctr / (target_ctr.sum() + eps)
                         loss_ctr_obj = F.kl_div(
@@ -2971,6 +3103,7 @@ class Ross3DMetaForCausalLM(ABC):
             setattr(self, "_occ_dbg_geom_return_reason", "no_valid_targets")
             setattr(self, "_occ_dbg_used_geom_any", bool(used_geom_any))
             rlog(f"FIRST_FAIL step={global_step} fn=geom first_fail={first_geom_fail or 'none'}")
+            _emit_occ_geom_debug("zero_loss", "no_valid_targets")
             return torch.zeros((), device=device, dtype=dtype)
         rlog(f"OCC_DECISION step={global_step} fn=geom guard=has_valid_targets pass=1")
 
@@ -2989,6 +3122,7 @@ class Ross3DMetaForCausalLM(ABC):
         setattr(self, "_occ_dbg_geom_return_reason", None)
         setattr(self, "_occ_dbg_used_geom_any", bool(used_geom_any))
         rlog(f"FIRST_FAIL step={global_step} fn=geom first_fail={first_geom_fail or 'none'}")
+        _emit_occ_geom_debug("ok", None)
         return geom_loss.float()
 
     @torch._dynamo.disable
