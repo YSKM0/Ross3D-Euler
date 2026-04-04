@@ -1807,14 +1807,12 @@ class Ross3DTrainer(Trainer):
         log_dict = {}
         self._cycle_loss_active = outputs.get("cycle_loss", None) is not None
 
+        if outputs.get('lm_loss', None) is not None:
+            log_dict["lm_loss"] = round(outputs['lm_loss'].item(), 4)
+
         if outputs.get('vm_loss', None) is not None:
-            assert outputs.get('lm_loss', None) is not None
-
             vm_loss = outputs['vm_loss']
-            lm_loss = outputs['lm_loss']
-
-            log_dict = {"vm_loss": round(vm_loss.item(), 4),
-                        "lm_loss": round(lm_loss.item(), 4)}
+            log_dict["vm_loss"] = round(vm_loss.item(), 4)
 
             if outputs.get('bev_loss', None) is not None:
                 bev_loss = outputs['bev_loss']
@@ -1826,6 +1824,20 @@ class Ross3DTrainer(Trainer):
             log_dict["cycle_loss"] = round(outputs["cycle_loss"].item(), 4)
         if outputs.get("occ_geom_loss", None) is not None:
             log_dict["occ_geom_loss"] = round(outputs["occ_geom_loss"].item(), 4)
+            occ_geom_component_keys = [
+                "occ_geom_mask_loss",
+                "occ_geom_box_loss",
+                "occ_geom_ctr_loss",
+                "occ_geom_vis_loss",
+                "occ_geom_mask_bce_loss",
+                "occ_geom_mask_dice_loss",
+                "occ_geom_box_l1_loss",
+                "occ_geom_box_giou_loss",
+            ]
+            for key in occ_geom_component_keys:
+                value = outputs.get(key, None)
+                if value is not None:
+                    log_dict[key] = round(value.item(), 4)
         if outputs.get("occ_temp_loss", None) is not None:
             log_dict["occ_temp_loss"] = round(outputs["occ_temp_loss"].item(), 4)
 

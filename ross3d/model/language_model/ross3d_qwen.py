@@ -70,6 +70,10 @@ class Ross3DQwenConfig(Qwen2Config):
         self.occ_detach_hidden_states = kwargs.get("occ_detach_hidden_states", False)
         self.enable_occ_geom_loss = kwargs.get("enable_occ_geom_loss", False)
         self.occ_geom_loss_weight = kwargs.get("occ_geom_loss_weight", 0.0)
+        self.use_occupancy_patch_projector = kwargs.get("use_occupancy_patch_projector", True)
+        self.use_occ_temp_projector = kwargs.get("use_occ_temp_projector", True)
+        self.use_occ_geom_patch_norm = kwargs.get("use_occ_geom_patch_norm", True)
+        self.use_occ_geom_obj_query = kwargs.get("use_occ_geom_obj_query", True)
         self.occ_geom_mask_weight = kwargs.get("occ_geom_mask_weight", 1.0)
         self.occ_geom_box_weight = kwargs.get("occ_geom_box_weight", 1.0)
         self.occ_geom_ctr_weight = kwargs.get("occ_geom_ctr_weight", 1.0)
@@ -683,6 +687,14 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             extract_return_reason = getattr(self, "_occ_dbg_extract_return_reason", None)
 
         occ_geom_loss = None
+        occ_geom_mask_loss = None
+        occ_geom_box_loss = None
+        occ_geom_ctr_loss = None
+        occ_geom_vis_loss = None
+        occ_geom_mask_bce_loss = None
+        occ_geom_mask_dice_loss = None
+        occ_geom_box_l1_loss = None
+        occ_geom_box_giou_loss = None
         occ_obj_emb = occupancy_aux_outputs.get("object_embeddings", None) if isinstance(occupancy_aux_outputs, dict) else None
         occ_target = None
         rlog("OCC_BEFORE_GEOM_LOSS")
@@ -709,6 +721,14 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
                 global_step=global_step,
             )
             occ_geom_loss = occ_geom_loss.float()
+            occ_geom_mask_loss = getattr(self, "_occ_geom_mask_loss", None)
+            occ_geom_box_loss = getattr(self, "_occ_geom_box_loss", None)
+            occ_geom_ctr_loss = getattr(self, "_occ_geom_ctr_loss", None)
+            occ_geom_vis_loss = getattr(self, "_occ_geom_vis_loss", None)
+            occ_geom_mask_bce_loss = getattr(self, "_occ_geom_mask_bce_loss", None)
+            occ_geom_mask_dice_loss = getattr(self, "_occ_geom_mask_dice_loss", None)
+            occ_geom_box_l1_loss = getattr(self, "_occ_geom_box_l1_loss", None)
+            occ_geom_box_giou_loss = getattr(self, "_occ_geom_box_giou_loss", None)
             used_geom_any = bool(getattr(self, "_occ_dbg_used_geom_any", False))
             geom_return_reason = getattr(self, "_occ_dbg_geom_return_reason", None)
             loss = loss + getattr(self.config, "occ_geom_loss_weight", 0.0) * occ_geom_loss
@@ -832,6 +852,14 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             cycle_loss=cycle_loss, # Hanwliu
             occ_geom_loss=occ_geom_loss,
             occ_temp_loss=occ_temp_loss,
+            occ_geom_mask_loss=occ_geom_mask_loss,
+            occ_geom_box_loss=occ_geom_box_loss,
+            occ_geom_ctr_loss=occ_geom_ctr_loss,
+            occ_geom_vis_loss=occ_geom_vis_loss,
+            occ_geom_mask_bce_loss=occ_geom_mask_bce_loss,
+            occ_geom_mask_dice_loss=occ_geom_mask_dice_loss,
+            occ_geom_box_l1_loss=occ_geom_box_l1_loss,
+            occ_geom_box_giou_loss=occ_geom_box_giou_loss,
         )
 
     @torch.no_grad()

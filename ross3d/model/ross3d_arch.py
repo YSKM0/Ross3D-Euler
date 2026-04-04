@@ -511,6 +511,16 @@ class Ross3DMetaForCausalLM(ABC):
     def get_model(self):
         pass
 
+    def _occ_match_last_dim(self, x: torch.Tensor, target_dim: int) -> torch.Tensor:
+        cur_dim = int(x.shape[-1])
+        if cur_dim == int(target_dim):
+            return x
+        if cur_dim > int(target_dim):
+            return x[..., :target_dim]
+        pad_shape = list(x.shape[:-1]) + [int(target_dim - cur_dim)]
+        pad = torch.zeros(*pad_shape, device=x.device, dtype=x.dtype)
+        return torch.cat([x, pad], dim=-1)
+
     @staticmethod
     @torch._dynamo.disable
     def _sample_posterior_latents(posterior):
@@ -2372,9 +2382,15 @@ class Ross3DMetaForCausalLM(ABC):
         rlog(f"OCC_DECISION step={global_step} fn=extract guard=global_guards pass=1")
 
         patch_feats = self._extract_frame_patch_hidden_states(hidden_states, boi_ids, eoi_ids, newline_ids)
-        rlog(f"PARAM_USE step={global_step} module=occupancy_patch_projector used=1")
-        used_patch_proj = True
-        projected_patch_feats = self.model.occupancy_patch_projector(patch_feats)
+        use_occ_patch_proj = bool(getattr(self.config, "use_occupancy_patch_projector", True))
+        if use_occ_patch_proj:
+            rlog(f"PARAM_USE step={global_step} module=occupancy_patch_projector used=1")
+            used_patch_proj = True
+            projected_patch_feats = self.model.occupancy_patch_projector(patch_feats)
+        else:
+            rlog(f"PARAM_USE step={global_step} module=occupancy_patch_projector used=0 reason=ablation_disabled")
+            target_dim = int(self.model.occupancy_object_norm.normalized_shape[0])
+            projected_patch_feats = self._occ_match_last_dim(patch_feats, target_dim)
         rlog(f"PATCH_PROJECTOR_OUTPUT shape={tshape(projected_patch_feats)}")
         rlog("EXTRACT_AFTER_PATCH_PROJECTOR")
         self._log_occ_cuda_memory("aux_after_patch_projector")
@@ -2761,6 +2777,17 @@ class Ross3DMetaForCausalLM(ABC):
         video_dict: Dict[str, Any],
         global_step: Optional[int] = "NA",
     ) -> torch.Tensor:
+        for _attr in [
+            "_occ_geom_mask_loss",
+            "_occ_geom_box_loss",
+            "_occ_geom_ctr_loss",
+            "_occ_geom_vis_loss",
+            "_occ_geom_mask_bce_loss",
+            "_occ_geom_mask_dice_loss",
+            "_occ_geom_box_l1_loss",
+            "_occ_geom_box_giou_loss",
+        ]:
+            setattr(self, _attr, None)
         occ_geom_debug = os.getenv("ROSS3D_OCC_GEOM_DEBUG", "0") == "1"
         occ_geom_debug_max_steps = int(os.getenv("ROSS3D_OCC_GEOM_DEBUG_MAX_STEPS", "200"))
         should_log_occ_geom = occ_geom_debug
@@ -2917,6 +2944,10 @@ class Ross3DMetaForCausalLM(ABC):
         box_loss_sum = torch.zeros((), device=device, dtype=dtype)
         ctr_loss_sum = torch.zeros((), device=device, dtype=dtype)
         vis_loss_sum = torch.zeros((), device=device, dtype=dtype)
+        mask_bce_loss_sum = torch.zeros((), device=device, dtype=dtype)
+        mask_dice_loss_sum = torch.zeros((), device=device, dtype=dtype)
+        box_l1_loss_sum = torch.zeros((), device=device, dtype=dtype)
+        box_giou_loss_sum = torch.zeros((), device=device, dtype=dtype)
         mask_count = box_count = ctr_count = vis_count = 0
         _geom_use_logged = False
         self._log_occ_cuda_memory(f"geom_start T={T} P={P} O={int(E.shape[1])} Dp={Dp}")
@@ -3008,15 +3039,26 @@ class Ross3DMetaForCausalLM(ABC):
 
             union_cols_t = torch.tensor(union_cols, device=device, dtype=torch.long)
             x_f = X[f]
+            use_occ_geom_patch_norm = bool(getattr(self.config, "use_occ_geom_patch_norm", True))
+            use_occ_geom_obj_query = bool(getattr(self.config, "use_occ_geom_obj_query", True))
             if not _geom_use_logged:
+                rlog(
+                    f"PARAM_USE step={global_step} module=occ_geom_patch_norm "
+                    f"used={1 if use_occ_geom_patch_norm else 0}"
+                    + ("" if use_occ_geom_patch_norm else " reason=ablation_disabled")
+                )
+                rlog(
+                    f"PARAM_USE step={global_step} module=occ_geom_obj_query "
+                    f"used={1 if use_occ_geom_obj_query else 0}"
+                    + ("" if use_occ_geom_obj_query else " reason=ablation_disabled")
+                )
                 for _m in [
-                    "occ_geom_patch_norm", "occ_geom_obj_query", "occ_geom_relation",
-                    "occ_geom_mask_head", "occ_geom_center_head", "occ_geom_size_head", "occ_geom_vis_head"
+                    "occ_geom_relation", "occ_geom_mask_head", "occ_geom_center_head", "occ_geom_size_head", "occ_geom_vis_head"
                 ]:
                     rlog(f"PARAM_USE step={global_step} module={_m} used=1")
                 _geom_use_logged = True
                 used_geom_any = True
-            x_feat = self.model.occ_geom_patch_norm(x_f)
+            x_feat = self.model.occ_geom_patch_norm(x_f) if use_occ_geom_patch_norm else x_f
             with torch.no_grad():
                 target_boxes_t = torch.tensor(tgt_boxes, device=device, dtype=dtype)
                 target_vis_t = torch.tensor(
@@ -3031,7 +3073,7 @@ class Ross3DMetaForCausalLM(ABC):
                 end = min(start + chunk_size, Ov)
                 chunk_cols_t = union_cols_t[start:end]
                 e_chunk = E[f, chunk_cols_t, :]
-                e_query = self.model.occ_geom_obj_query(e_chunk)
+                e_query = self.model.occ_geom_obj_query(e_chunk) if use_occ_geom_obj_query else e_chunk
 
                 x_expand = x_feat.unsqueeze(0).expand(end - start, -1, -1)
                 e_expand = e_query.unsqueeze(1).expand(-1, P, -1)
@@ -3073,6 +3115,8 @@ class Ross3DMetaForCausalLM(ABC):
                     loss_mask_dice = 1.0 - (dice_num / dice_den)
                     loss_mask_obj = loss_mask_bce + float(getattr(self.config, "occ_geom_mask_dice_weight", 0.5)) * loss_mask_dice
                     mask_loss_sum = mask_loss_sum + loss_mask_obj
+                    mask_bce_loss_sum = mask_bce_loss_sum + loss_mask_bce
+                    mask_dice_loss_sum = mask_dice_loss_sum + loss_mask_dice
                     mask_count += 1
 
                     target_box = target_boxes_t[global_k].to(dtype=pred_box.dtype)
@@ -3084,6 +3128,8 @@ class Ross3DMetaForCausalLM(ABC):
                     ).mean()
                     loss_box_obj = loss_box_l1 + float(getattr(self.config, "occ_geom_box_giou_weight", 1.0)) * loss_box_giou
                     box_loss_sum = box_loss_sum + loss_box_obj
+                    box_l1_loss_sum = box_l1_loss_sum + loss_box_l1
+                    box_giou_loss_sum = box_giou_loss_sum + loss_box_giou
                     box_count += 1
 
                     target_vis = target_vis_t[global_k].to(dtype=pred_vis_logit.dtype)
@@ -3133,6 +3179,10 @@ class Ross3DMetaForCausalLM(ABC):
         loss_box = box_loss_sum / max(box_count, 1)
         loss_ctr = ctr_loss_sum / max(ctr_count, 1)
         loss_vis = vis_loss_sum / max(vis_count, 1)
+        loss_mask_bce = mask_bce_loss_sum / max(mask_count, 1)
+        loss_mask_dice = mask_dice_loss_sum / max(mask_count, 1)
+        loss_box_l1 = box_l1_loss_sum / max(box_count, 1)
+        loss_box_giou = box_giou_loss_sum / max(box_count, 1)
 
         geom_loss = (
             float(getattr(self.config, "occ_geom_mask_weight", 1.0)) * loss_mask
@@ -3141,6 +3191,14 @@ class Ross3DMetaForCausalLM(ABC):
             + float(getattr(self.config, "occ_geom_vis_weight", 1.0)) * loss_vis
         )
         self._log_occ_cuda_memory("geom_end")
+        setattr(self, "_occ_geom_mask_loss", loss_mask.float())
+        setattr(self, "_occ_geom_box_loss", loss_box.float())
+        setattr(self, "_occ_geom_ctr_loss", loss_ctr.float())
+        setattr(self, "_occ_geom_vis_loss", loss_vis.float())
+        setattr(self, "_occ_geom_mask_bce_loss", loss_mask_bce.float())
+        setattr(self, "_occ_geom_mask_dice_loss", loss_mask_dice.float())
+        setattr(self, "_occ_geom_box_l1_loss", loss_box_l1.float())
+        setattr(self, "_occ_geom_box_giou_loss", loss_box_giou.float())
         setattr(self, "_occ_dbg_geom_return_reason", None)
         setattr(self, "_occ_dbg_used_geom_any", bool(used_geom_any))
         rlog(f"FIRST_FAIL step={global_step} fn=geom first_fail={first_geom_fail or 'none'}")
@@ -3244,9 +3302,14 @@ class Ross3DMetaForCausalLM(ABC):
         min_frames = int(getattr(self.config, "occ_temp_min_frames", 2))
         eps = float(getattr(self.config, "occ_temp_eps", 1e-6))
 
-        rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=1")
-        used_temp_proj = True
-        U = self.model.occ_temp_projector(Z)
+        use_occ_temp_proj = bool(getattr(self.config, "use_occ_temp_projector", True))
+        if use_occ_temp_proj:
+            rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=1")
+            used_temp_proj = True
+            U = self.model.occ_temp_projector(Z)
+        else:
+            rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=0 reason=ablation_disabled")
+            U = Z
         U = F.normalize(U, dim=-1)
         self._log_occ_cuda_memory(f"temp_after_projector T={T} O={O}")
 
@@ -4288,3 +4351,11 @@ class CausalLMOutputWithPastRoss(ModelOutput):
     occupancy_aux_outputs: Optional[Dict[str, Union[torch.Tensor, List[int], List[str], str]]] = None
     occ_geom_loss: Optional[torch.FloatTensor] = None
     occ_temp_loss: Optional[torch.FloatTensor] = None
+    occ_geom_mask_loss: Optional[torch.FloatTensor] = None
+    occ_geom_box_loss: Optional[torch.FloatTensor] = None
+    occ_geom_ctr_loss: Optional[torch.FloatTensor] = None
+    occ_geom_vis_loss: Optional[torch.FloatTensor] = None
+    occ_geom_mask_bce_loss: Optional[torch.FloatTensor] = None
+    occ_geom_mask_dice_loss: Optional[torch.FloatTensor] = None
+    occ_geom_box_l1_loss: Optional[torch.FloatTensor] = None
+    occ_geom_box_giou_loss: Optional[torch.FloatTensor] = None

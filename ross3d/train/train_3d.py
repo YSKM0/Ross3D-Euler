@@ -255,6 +255,11 @@ class ModelArguments:
     enable_occ_temp_loss: bool = field(default=False)
     occ_temp_loss_weight: float = field(default=0.0)
 
+    use_occupancy_patch_projector: bool = field(default=True)
+    use_occ_temp_projector: bool = field(default=True)
+    use_occ_geom_patch_norm: bool = field(default=True)
+    use_occ_geom_obj_query: bool = field(default=True)
+
     occ_temp_eps: float = field(default=1e-6)
     occ_temp_min_frames: int = field(default=2)
 
@@ -1656,6 +1661,10 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args, load_so
     overwrite_config["enable_bev_loss"] = model_args.enable_bev_loss
     overwrite_config["enable_occ_geom_loss"] = model_args.enable_occ_geom_loss
     overwrite_config["enable_occ_temp_loss"] = model_args.enable_occ_temp_loss
+    overwrite_config["use_occupancy_patch_projector"] = model_args.use_occupancy_patch_projector
+    overwrite_config["use_occ_temp_projector"] = model_args.use_occ_temp_projector
+    overwrite_config["use_occ_geom_patch_norm"] = model_args.use_occ_geom_patch_norm
+    overwrite_config["use_occ_geom_obj_query"] = model_args.use_occ_geom_obj_query
     overwrite_config["occupancy_projector_dim"] = model_args.occupancy_projector_dim
     overwrite_config["occ_detach_hidden_states"] = model_args.occ_detach_hidden_states
 
@@ -1737,6 +1746,10 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args, load_so
     setattr(model.config, "occ_detach_hidden_states", model_args.occ_detach_hidden_states)
     setattr(model.config, "enable_occ_geom_loss", model_args.enable_occ_geom_loss)
     setattr(model.config, "occ_geom_loss_weight", model_args.occ_geom_loss_weight)
+    setattr(model.config, "use_occupancy_patch_projector", model_args.use_occupancy_patch_projector)
+    setattr(model.config, "use_occ_temp_projector", model_args.use_occ_temp_projector)
+    setattr(model.config, "use_occ_geom_patch_norm", model_args.use_occ_geom_patch_norm)
+    setattr(model.config, "use_occ_geom_obj_query", model_args.use_occ_geom_obj_query)
     setattr(model.config, "occ_geom_mask_weight", model_args.occ_geom_mask_weight)
     setattr(model.config, "occ_geom_box_weight", model_args.occ_geom_box_weight)
     setattr(model.config, "occ_geom_ctr_weight", model_args.occ_geom_ctr_weight)
