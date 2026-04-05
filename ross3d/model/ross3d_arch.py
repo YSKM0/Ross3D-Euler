@@ -3233,10 +3233,16 @@ class Ross3DMetaForCausalLM(ABC):
             return torch.zeros(())
         rlog(f"OCC_DECISION step={global_step} fn=temp guard=has_inputs pass=1")
 
+        use_simple_occ_temp_loss = bool(getattr(self.config, "use_simple_occ_temp_loss", False))
+        use_positive_only_occ_temp_loss = bool(getattr(self.config, "use_positive_only_occ_temp_loss", False))
+        use_original_occ_temp_loss = (not use_simple_occ_temp_loss) and (not use_positive_only_occ_temp_loss)
         Z = occupancy_aux_outputs.get("object_embeddings", None)
         present = occupancy_aux_outputs.get("present", None)
         obj_cat_ids_union = occupancy_aux_outputs.get("obj_cat_ids_union", None)
-        if Z is None or present is None or obj_cat_ids_union is None:
+        missing_aux = (Z is None or present is None)
+        if use_original_occ_temp_loss and (obj_cat_ids_union is None):
+            missing_aux = True
+        if missing_aux:
             if first_temp_fail is None:
                 first_temp_fail = "has_aux_tensors"
             rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=0 reason=missing_aux_tensors")
@@ -3274,29 +3280,41 @@ class Ross3DMetaForCausalLM(ABC):
             rlog(f"FIRST_FAIL step={global_step} fn=temp first_fail={first_temp_fail or 'none'}")
             return torch.zeros((), device=device, dtype=dtype)
         rlog(f"OCC_DECISION step={global_step} fn=temp guard=has_min_frames_and_objects pass=1")
-        if obj_cat_ids_union.shape[0] != O:
-            if first_temp_fail is None:
-                first_temp_fail = "category_shape_match"
-            rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=0 reason=category_shape_mismatch")
-            rlog(f"OCC_DECISION step={global_step} fn=temp guard=category_shape_match pass=0")
-            setattr(self, "_occ_dbg_temp_return_reason", "category_shape_mismatch")
-            setattr(self, "_occ_dbg_used_temp_proj", False)
-            rlog(f"FIRST_FAIL step={global_step} fn=temp first_fail={first_temp_fail or 'none'}")
-            return torch.zeros((), device=device, dtype=dtype)
+        if use_original_occ_temp_loss:
+            if obj_cat_ids_union.shape[0] != O:
+                if first_temp_fail is None:
+                    first_temp_fail = "category_shape_match"
+                rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=0 reason=category_shape_mismatch")
+                rlog(f"OCC_DECISION step={global_step} fn=temp guard=category_shape_match pass=0")
+                setattr(self, "_occ_dbg_temp_return_reason", "category_shape_mismatch")
+                setattr(self, "_occ_dbg_used_temp_proj", False)
+                rlog(f"FIRST_FAIL step={global_step} fn=temp first_fail={first_temp_fail or 'none'}")
+                return torch.zeros((), device=device, dtype=dtype)
         rlog(f"OCC_DECISION step={global_step} fn=temp guard=category_shape_match pass=1")
 
         same_min = float(getattr(self.config, "occ_temp_same_min_margin", 0.10))
         same_max = float(getattr(self.config, "occ_temp_same_max_margin", 0.25))
         diff_margin = float(getattr(self.config, "occ_temp_diff_margin", 0.30))
-        if not (diff_margin > same_max > same_min > 0.0):
-            if first_temp_fail is None:
-                first_temp_fail = "margin_config_valid"
-            rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=0 reason=invalid_margins")
-            rlog(f"OCC_DECISION step={global_step} fn=temp guard=margin_config_valid pass=0")
-            setattr(self, "_occ_dbg_temp_return_reason", "invalid_margins")
-            setattr(self, "_occ_dbg_used_temp_proj", False)
-            rlog(f"FIRST_FAIL step={global_step} fn=temp first_fail={first_temp_fail or 'none'}")
-            return torch.zeros((), device=device, dtype=dtype)
+        if use_original_occ_temp_loss:
+            if not (diff_margin > same_max > same_min > 0.0):
+                if first_temp_fail is None:
+                    first_temp_fail = "margin_config_valid"
+                rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=0 reason=invalid_margins")
+                rlog(f"OCC_DECISION step={global_step} fn=temp guard=margin_config_valid pass=0")
+                setattr(self, "_occ_dbg_temp_return_reason", "invalid_margins")
+                setattr(self, "_occ_dbg_used_temp_proj", False)
+                rlog(f"FIRST_FAIL step={global_step} fn=temp first_fail={first_temp_fail or 'none'}")
+                return torch.zeros((), device=device, dtype=dtype)
+        elif use_simple_occ_temp_loss:
+            if not (diff_margin >= 0.0):
+                if first_temp_fail is None:
+                    first_temp_fail = "margin_config_valid"
+                rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=0 reason=invalid_margins")
+                rlog(f"OCC_DECISION step={global_step} fn=temp guard=margin_config_valid pass=0")
+                setattr(self, "_occ_dbg_temp_return_reason", "invalid_margins")
+                setattr(self, "_occ_dbg_used_temp_proj", False)
+                rlog(f"FIRST_FAIL step={global_step} fn=temp first_fail={first_temp_fail or 'none'}")
+                return torch.zeros((), device=device, dtype=dtype)
         rlog(f"OCC_DECISION step={global_step} fn=temp guard=margin_config_valid pass=1")
 
         min_frames = int(getattr(self.config, "occ_temp_min_frames", 2))
@@ -3345,7 +3363,8 @@ class Ross3DMetaForCausalLM(ABC):
         loss_sum = torch.zeros((), device=device, dtype=dtype)
         anchor_count = 0
 
-        cat_ids = obj_cat_ids_union.to(device=device)
+        if use_original_occ_temp_loss:
+            cat_ids = obj_cat_ids_union.to(device=device)
 
         for t in range(T):
             for o in range(O):
@@ -3365,30 +3384,46 @@ class Ross3DMetaForCausalLM(ABC):
                 s_pos = torch.sum(u_anchor * pos_proto, dim=-1)
                 loss_pos = 1.0 - s_pos
 
-                is_other = torch.arange(O, device=device) != o
-                valid_neg = is_other & valid_proto_obj.to(device=device)
-                same_mask = valid_neg & (cat_ids == cat_ids[o])
-                diff_mask = valid_neg & (cat_ids != cat_ids[o])
+                if use_positive_only_occ_temp_loss:
+                    loss_anchor = float(getattr(self.config, "occ_temp_pos_weight", 1.0)) * loss_pos
+                else:
+                    is_other = torch.arange(O, device=device) != o
+                    valid_neg = is_other & valid_proto_obj.to(device=device)
 
-                loss_same = torch.zeros((), device=device, dtype=dtype)
-                if same_mask.any():
-                    s_same = torch.matmul(proto_all[same_mask], u_anchor)
-                    gap_same = s_pos - s_same
-                    loss_same_i = F.relu(same_min - gap_same) + F.relu(gap_same - same_max)
-                    loss_same = loss_same_i.mean()
+                    if use_simple_occ_temp_loss:
+                        loss_neg = torch.zeros((), device=device, dtype=dtype)
+                        if valid_neg.any():
+                            s_neg = torch.matmul(proto_all[valid_neg], u_anchor)
+                            gap_neg = s_pos - s_neg
+                            loss_neg_i = F.relu(diff_margin - gap_neg)
+                            loss_neg = loss_neg_i.mean()
+                        loss_anchor = (
+                            float(getattr(self.config, "occ_temp_pos_weight", 1.0)) * loss_pos
+                            + float(getattr(self.config, "occ_temp_diff_weight", 1.0)) * loss_neg
+                        )
+                    else:
+                        same_mask = valid_neg & (cat_ids == cat_ids[o])
+                        diff_mask = valid_neg & (cat_ids != cat_ids[o])
 
-                loss_diff = torch.zeros((), device=device, dtype=dtype)
-                if diff_mask.any():
-                    s_diff = torch.matmul(proto_all[diff_mask], u_anchor)
-                    gap_diff = s_pos - s_diff
-                    loss_diff_i = F.relu(diff_margin - gap_diff)
-                    loss_diff = loss_diff_i.mean()
+                        loss_same = torch.zeros((), device=device, dtype=dtype)
+                        if same_mask.any():
+                            s_same = torch.matmul(proto_all[same_mask], u_anchor)
+                            gap_same = s_pos - s_same
+                            loss_same_i = F.relu(same_min - gap_same) + F.relu(gap_same - same_max)
+                            loss_same = loss_same_i.mean()
 
-                loss_anchor = (
-                    float(getattr(self.config, "occ_temp_pos_weight", 1.0)) * loss_pos
-                    + float(getattr(self.config, "occ_temp_same_weight", 1.0)) * loss_same
-                    + float(getattr(self.config, "occ_temp_diff_weight", 1.0)) * loss_diff
-                )
+                        loss_diff = torch.zeros((), device=device, dtype=dtype)
+                        if diff_mask.any():
+                            s_diff = torch.matmul(proto_all[diff_mask], u_anchor)
+                            gap_diff = s_pos - s_diff
+                            loss_diff_i = F.relu(diff_margin - gap_diff)
+                            loss_diff = loss_diff_i.mean()
+
+                        loss_anchor = (
+                            float(getattr(self.config, "occ_temp_pos_weight", 1.0)) * loss_pos
+                            + float(getattr(self.config, "occ_temp_same_weight", 1.0)) * loss_same
+                            + float(getattr(self.config, "occ_temp_diff_weight", 1.0)) * loss_diff
+                        )
                 loss_sum = loss_sum + loss_anchor
                 anchor_count += 1
 

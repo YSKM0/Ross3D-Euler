@@ -172,8 +172,12 @@ def eval_model(questions, args):
         )
         video_dict = merge_video_dict([video_dict])
         image_tensors = video_dict.pop('images').half().to(model.device)
-        for k in video_dict:
-            video_dict[k] = video_dict[k].half().to(model.device)
+        for k, v in video_dict.items():
+            if isinstance(v, torch.Tensor):
+                if torch.is_floating_point(v):
+                    video_dict[k] = v.half().to(model.device)
+                else:
+                    video_dict[k] = v.to(model.device)
 
         stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
         keywords = [stop_str]

@@ -92,6 +92,8 @@ class Ross3DQwenConfig(Qwen2Config):
         self.occ_temp_same_weight = kwargs.get("occ_temp_same_weight", 1.0)
         self.occ_temp_diff_margin = kwargs.get("occ_temp_diff_margin", 0.30)
         self.occ_temp_diff_weight = kwargs.get("occ_temp_diff_weight", 1.0)
+        self.use_simple_occ_temp_loss = kwargs.get("use_simple_occ_temp_loss", False)
+        self.use_positive_only_occ_temp_loss = kwargs.get("use_positive_only_occ_temp_loss", False)
 
 
 class Ross3DQwenModel(Ross3DMetaModel, Qwen2Model):
