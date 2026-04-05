@@ -3235,6 +3235,7 @@ class Ross3DMetaForCausalLM(ABC):
 
         use_simple_occ_temp_loss = bool(getattr(self.config, "use_simple_occ_temp_loss", False))
         use_positive_only_occ_temp_loss = bool(getattr(self.config, "use_positive_only_occ_temp_loss", False))
+        use_softmax_occ_temp_loss = bool(getattr(self.config, "use_softmax_occ_temp_loss", False))
         use_original_occ_temp_loss = (not use_simple_occ_temp_loss) and (not use_positive_only_occ_temp_loss)
         Z = occupancy_aux_outputs.get("object_embeddings", None)
         present = occupancy_aux_outputs.get("present", None)
@@ -3295,26 +3296,40 @@ class Ross3DMetaForCausalLM(ABC):
         same_min = float(getattr(self.config, "occ_temp_same_min_margin", 0.10))
         same_max = float(getattr(self.config, "occ_temp_same_max_margin", 0.25))
         diff_margin = float(getattr(self.config, "occ_temp_diff_margin", 0.30))
-        if use_original_occ_temp_loss:
-            if not (diff_margin > same_max > same_min > 0.0):
+        if use_softmax_occ_temp_loss:
+            softmax_tau = float(getattr(self.config, "occ_temp_softmax_tau", 0.07))
+            same_neg_weight = float(getattr(self.config, "occ_temp_same_neg_weight", 0.5))
+            diff_neg_weight = float(getattr(self.config, "occ_temp_diff_neg_weight", 1.0))
+            if not (softmax_tau > 0.0 and same_neg_weight >= 0.0 and diff_neg_weight >= 0.0):
                 if first_temp_fail is None:
-                    first_temp_fail = "margin_config_valid"
-                rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=0 reason=invalid_margins")
-                rlog(f"OCC_DECISION step={global_step} fn=temp guard=margin_config_valid pass=0")
-                setattr(self, "_occ_dbg_temp_return_reason", "invalid_margins")
+                    first_temp_fail = "softmax_config_valid"
+                rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=0 reason=invalid_softmax_hparams")
+                rlog(f"OCC_DECISION step={global_step} fn=temp guard=softmax_config_valid pass=0")
+                setattr(self, "_occ_dbg_temp_return_reason", "invalid_softmax_hparams")
                 setattr(self, "_occ_dbg_used_temp_proj", False)
                 rlog(f"FIRST_FAIL step={global_step} fn=temp first_fail={first_temp_fail or 'none'}")
                 return torch.zeros((), device=device, dtype=dtype)
-        elif use_simple_occ_temp_loss:
-            if not (diff_margin >= 0.0):
-                if first_temp_fail is None:
-                    first_temp_fail = "margin_config_valid"
-                rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=0 reason=invalid_margins")
-                rlog(f"OCC_DECISION step={global_step} fn=temp guard=margin_config_valid pass=0")
-                setattr(self, "_occ_dbg_temp_return_reason", "invalid_margins")
-                setattr(self, "_occ_dbg_used_temp_proj", False)
-                rlog(f"FIRST_FAIL step={global_step} fn=temp first_fail={first_temp_fail or 'none'}")
-                return torch.zeros((), device=device, dtype=dtype)
+        else:
+            if use_original_occ_temp_loss:
+                if not (diff_margin > same_max > same_min > 0.0):
+                    if first_temp_fail is None:
+                        first_temp_fail = "margin_config_valid"
+                    rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=0 reason=invalid_margins")
+                    rlog(f"OCC_DECISION step={global_step} fn=temp guard=margin_config_valid pass=0")
+                    setattr(self, "_occ_dbg_temp_return_reason", "invalid_margins")
+                    setattr(self, "_occ_dbg_used_temp_proj", False)
+                    rlog(f"FIRST_FAIL step={global_step} fn=temp first_fail={first_temp_fail or 'none'}")
+                    return torch.zeros((), device=device, dtype=dtype)
+            elif use_simple_occ_temp_loss:
+                if not (diff_margin >= 0.0):
+                    if first_temp_fail is None:
+                        first_temp_fail = "margin_config_valid"
+                    rlog(f"PARAM_USE step={global_step} module=occ_temp_projector used=0 reason=invalid_margins")
+                    rlog(f"OCC_DECISION step={global_step} fn=temp guard=margin_config_valid pass=0")
+                    setattr(self, "_occ_dbg_temp_return_reason", "invalid_margins")
+                    setattr(self, "_occ_dbg_used_temp_proj", False)
+                    rlog(f"FIRST_FAIL step={global_step} fn=temp first_fail={first_temp_fail or 'none'}")
+                    return torch.zeros((), device=device, dtype=dtype)
         rlog(f"OCC_DECISION step={global_step} fn=temp guard=margin_config_valid pass=1")
 
         min_frames = int(getattr(self.config, "occ_temp_min_frames", 2))
@@ -3390,7 +3405,33 @@ class Ross3DMetaForCausalLM(ABC):
                     is_other = torch.arange(O, device=device) != o
                     valid_neg = is_other & valid_proto_obj.to(device=device)
 
-                    if use_simple_occ_temp_loss:
+                    if use_softmax_occ_temp_loss:
+                        if use_simple_occ_temp_loss:
+                            if valid_neg.any():
+                                s_neg = torch.matmul(proto_all[valid_neg], u_anchor)
+                                logits = torch.cat([s_pos.unsqueeze(0), s_neg], dim=0) / softmax_tau
+                                loss_anchor = -F.log_softmax(logits, dim=0)[0]
+                            else:
+                                loss_anchor = float(getattr(self.config, "occ_temp_pos_weight", 1.0)) * loss_pos
+                        else:
+                            same_mask = valid_neg & (cat_ids == cat_ids[o])
+                            diff_mask = valid_neg & (cat_ids != cat_ids[o])
+
+                            has_same = bool(same_mask.any().item())
+                            has_diff = bool(diff_mask.any().item())
+                            if not (has_same or has_diff):
+                                loss_anchor = float(getattr(self.config, "occ_temp_pos_weight", 1.0)) * loss_pos
+                            else:
+                                log_terms = [s_pos / softmax_tau]
+                                if has_same and same_neg_weight > 0.0:
+                                    s_same = torch.matmul(proto_all[same_mask], u_anchor)
+                                    log_terms.append(math.log(same_neg_weight) + torch.logsumexp(s_same / softmax_tau, dim=0))
+                                if has_diff and diff_neg_weight > 0.0:
+                                    s_diff = torch.matmul(proto_all[diff_mask], u_anchor)
+                                    log_terms.append(math.log(diff_neg_weight) + torch.logsumexp(s_diff / softmax_tau, dim=0))
+                                log_denom = torch.logsumexp(torch.stack(log_terms), dim=0)
+                                loss_anchor = log_denom - (s_pos / softmax_tau)
+                    elif use_simple_occ_temp_loss:
                         loss_neg = torch.zeros((), device=device, dtype=dtype)
                         if valid_neg.any():
                             s_neg = torch.matmul(proto_all[valid_neg], u_anchor)

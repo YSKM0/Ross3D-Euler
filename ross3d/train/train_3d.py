@@ -273,6 +273,10 @@ class ModelArguments:
     occ_temp_diff_weight: float = field(default=1.0)
     use_simple_occ_temp_loss: bool = field(default=False)
     use_positive_only_occ_temp_loss: bool = field(default=False)
+    use_softmax_occ_temp_loss: bool = field(default=False)
+    occ_temp_softmax_tau: float = field(default=0.07)
+    occ_temp_same_neg_weight: float = field(default=0.5)
+    occ_temp_diff_neg_weight: float = field(default=1.0)
 
 @dataclass
 class DataArguments:
@@ -1669,6 +1673,10 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args, load_so
     overwrite_config["use_occ_geom_obj_query"] = model_args.use_occ_geom_obj_query
     overwrite_config["use_simple_occ_temp_loss"] = model_args.use_simple_occ_temp_loss
     overwrite_config["use_positive_only_occ_temp_loss"] = model_args.use_positive_only_occ_temp_loss
+    overwrite_config["use_softmax_occ_temp_loss"] = model_args.use_softmax_occ_temp_loss
+    overwrite_config["occ_temp_softmax_tau"] = model_args.occ_temp_softmax_tau
+    overwrite_config["occ_temp_same_neg_weight"] = model_args.occ_temp_same_neg_weight
+    overwrite_config["occ_temp_diff_neg_weight"] = model_args.occ_temp_diff_neg_weight
     overwrite_config["occupancy_projector_dim"] = model_args.occupancy_projector_dim
     overwrite_config["occ_detach_hidden_states"] = model_args.occ_detach_hidden_states
 
@@ -1756,6 +1764,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args, load_so
     setattr(model.config, "use_occ_geom_obj_query", model_args.use_occ_geom_obj_query)
     setattr(model.config, "use_simple_occ_temp_loss", model_args.use_simple_occ_temp_loss)
     setattr(model.config, "use_positive_only_occ_temp_loss", model_args.use_positive_only_occ_temp_loss)
+    setattr(model.config, "use_softmax_occ_temp_loss", model_args.use_softmax_occ_temp_loss)
     setattr(model.config, "occ_geom_mask_weight", model_args.occ_geom_mask_weight)
     setattr(model.config, "occ_geom_box_weight", model_args.occ_geom_box_weight)
     setattr(model.config, "occ_geom_ctr_weight", model_args.occ_geom_ctr_weight)
@@ -1774,6 +1783,9 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args, load_so
     setattr(model.config, "occ_temp_same_weight", model_args.occ_temp_same_weight)
     setattr(model.config, "occ_temp_diff_margin", model_args.occ_temp_diff_margin)
     setattr(model.config, "occ_temp_diff_weight", model_args.occ_temp_diff_weight)
+    setattr(model.config, "occ_temp_softmax_tau", model_args.occ_temp_softmax_tau)
+    setattr(model.config, "occ_temp_same_neg_weight", model_args.occ_temp_same_neg_weight)
+    setattr(model.config, "occ_temp_diff_neg_weight", model_args.occ_temp_diff_neg_weight)
     setattr(model.config, "verbose_logging", training_args.verbose_logging)
     setattr(model.config, "gradient_checkpointing_use_reentrant", training_args.gradient_checkpointing_use_reentrant)
 
