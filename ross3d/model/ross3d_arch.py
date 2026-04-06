@@ -42,6 +42,7 @@ from ross3d.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATC
 from ross3d.mm_utils import get_anyres_image_grid_shape
 from ross3d.utils import rank0_print, rank_print
 import random
+import warnings
 
 
 def rlog(msg):
@@ -103,7 +104,8 @@ class Ross3DMetaModel:
         d_model = getattr(config, "hidden_size", None)
         occ_geom_enabled = bool(getattr(config, "enable_occ_geom_loss", False))
         occ_temp_enabled = bool(getattr(config, "enable_occ_temp_loss", False))
-        occ_aux_enabled = occ_geom_enabled or occ_temp_enabled
+        occ_obj3d_enabled = bool(getattr(config, "enable_occ_obj3d_loss", False))
+        occ_aux_enabled = occ_geom_enabled or occ_temp_enabled or occ_obj3d_enabled
         if d_model is not None and occ_aux_enabled:
             d_proj = getattr(config, "occupancy_projector_dim", None)
             d_proj = d_model if (d_proj is None) else d_proj
@@ -143,6 +145,21 @@ class Ross3DMetaModel:
                 nn.GELU(),
                 nn.Linear(d_proj, d_proj),
                 nn.LayerNorm(d_proj),
+            )
+            self.occ_obj3d_head_shared = nn.Sequential(
+                nn.LayerNorm(d_proj),
+                nn.Linear(d_proj, d_proj),
+                nn.GELU(),
+            )
+            self.occ_obj3d_center_head = nn.Sequential(
+                nn.Linear(d_proj, d_proj),
+                nn.GELU(),
+                nn.Linear(d_proj, 3),
+            )
+            self.occ_obj3d_size_head = nn.Sequential(
+                nn.Linear(d_proj, d_proj),
+                nn.GELU(),
+                nn.Linear(d_proj, 3),
             )
         
         if hasattr(self.config, 'world_position_embedding_type'):
@@ -3206,6 +3223,175 @@ class Ross3DMetaForCausalLM(ABC):
         return geom_loss.float()
 
     @torch._dynamo.disable
+    def compute_occupancy_obj3d_loss(
+        self,
+        occupancy_aux_outputs: Dict[str, Any],
+        video_dict: Optional[Dict[str, Any]] = None,
+        global_step: Optional[int] = "NA",
+    ) -> torch.Tensor:
+        setattr(self, "_occ_obj3d_center_loss", None)
+        setattr(self, "_occ_obj3d_size_loss", None)
+
+        obj3d_warn_enabled = bool(getattr(self.config, "occ_obj3d_warn", False))
+
+        def _obj3d_warn(msg: str) -> None:
+            if obj3d_warn_enabled:
+                warnings.warn(msg)
+        if occupancy_aux_outputs is None:
+            _obj3d_warn("[occ_obj3d_loss] Missing occupancy_aux_outputs; skipping loss.")
+            return torch.zeros(())
+        if video_dict is None:
+            _obj3d_warn("[occ_obj3d_loss] Missing video_dict; skipping loss.")
+            ref = occupancy_aux_outputs.get("object_embeddings", None)
+            if torch.is_tensor(ref):
+                return torch.zeros((), device=ref.device, dtype=ref.dtype)
+            return torch.zeros(())
+        if not hasattr(self.model, "occ_obj3d_head_shared"):
+            _obj3d_warn("[occ_obj3d_loss] Missing occ_obj3d heads; skipping loss.")
+            ref = occupancy_aux_outputs.get("object_embeddings", None)
+            if torch.is_tensor(ref):
+                return torch.zeros((), device=ref.device, dtype=ref.dtype)
+            return torch.zeros(())
+
+        Z = occupancy_aux_outputs.get("object_embeddings", None)
+        present = occupancy_aux_outputs.get("present", None)
+        obj_ids_union = occupancy_aux_outputs.get("obj_ids_union", None)
+        obj_labels_union = occupancy_aux_outputs.get("obj_labels_union", None)
+        if (Z is None) or (present is None) or (obj_ids_union is None):
+            _obj3d_warn("[occ_obj3d_loss] Missing object embeddings/present/object ids; skipping loss.")
+            ref = Z if torch.is_tensor(Z) else present
+            if torch.is_tensor(ref):
+                return torch.zeros((), device=ref.device, dtype=ref.dtype)
+            return torch.zeros(())
+        if Z.ndim != 3 or present.ndim != 2:
+            _obj3d_warn(
+                f"[occ_obj3d_loss] Invalid tensor ranks: object_embeddings.ndim={getattr(Z, 'ndim', None)}, "
+                f"present.ndim={getattr(present, 'ndim', None)}; skipping loss."
+            )
+            return torch.zeros((), device=Z.device, dtype=Z.dtype)
+        if Z.shape[:2] != present.shape:
+            _obj3d_warn(
+                f"[occ_obj3d_loss] Shape mismatch between object_embeddings {tuple(Z.shape)} and present {tuple(present.shape)}; "
+                "skipping loss."
+            )
+            return torch.zeros((), device=Z.device, dtype=Z.dtype)
+        if obj_ids_union.ndim != 1 or obj_ids_union.shape[0] != Z.shape[1]:
+            _obj3d_warn(
+                f"[occ_obj3d_loss] obj_ids_union shape mismatch: obj_ids_union={tuple(obj_ids_union.shape)} vs O={Z.shape[1]}; "
+                "skipping loss."
+            )
+            return torch.zeros((), device=Z.device, dtype=Z.dtype)
+
+        scene_id_from_aux = occupancy_aux_outputs.get("scene_id", None)
+        scene_id_from_video = video_dict.get("scene_id", None) if isinstance(video_dict, dict) else None
+        scene_id = scene_id_from_aux if scene_id_from_aux is not None else scene_id_from_video
+        scene_id = str(scene_id) if scene_id is not None else None
+        if not scene_id:
+            _obj3d_warn("[occ_obj3d_loss] Missing scene_id in aux/video metadata; skipping loss.")
+            return torch.zeros((), device=Z.device, dtype=Z.dtype)
+        if (scene_id_from_aux is not None) and (scene_id_from_video is not None) and (str(scene_id_from_aux) != str(scene_id_from_video)):
+            _obj3d_warn(
+                f"[occ_obj3d_loss] scene_id mismatch between aux ({scene_id_from_aux}) and video_dict ({scene_id_from_video})."
+            )
+
+        scene_obj3d_map = video_dict.get("obj3d_annotations", None)
+        if not isinstance(scene_obj3d_map, dict):
+            _obj3d_warn(f"[occ_obj3d_loss] Missing scene-level obj3d annotations for scene={scene_id}; skipping loss.")
+            return torch.zeros((), device=Z.device, dtype=Z.dtype)
+
+        matched_embeddings = []
+        gt_centers = []
+        gt_log_sizes = []
+        T, O, D = Z.shape
+        for o in range(O):
+            oid = int(obj_ids_union[o].item())
+            if oid not in scene_obj3d_map:
+                _obj3d_warn(f"[occ_obj3d_loss] Missing GT bbox for scene={scene_id}, object_id={oid}")
+                continue
+
+            gt_entry = scene_obj3d_map.get(oid, {})
+            bbox = gt_entry.get("bbox", None) if isinstance(gt_entry, dict) else None
+            center_fallback = gt_entry.get("center", None) if isinstance(gt_entry, dict) else None
+            gt_label = str(gt_entry.get("object_label", "")).strip().lower() if isinstance(gt_entry, dict) else ""
+            pred_label = ""
+            if isinstance(obj_labels_union, list) and (o < len(obj_labels_union)):
+                pred_label = str(obj_labels_union[o]).strip().lower()
+            if gt_label and pred_label and (gt_label != pred_label):
+                _obj3d_warn(
+                    f"[occ_obj3d_loss] Label mismatch for scene={scene_id}, object_id={oid}: "
+                    f"aux_label={pred_label}, gt_label={gt_label}"
+                )
+
+            if (not isinstance(bbox, (list, tuple))) or (len(bbox) != 6):
+                _obj3d_warn(
+                    f"[occ_obj3d_loss] Invalid bbox for scene={scene_id}, object_id={oid}; "
+                    f"expected length 6, got {None if bbox is None else len(bbox)}"
+                )
+                if isinstance(center_fallback, (list, tuple)) and (len(center_fallback) == 3):
+                    _obj3d_warn(
+                        f"[occ_obj3d_loss] scene={scene_id}, object_id={oid} has center fallback but missing valid bbox; skipping."
+                    )
+                continue
+
+            present_mask = present[:, o].to(dtype=torch.bool)
+            if not bool(present_mask.any().item()):
+                _obj3d_warn(
+                    f"[occ_obj3d_loss] object embedding exists but object never present for scene={scene_id}, object_id={oid}; skipping."
+                )
+                continue
+            obj_embedding = Z[present_mask, o].mean(dim=0)
+            if obj_embedding.shape[0] != D:
+                _obj3d_warn(
+                    f"[occ_obj3d_loss] Invalid pooled embedding shape for scene={scene_id}, object_id={oid}: "
+                    f"{tuple(obj_embedding.shape)}"
+                )
+                continue
+
+            gt_center = torch.tensor(bbox[0:3], device=Z.device, dtype=Z.dtype)
+            gt_size = torch.tensor(bbox[3:6], device=Z.device, dtype=Z.dtype)
+            if gt_center.shape[0] != 3 or gt_size.shape[0] != 3:
+                _obj3d_warn(f"[occ_obj3d_loss] Invalid center/size vector for scene={scene_id}, object_id={oid}; skipping.")
+                continue
+            gt_log_size = torch.log(gt_size.clamp_min(1e-6))
+
+            matched_embeddings.append(obj_embedding)
+            gt_centers.append(gt_center)
+            gt_log_sizes.append(gt_log_size)
+
+        if len(matched_embeddings) == 0:
+            _obj3d_warn(f"[occ_obj3d_loss] No valid matched objects for scene={scene_id}; skipping loss.")
+            return torch.zeros((), device=Z.device, dtype=Z.dtype)
+
+        matched_embeddings = torch.stack(matched_embeddings, dim=0)
+        gt_center = torch.stack(gt_centers, dim=0)
+        gt_log_size = torch.stack(gt_log_sizes, dim=0)
+
+        shared_feat = self.model.occ_obj3d_head_shared(matched_embeddings)
+        pred_center_3d = self.model.occ_obj3d_center_head(shared_feat)
+        pred_log_size_3d = self.model.occ_obj3d_size_head(shared_feat)
+
+        if pred_center_3d.shape != gt_center.shape:
+            _obj3d_warn(
+                f"[occ_obj3d_loss] Shape mismatch for center: pred={tuple(pred_center_3d.shape)}, gt={tuple(gt_center.shape)}; "
+                "skipping loss."
+            )
+            return torch.zeros((), device=Z.device, dtype=Z.dtype)
+        if pred_log_size_3d.shape != gt_log_size.shape:
+            _obj3d_warn(
+                f"[occ_obj3d_loss] Shape mismatch for size: pred={tuple(pred_log_size_3d.shape)}, gt={tuple(gt_log_size.shape)}; "
+                "skipping loss."
+            )
+            return torch.zeros((), device=Z.device, dtype=Z.dtype)
+
+        loss_center = F.smooth_l1_loss(pred_center_3d, gt_center, reduction="mean")
+        loss_size = F.smooth_l1_loss(pred_log_size_3d, gt_log_size, reduction="mean")
+        setattr(self, "_occ_obj3d_center_loss", loss_center.float())
+        setattr(self, "_occ_obj3d_size_loss", loss_size.float())
+        lambda_center = float(getattr(self.config, "occ_obj3d_center_weight", 1.0))
+        lambda_size = float(getattr(self.config, "occ_obj3d_size_weight", 1.0))
+        return (lambda_center * loss_center + lambda_size * loss_size).float()
+
+    @torch._dynamo.disable
     def compute_occupancy_temporal_loss(
         self,
         occupancy_aux_outputs: Dict[str, Any],
@@ -4435,3 +4621,6 @@ class CausalLMOutputWithPastRoss(ModelOutput):
     occ_geom_mask_dice_loss: Optional[torch.FloatTensor] = None
     occ_geom_box_l1_loss: Optional[torch.FloatTensor] = None
     occ_geom_box_giou_loss: Optional[torch.FloatTensor] = None
+    occ_obj3d_loss: Optional[torch.FloatTensor] = None
+    occ_obj3d_center_loss: Optional[torch.FloatTensor] = None
+    occ_obj3d_size_loss: Optional[torch.FloatTensor] = None

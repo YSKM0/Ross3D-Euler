@@ -84,6 +84,11 @@ class Ross3DQwenConfig(Qwen2Config):
         self.occ_geom_eps = kwargs.get("occ_geom_eps", 1e-6)
         self.enable_occ_temp_loss = kwargs.get("enable_occ_temp_loss", False)
         self.occ_temp_loss_weight = kwargs.get("occ_temp_loss_weight", 0.0)
+        self.enable_occ_obj3d_loss = kwargs.get("enable_occ_obj3d_loss", False)
+        self.occ_obj3d_loss_weight = kwargs.get("occ_obj3d_loss_weight", 0.0)
+        self.occ_obj3d_warn = kwargs.get("occ_obj3d_warn", False)
+        self.occ_obj3d_center_weight = kwargs.get("occ_obj3d_center_weight", 1.0)
+        self.occ_obj3d_size_weight = kwargs.get("occ_obj3d_size_weight", 1.0)
         self.occ_temp_eps = kwargs.get("occ_temp_eps", 1e-6)
         self.occ_temp_min_frames = kwargs.get("occ_temp_min_frames", 2)
         self.occ_temp_pos_weight = kwargs.get("occ_temp_pos_weight", 1.0)
@@ -657,7 +662,8 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
         temp_time = 0.0
         occ_geom_enabled = bool(getattr(self.config, "enable_occ_geom_loss", False))
         occ_temp_enabled = bool(getattr(self.config, "enable_occ_temp_loss", False))
-        occ_aux_enabled = occ_geom_enabled or occ_temp_enabled
+        occ_obj3d_enabled = bool(getattr(self.config, "enable_occ_obj3d_loss", False))
+        occ_aux_enabled = occ_geom_enabled or occ_temp_enabled or occ_obj3d_enabled
         scene_id = video_dict.get("scene_id", "NA") if isinstance(video_dict, dict) else "NA"
         has_occ_targets = bool(isinstance(video_dict, dict) and video_dict.get("patch_occupancy", None) is not None)
         has_temporal_targets = bool(isinstance(video_dict, dict) and video_dict.get("frame_ids", None) is not None)
@@ -685,7 +691,7 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
                 video_dict=video_dict,
                 global_step=global_step,
                 need_patch_embeddings=occ_geom_enabled,
-                need_geom_metadata=occ_geom_enabled,
+                need_geom_metadata=(occ_geom_enabled or occ_obj3d_enabled),
                 need_temp_metadata=occ_temp_enabled,
             )
             used_patch_proj = bool(getattr(self, "_occ_dbg_used_patch_proj", False))
@@ -767,6 +773,27 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             temp_return_reason = getattr(self, "_occ_dbg_temp_return_reason", None)
             loss = loss + getattr(self.config, "occ_temp_loss_weight", 0.0) * occ_temp_loss
         rlog("OCC_AFTER_TEMP_LOSS")
+
+        occ_obj3d_loss = None
+        occ_obj3d_center_loss = None
+        occ_obj3d_size_loss = None
+        if (
+            self.training
+            and occ_obj3d_enabled
+        ):
+            occ_obj3d_loss = self.compute_occupancy_obj3d_loss(
+                occupancy_aux_outputs=occupancy_aux_outputs,
+                video_dict=video_dict,
+                global_step=global_step,
+            )
+            occ_obj3d_loss = occ_obj3d_loss.float()
+            occ_obj3d_center_loss = getattr(self, "_occ_obj3d_center_loss", None)
+            occ_obj3d_size_loss = getattr(self, "_occ_obj3d_size_loss", None)
+            if occ_obj3d_center_loss is None:
+                occ_obj3d_center_loss = occ_obj3d_loss.new_zeros(())
+            if occ_obj3d_size_loss is None:
+                occ_obj3d_size_loss = occ_obj3d_loss.new_zeros(())
+            loss = loss + getattr(self.config, "occ_obj3d_loss_weight", 0.0) * occ_obj3d_loss
 
         # Hanwliu
         cycle_loss = None
@@ -866,6 +893,9 @@ class Ross3DQwenForCausalLM(Qwen2ForCausalLM, Ross3DMetaForCausalLM):
             occ_geom_mask_dice_loss=occ_geom_mask_dice_loss,
             occ_geom_box_l1_loss=occ_geom_box_l1_loss,
             occ_geom_box_giou_loss=occ_geom_box_giou_loss,
+            occ_obj3d_loss=occ_obj3d_loss,
+            occ_obj3d_center_loss=occ_obj3d_center_loss,
+            occ_obj3d_size_loss=occ_obj3d_size_loss,
         )
 
     @torch.no_grad()

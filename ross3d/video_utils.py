@@ -12,6 +12,7 @@ from tqdm import tqdm
 import random
 import copy
 import tempfile
+import warnings
 
 from ross3d.utils import rank0_print
 
@@ -186,6 +187,8 @@ class VideoProcessor:
         fvs_cache_file='data/metadata/scannet_fvs_selected_frames.json',
         occupancy_root=None,
         coordinates_root=None,
+        obj3d_json_path=None,
+        occ_obj3d_warn=False,
     ):
         self.video_folder = video_folder
         self.voxel_size = voxel_size
@@ -195,6 +198,9 @@ class VideoProcessor:
         self.fvs_cache_file = fvs_cache_file
         self.occupancy_root = occupancy_root
         self.coordinates_root = coordinates_root
+        self.obj3d_json_path = obj3d_json_path
+        self.occ_obj3d_warn = bool(occ_obj3d_warn)
+        self.obj3d_scene_to_objects = self._load_obj3d_annotations()
         self.scene = {}
         print('============ frame sampling strategy: {} ============='.format(self.frame_sampling_strategy))
 
@@ -586,6 +592,7 @@ class VideoProcessor:
             "frame_ids": [os.path.splitext(os.path.basename(f))[0] for f in frame_files],
             "patch_occupancy": self._load_patch_occupancy_annotations(video_id, frame_files),
             "visible_bboxes": self._load_visible_bboxes_annotations(video_id, frame_files),
+            "obj3d_annotations": self.obj3d_scene_to_objects.get(video_id, None),
             # "world_coords_norm": resized_coords_norm
         }
 
@@ -651,6 +658,63 @@ class VideoProcessor:
         assert len(annotations) == len(frame_files)
         return annotations
 
+    def _load_obj3d_annotations(self):
+        scene_to_objects = {}
+        def _obj3d_warn(msg: str) -> None:
+            if self.occ_obj3d_warn:
+                warnings.warn(msg)
+
+        if not self.obj3d_json_path:
+            return scene_to_objects
+        if not os.path.exists(self.obj3d_json_path):
+            _obj3d_warn(f"[occ_obj3d_loss] obj3d_json_path not found: {self.obj3d_json_path}")
+            return scene_to_objects
+
+        try:
+            with open(self.obj3d_json_path, "r") as f:
+                data = json.load(f)
+        except Exception as exc:
+            _obj3d_warn(f"[occ_obj3d_loss] Failed to load obj3d json {self.obj3d_json_path}: {exc}")
+            return scene_to_objects
+
+        if not isinstance(data, list):
+            _obj3d_warn(f"[occ_obj3d_loss] Invalid obj3d json format (expected list): {self.obj3d_json_path}")
+            return scene_to_objects
+
+        for scene_entry in data:
+            if not isinstance(scene_entry, dict):
+                _obj3d_warn("[occ_obj3d_loss] Invalid scene entry in obj3d json (expected dict).")
+                continue
+            scene_id = str(scene_entry.get("scene_id", "")).strip()
+            if not scene_id:
+                _obj3d_warn("[occ_obj3d_loss] Missing scene_id in obj3d json entry.")
+                continue
+            objects = scene_entry.get("objects", [])
+            if not isinstance(objects, list):
+                _obj3d_warn(f"[occ_obj3d_loss] scene={scene_id} has invalid objects field (expected list).")
+                continue
+
+            obj_map = scene_to_objects.setdefault(scene_id, {})
+            for obj in objects:
+                if not isinstance(obj, dict):
+                    _obj3d_warn(f"[occ_obj3d_loss] scene={scene_id} has invalid object entry (expected dict).")
+                    continue
+                if "object_id" not in obj:
+                    _obj3d_warn(f"[occ_obj3d_loss] scene={scene_id} object missing object_id.")
+                    continue
+                try:
+                    object_id = int(obj["object_id"])
+                except Exception:
+                    _obj3d_warn(f"[occ_obj3d_loss] scene={scene_id} has non-integer object_id={obj.get('object_id')}.")
+                    continue
+                obj_map[object_id] = {
+                    "bbox": obj.get("bbox", None),
+                    "center": obj.get("center", None),
+                    "object_label": obj.get("object_label", None),
+                }
+
+        return scene_to_objects
+
     def process_3d_video(
         self,
         video_id: str, 
@@ -697,7 +761,7 @@ def merge_video_dict(video_dict_list):
             for video_dict in video_dict_list:
                 if video_dict[k] is not None:
                     new_video_dict[k].append(video_dict[k])
-        elif k in ['patch_occupancy', 'visible_bboxes', 'frame_ids', 'scene_id']:
+        elif k in ['patch_occupancy', 'visible_bboxes', 'frame_ids', 'scene_id', 'obj3d_annotations']:
             new_video_dict[k] = video_dict_list[0][k]
 
     new_video_dict['box_input'] = torch.Tensor(new_video_dict['box_input'])

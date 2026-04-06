@@ -1446,7 +1446,7 @@ class Ross3DTrainer(Trainer):
             return msg
 
         parts = [_fmt_tensor_finite("loss", loss)]
-        for key in ["lm_loss", "vm_loss", "bev_loss", "cycle_loss", "occ_geom_loss", "occ_temp_loss"]:
+        for key in ["lm_loss", "vm_loss", "bev_loss", "cycle_loss", "occ_geom_loss", "occ_temp_loss", "occ_obj3d_loss", "occ_obj3d_center_loss", "occ_obj3d_size_loss"]:
             parts.append(_fmt_tensor_finite(key, outputs.get(key, None) if isinstance(outputs, dict) else None))
         rank0_print("[NAN_DEBUG][loss] " + " | ".join(parts))
 
@@ -1785,7 +1785,7 @@ class Ross3DTrainer(Trainer):
         if len(targets) == 0:
             return
 
-        loss_keys = ["lm_loss", "occ_temp_loss", "occ_geom_loss", "vm_loss", "bev_loss", "cycle_loss", "loss"]
+        loss_keys = ["lm_loss", "occ_temp_loss", "occ_geom_loss", "occ_obj3d_loss", "occ_obj3d_center_loss", "occ_obj3d_size_loss", "vm_loss", "bev_loss", "cycle_loss", "loss"]
         for key in loss_keys:
             loss_term = outputs.get(key, None)
             if loss_term is None or (not torch.is_tensor(loss_term)):
@@ -1840,6 +1840,12 @@ class Ross3DTrainer(Trainer):
                     log_dict[key] = round(value.item(), 4)
         if outputs.get("occ_temp_loss", None) is not None:
             log_dict["occ_temp_loss"] = round(outputs["occ_temp_loss"].item(), 4)
+        if outputs.get("occ_obj3d_loss", None) is not None:
+            log_dict["occ_obj3d_loss"] = round(outputs["occ_obj3d_loss"].item(), 4)
+        if outputs.get("occ_obj3d_center_loss", None) is not None:
+            log_dict["occ_obj3d_center_loss"] = round(outputs["occ_obj3d_center_loss"].item(), 4)
+        if outputs.get("occ_obj3d_size_loss", None) is not None:
+            log_dict["occ_obj3d_size_loss"] = round(outputs["occ_obj3d_size_loss"].item(), 4)
 
         if len(log_dict) > 0:
             self.log(log_dict)

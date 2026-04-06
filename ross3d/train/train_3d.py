@@ -254,6 +254,11 @@ class ModelArguments:
 
     enable_occ_temp_loss: bool = field(default=False)
     occ_temp_loss_weight: float = field(default=0.0)
+    enable_occ_obj3d_loss: bool = field(default=False)
+    occ_obj3d_loss_weight: float = field(default=0.0)
+    occ_obj3d_warn: bool = field(default=False)
+    occ_obj3d_center_weight: float = field(default=1.0)
+    occ_obj3d_size_weight: float = field(default=1.0)
 
     use_occupancy_patch_projector: bool = field(default=True)
     use_occ_temp_projector: bool = field(default=True)
@@ -311,6 +316,10 @@ class DataArguments:
     coordinates_root: Optional[str] = field(
         default=None,
         metadata={"help": "Root directory containing per-scene visible bboxes JSON annotations."},
+    )
+    obj3d_json_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Global JSON file containing per-scene object-level 3D bbox annotations."},
     )
 
 
@@ -1196,6 +1205,8 @@ class LazySupervisedDataset(Dataset):
             fvs_cache_file=getattr(data_args, "fvs_cache_file", 'data/metadata/scannet_fvs_selected_frames.json'),
             occupancy_root=getattr(data_args, "occupancy_root", None),
             coordinates_root=getattr(data_args, "coordinates_root", None),
+            obj3d_json_path=getattr(data_args, "obj3d_json_path", None),
+            occ_obj3d_warn=getattr(data_args, "occ_obj3d_warn", False),
         )
 
         # Handle multiple JSON files specified in the data_path
@@ -1667,6 +1678,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args, load_so
     overwrite_config["enable_bev_loss"] = model_args.enable_bev_loss
     overwrite_config["enable_occ_geom_loss"] = model_args.enable_occ_geom_loss
     overwrite_config["enable_occ_temp_loss"] = model_args.enable_occ_temp_loss
+    overwrite_config["enable_occ_obj3d_loss"] = model_args.enable_occ_obj3d_loss
     overwrite_config["use_occupancy_patch_projector"] = model_args.use_occupancy_patch_projector
     overwrite_config["use_occ_temp_projector"] = model_args.use_occ_temp_projector
     overwrite_config["use_occ_geom_patch_norm"] = model_args.use_occ_geom_patch_norm
@@ -1677,6 +1689,10 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args, load_so
     overwrite_config["occ_temp_softmax_tau"] = model_args.occ_temp_softmax_tau
     overwrite_config["occ_temp_same_neg_weight"] = model_args.occ_temp_same_neg_weight
     overwrite_config["occ_temp_diff_neg_weight"] = model_args.occ_temp_diff_neg_weight
+    overwrite_config["occ_obj3d_loss_weight"] = model_args.occ_obj3d_loss_weight
+    overwrite_config["occ_obj3d_warn"] = model_args.occ_obj3d_warn
+    overwrite_config["occ_obj3d_center_weight"] = model_args.occ_obj3d_center_weight
+    overwrite_config["occ_obj3d_size_weight"] = model_args.occ_obj3d_size_weight
     overwrite_config["occupancy_projector_dim"] = model_args.occupancy_projector_dim
     overwrite_config["occ_detach_hidden_states"] = model_args.occ_detach_hidden_states
 
@@ -1775,6 +1791,11 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args, load_so
     setattr(model.config, "occ_geom_eps", model_args.occ_geom_eps)
     setattr(model.config, "enable_occ_temp_loss", model_args.enable_occ_temp_loss)
     setattr(model.config, "occ_temp_loss_weight", model_args.occ_temp_loss_weight)
+    setattr(model.config, "enable_occ_obj3d_loss", model_args.enable_occ_obj3d_loss)
+    setattr(model.config, "occ_obj3d_loss_weight", model_args.occ_obj3d_loss_weight)
+    setattr(model.config, "occ_obj3d_warn", model_args.occ_obj3d_warn)
+    setattr(model.config, "occ_obj3d_center_weight", model_args.occ_obj3d_center_weight)
+    setattr(model.config, "occ_obj3d_size_weight", model_args.occ_obj3d_size_weight)
     setattr(model.config, "occ_temp_eps", model_args.occ_temp_eps)
     setattr(model.config, "occ_temp_min_frames", model_args.occ_temp_min_frames)
     setattr(model.config, "occ_temp_pos_weight", model_args.occ_temp_pos_weight)
