@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-MID_RUN_NAME="ross3d-train-4"
+MID_RUN_NAME="test-r4"
 echo "MID_RUN_NAME: ${MID_RUN_NAME}"
 
 # Slurm context (these should exist inside the allocation step)
@@ -14,17 +14,12 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 
 set -x
 
-# Rank-0 node hostname becomes the rendezvous master
-MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-
-# Pick a port; keep your default
+# Use local hostname; avoid scontrol inside the container runtime
+MASTER_ADDR="${SLURMD_NODENAME:-$(hostname)}"
 MASTER_PORT="${MASTER_PORT:-20409}"
 
-# For a 2-node job with --ntasks-per-node=1, Slurm starts 2 tasks:
-#   SLURM_PROCID = 0 on node 0, 1 on node 1
-# We use that as the torchrun node_rank.
-NODE_RANK="${SLURM_NODEID}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+NODE_RANK="${SLURM_NODEID:-0}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 
 # Required for multi-node: SLURM_NNODES must be set
 : "${SLURM_NNODES:?SLURM_NNODES is not set. Are you running under srun/sbatch?}"
@@ -107,4 +102,4 @@ python -m torch.distributed.run \
   --verbose_logging False \
   --cycle_debug_grad False \
   --cycle_debug_optimizer False \
-  --report_to wandb 
+  --report_to wandb

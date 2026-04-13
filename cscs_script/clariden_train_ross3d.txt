@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --account=a144                  # CSCS project/account to charge
 #SBATCH --partition=normal              # Clariden production partition ("normal") :contentReference[oaicite:1]{index=1}
-#SBATCH --job-name=rt1         # short, descriptive job name
+#SBATCH --job-name=r4       # short, descriptive job name
 #SBATCH --time=12:00:00                # matches your interactive --time=1:30:00
 
 #SBATCH --nodes=1                       # interactive srun defaults to a single allocation unless requested otherwise
@@ -28,10 +28,6 @@ export WANDB_API_KEY="wandb_v1_HWZCob8EJKyrPL8cU2JWeV1Io6m_54eIfX1yigdZDsDBN39bK
 # CSCS recommends using --environment with srun in batch scripts (and discourages #SBATCH --environment). :contentReference[oaicite:6]{index=6}
 
 srun -ul --environment=./clariden-ngc-pytorch-24.10-ffmpeg-original.toml bash -lc "
-  #export TORCH_COMPILE_DISABLE=1
-  #export TORCHDYNAMO_DISABLE=1
-  #export DISABLE_TORCHDYNAMO=1
-
   cd /iopsstor/scratch/cscs/hanwliu/project/Ross3D-Euler
 
   # Activate your venv exactly like in the interactive session
