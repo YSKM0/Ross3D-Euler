@@ -181,13 +181,6 @@ class Ross3DMetaModel:
             # elif "slp" in self.config.world_position_embedding_type:
             #     self.world_position_embedding = PositionEmbeddingSine3DMLP(config.hidden_size, n_points=n_points)
 
-        # self.mm_inv_projector = build_inv_projector(self.config)
-        # self.mm_pixel_decoder = build_pixel_decoder(self.config)
-        # # other necessary information for reconstruction
-        # self.image_embed_len = math.ceil(
-        #     (self.vision_tower.config.image_size // self.vision_tower.config.patch_size)
-        #     / float(self.config.mm_spatial_pool_stride)) ** 2
-
         self._audit_special_param_finiteness("post_model_init_complete")
         self._audit_special_param_aliases("post_model_init_complete")
 
@@ -279,6 +272,7 @@ class Ross3DMetaModel:
         return vision_tower
 
     def initialize_vision_modules(self, model_args, fsdp=None):
+        resume_from_full_checkpoint = bool(getattr(model_args, "resume_from_full_checkpoint", False))
         vision_tower = model_args.vision_tower
         mm_vision_select_layer = model_args.mm_vision_select_layer
         mm_vision_select_feature = model_args.mm_vision_select_feature
@@ -290,8 +284,10 @@ class Ross3DMetaModel:
         pretrain_mm_inv_adapter = model_args.pretrain_mm_inv_adapter
 
         self.config.mm_vision_tower = vision_tower
-        self.config.vision_tower_pretrained = getattr(model_args, "vision_tower_pretrained", "")
-        self.config.mm_pixel_decoder = mm_pixel_decoder
+        if not resume_from_full_checkpoint or not getattr(self.config, "vision_tower_pretrained", None):
+            self.config.vision_tower_pretrained = getattr(model_args, "vision_tower_pretrained", "")
+        if not resume_from_full_checkpoint or getattr(self.config, "mm_pixel_decoder", None) is None:
+            self.config.mm_pixel_decoder = mm_pixel_decoder
 
         if self.get_vision_tower() is None:
             vision_tower = build_vision_tower(model_args)
@@ -361,7 +357,7 @@ class Ross3DMetaModel:
             for p in self.mm_projector.parameters():
                 p.requires_grad = True
 
-        if pretrain_mm_mlp_adapter is not None:
+        if pretrain_mm_mlp_adapter is not None and not resume_from_full_checkpoint:
             self._audit_special_param_finiteness("initialize_vision_modules.before_checkpoint_load")
             mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location="cpu")
             mask_ckpt_keys = [k for k in mm_projector_weights.keys() if ("mask_token" in k) or ("image_newline" in k)]
@@ -392,6 +388,8 @@ class Ross3DMetaModel:
             self._sanitize_mask_token_if_nonfinite("initialize_vision_modules.after_checkpoint_load")
             self._audit_special_param_finiteness("initialize_vision_modules.after_checkpoint_load")
             self._audit_special_param_aliases("initialize_vision_modules.after_checkpoint_load")
+        elif pretrain_mm_mlp_adapter is not None and resume_from_full_checkpoint:
+            rank0_print("[resume] initialize_vision_modules: skipped pretrain_mm_mlp_adapter load for full-checkpoint resume.")
 
         self.config.ross_enable = False
         self._audit_special_param_finiteness("initialize_vision_modules.after_precision_cast_or_to")
@@ -401,7 +399,8 @@ class Ross3DMetaModel:
         if getattr(model_args, 'mm_pixel_decoder', False):
             self.config.ross_enable = True
             ### build pixel decoder
-            self.mm_pixel_decoder = build_pixel_decoder(self.config)
+            if not (resume_from_full_checkpoint and getattr(self, "mm_pixel_decoder", None) is not None):
+                self.mm_pixel_decoder = build_pixel_decoder(self.config)
             self.config.mm_inv_hidden_size = self.mm_pixel_decoder.latent_dim
 
             ### build LLM-CLIP projector
@@ -415,7 +414,7 @@ class Ross3DMetaModel:
                 for p in self.mm_inv_projector.parameters():
                     p.requires_grad = True
 
-            if pretrain_mm_inv_adapter is not None:
+            if pretrain_mm_inv_adapter is not None and not resume_from_full_checkpoint:
                 rank0_print(f"=> loading pretrain_mm_inv_adapter from {pretrain_mm_inv_adapter} ...")
                 mm_inv_projector_weights = torch.load(pretrain_mm_inv_adapter, map_location='cpu')
 
@@ -480,6 +479,8 @@ class Ross3DMetaModel:
 
                 msg = self.mm_inv_projector.load_state_dict(get_w(mm_inv_projector_weights, 'mm_inv_projector'), strict=False)
                 print(msg)
+            elif pretrain_mm_inv_adapter is not None and resume_from_full_checkpoint:
+                rank0_print("[resume] initialize_vision_modules: skipped pretrain_mm_inv_adapter load for full-checkpoint resume.")
 
             self.config.ross_multi_task = False
             if getattr(model_args, 'ross_multi_task', False):

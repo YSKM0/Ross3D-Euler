@@ -1576,7 +1576,338 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, dat
     return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
 
-def get_model(model_args, training_args, bnb_model_from_pretrained_args, load_source=None):
+def _find_embed_tokens_weight_key(weight_names):
+    for weight_name in weight_names:
+        if weight_name.endswith("embed_tokens.weight"):
+            return weight_name
+    for weight_name in weight_names:
+        if "embed_tokens.weight" in weight_name:
+            return weight_name
+    return None
+
+
+def _find_weight_key(weight_names, target_suffix):
+    for weight_name in weight_names:
+        if weight_name == target_suffix:
+            return weight_name
+    for weight_name in weight_names:
+        if weight_name.endswith(target_suffix):
+            return weight_name
+    for weight_name in weight_names:
+        if target_suffix in weight_name:
+            return weight_name
+    return None
+
+
+def _inspect_resume_embed_rows_from_checkpoint(resume_checkpoint):
+    safetensors_file = os.path.join(resume_checkpoint, "model.safetensors")
+    safetensors_index_file = os.path.join(resume_checkpoint, "model.safetensors.index.json")
+    pytorch_file = os.path.join(resume_checkpoint, "pytorch_model.bin")
+    pytorch_index_file = os.path.join(resume_checkpoint, "pytorch_model.bin.index.json")
+
+    if os.path.exists(safetensors_file):
+        from safetensors import safe_open
+
+        with safe_open(safetensors_file, framework="pt", device="cpu") as checkpoint_file:
+            embed_weight_key = _find_embed_tokens_weight_key(checkpoint_file.keys())
+            if embed_weight_key is not None:
+                return checkpoint_file.get_slice(embed_weight_key).get_shape()[0]
+
+    if os.path.exists(safetensors_index_file):
+        from safetensors import safe_open
+
+        with open(safetensors_index_file, "r") as f:
+            index_json = json.load(f)
+        weight_map = index_json.get("weight_map", {})
+        embed_weight_key = _find_embed_tokens_weight_key(weight_map.keys())
+        if embed_weight_key is not None:
+            shard_name = weight_map[embed_weight_key]
+            shard_path = os.path.join(resume_checkpoint, shard_name)
+            with safe_open(shard_path, framework="pt", device="cpu") as checkpoint_file:
+                return checkpoint_file.get_slice(embed_weight_key).get_shape()[0]
+
+    if os.path.exists(pytorch_file):
+        state_dict = torch.load(pytorch_file, map_location="cpu")
+        embed_weight_key = _find_embed_tokens_weight_key(state_dict.keys())
+        if embed_weight_key is not None:
+            return state_dict[embed_weight_key].shape[0]
+
+    if os.path.exists(pytorch_index_file):
+        with open(pytorch_index_file, "r") as f:
+            index_json = json.load(f)
+        weight_map = index_json.get("weight_map", {})
+        embed_weight_key = _find_embed_tokens_weight_key(weight_map.keys())
+        if embed_weight_key is not None:
+            shard_name = weight_map[embed_weight_key]
+            shard_path = os.path.join(resume_checkpoint, shard_name)
+            state_dict = torch.load(shard_path, map_location="cpu")
+            return state_dict[embed_weight_key].shape[0]
+
+    return None
+
+
+def _load_checkpoint_tensor_by_key(resume_checkpoint, target_suffix):
+    safetensors_file = os.path.join(resume_checkpoint, "model.safetensors")
+    safetensors_index_file = os.path.join(resume_checkpoint, "model.safetensors.index.json")
+    pytorch_file = os.path.join(resume_checkpoint, "pytorch_model.bin")
+    pytorch_index_file = os.path.join(resume_checkpoint, "pytorch_model.bin.index.json")
+
+    if os.path.exists(safetensors_file):
+        from safetensors import safe_open
+
+        with safe_open(safetensors_file, framework="pt", device="cpu") as checkpoint_file:
+            weight_key = _find_weight_key(checkpoint_file.keys(), target_suffix)
+            if weight_key is not None:
+                return checkpoint_file.get_tensor(weight_key), weight_key
+
+    if os.path.exists(safetensors_index_file):
+        from safetensors import safe_open
+
+        with open(safetensors_index_file, "r") as f:
+            index_json = json.load(f)
+        weight_map = index_json.get("weight_map", {})
+        weight_key = _find_weight_key(weight_map.keys(), target_suffix)
+        if weight_key is not None:
+            shard_name = weight_map[weight_key]
+            shard_path = os.path.join(resume_checkpoint, shard_name)
+            with safe_open(shard_path, framework="pt", device="cpu") as checkpoint_file:
+                return checkpoint_file.get_tensor(weight_key), weight_key
+
+    if os.path.exists(pytorch_file):
+        state_dict = torch.load(pytorch_file, map_location="cpu")
+        weight_key = _find_weight_key(state_dict.keys(), target_suffix)
+        if weight_key is not None:
+            return state_dict[weight_key], weight_key
+
+    if os.path.exists(pytorch_index_file):
+        with open(pytorch_index_file, "r") as f:
+            index_json = json.load(f)
+        weight_map = index_json.get("weight_map", {})
+        weight_key = _find_weight_key(weight_map.keys(), target_suffix)
+        if weight_key is not None:
+            shard_name = weight_map[weight_key]
+            shard_path = os.path.join(resume_checkpoint, shard_name)
+            state_dict = torch.load(shard_path, map_location="cpu")
+            return state_dict[weight_key], weight_key
+
+    return None, None
+
+
+def _inspect_checkpoint_rows_by_suffix(resume_checkpoint, target_suffix):
+    tensor, _ = _load_checkpoint_tensor_by_key(resume_checkpoint, target_suffix)
+    if tensor is None:
+        return None
+    return tensor.shape[0]
+
+
+def _load_prefix_state_dict_from_checkpoint(resume_checkpoint, prefix):
+    state_dict = {}
+    safetensors_file = os.path.join(resume_checkpoint, "model.safetensors")
+    safetensors_index_file = os.path.join(resume_checkpoint, "model.safetensors.index.json")
+    pytorch_file = os.path.join(resume_checkpoint, "pytorch_model.bin")
+    pytorch_index_file = os.path.join(resume_checkpoint, "pytorch_model.bin.index.json")
+
+    if os.path.exists(safetensors_file):
+        from safetensors import safe_open
+
+        with safe_open(safetensors_file, framework="pt", device="cpu") as checkpoint_file:
+            for key in checkpoint_file.keys():
+                if key.startswith(prefix):
+                    state_dict[key[len(prefix):]] = checkpoint_file.get_tensor(key)
+        return state_dict
+
+    if os.path.exists(safetensors_index_file):
+        from safetensors import safe_open
+
+        with open(safetensors_index_file, "r") as f:
+            index_json = json.load(f)
+        weight_map = index_json.get("weight_map", {})
+        keys_by_shard = {}
+        for key, shard_name in weight_map.items():
+            if key.startswith(prefix):
+                keys_by_shard.setdefault(shard_name, []).append(key)
+        for shard_name, shard_keys in keys_by_shard.items():
+            shard_path = os.path.join(resume_checkpoint, shard_name)
+            with safe_open(shard_path, framework="pt", device="cpu") as checkpoint_file:
+                for key in shard_keys:
+                    state_dict[key[len(prefix):]] = checkpoint_file.get_tensor(key)
+        return state_dict
+
+    if os.path.exists(pytorch_file):
+        full_state_dict = torch.load(pytorch_file, map_location="cpu")
+        for key, value in full_state_dict.items():
+            if key.startswith(prefix):
+                state_dict[key[len(prefix):]] = value
+        return state_dict
+
+    if os.path.exists(pytorch_index_file):
+        with open(pytorch_index_file, "r") as f:
+            index_json = json.load(f)
+        weight_map = index_json.get("weight_map", {})
+        keys_by_shard = {}
+        for key, shard_name in weight_map.items():
+            if key.startswith(prefix):
+                keys_by_shard.setdefault(shard_name, []).append(key)
+        for shard_name, shard_keys in keys_by_shard.items():
+            shard_path = os.path.join(resume_checkpoint, shard_name)
+            shard_state_dict = torch.load(shard_path, map_location="cpu")
+            for key in shard_keys:
+                state_dict[key[len(prefix):]] = shard_state_dict[key]
+        return state_dict
+
+    return state_dict
+
+
+def _load_checkpoint_state_dict_without_lm_head(resume_checkpoint):
+    state_dict = {}
+    safetensors_file = os.path.join(resume_checkpoint, "model.safetensors")
+    safetensors_index_file = os.path.join(resume_checkpoint, "model.safetensors.index.json")
+    pytorch_file = os.path.join(resume_checkpoint, "pytorch_model.bin")
+    pytorch_index_file = os.path.join(resume_checkpoint, "pytorch_model.bin.index.json")
+
+    def _keep_key(key):
+        return not key.endswith("lm_head.weight")
+
+    if os.path.exists(safetensors_file):
+        from safetensors import safe_open
+
+        with safe_open(safetensors_file, framework="pt", device="cpu") as checkpoint_file:
+            for key in checkpoint_file.keys():
+                if _keep_key(key):
+                    state_dict[key] = checkpoint_file.get_tensor(key)
+        return state_dict
+
+    if os.path.exists(safetensors_index_file):
+        from safetensors import safe_open
+
+        with open(safetensors_index_file, "r") as f:
+            index_json = json.load(f)
+        weight_map = index_json.get("weight_map", {})
+        keys_by_shard = {}
+        for key, shard_name in weight_map.items():
+            if _keep_key(key):
+                keys_by_shard.setdefault(shard_name, []).append(key)
+        for shard_name, shard_keys in keys_by_shard.items():
+            shard_path = os.path.join(resume_checkpoint, shard_name)
+            with safe_open(shard_path, framework="pt", device="cpu") as checkpoint_file:
+                for key in shard_keys:
+                    state_dict[key] = checkpoint_file.get_tensor(key)
+        return state_dict
+
+    if os.path.exists(pytorch_file):
+        full_state_dict = torch.load(pytorch_file, map_location="cpu")
+        for key, value in full_state_dict.items():
+            if _keep_key(key):
+                state_dict[key] = value
+        return state_dict
+
+    if os.path.exists(pytorch_index_file):
+        with open(pytorch_index_file, "r") as f:
+            index_json = json.load(f)
+        weight_map = index_json.get("weight_map", {})
+        keys_by_shard = {}
+        for key, shard_name in weight_map.items():
+            if _keep_key(key):
+                keys_by_shard.setdefault(shard_name, []).append(key)
+        for shard_name, shard_keys in keys_by_shard.items():
+            shard_path = os.path.join(resume_checkpoint, shard_name)
+            shard_state_dict = torch.load(shard_path, map_location="cpu")
+            for key in shard_keys:
+                state_dict[key] = shard_state_dict[key]
+        return state_dict
+
+    return state_dict
+
+
+def _copy_partial_rows_(dst_tensor, src_tensor, tensor_name):
+    if dst_tensor is None or src_tensor is None:
+        return 0
+    if dst_tensor.ndim < 1 or src_tensor.ndim < 1:
+        rank0_print(f"[resume] skip partial copy for {tensor_name}: invalid tensor rank.")
+        return 0
+    dst_rows = dst_tensor.shape[0]
+    src_rows = src_tensor.shape[0]
+    rows_to_copy = min(dst_rows, src_rows)
+    if rows_to_copy <= 0:
+        return 0
+    if tuple(dst_tensor.shape[1:]) != tuple(src_tensor.shape[1:]):
+        rank0_print(
+            f"[resume] skip partial copy for {tensor_name}: shape mismatch "
+            f"src={tuple(src_tensor.shape)} dst={tuple(dst_tensor.shape)}"
+        )
+        return 0
+    with torch.no_grad():
+        dst_tensor[:rows_to_copy].copy_(src_tensor[:rows_to_copy].to(device=dst_tensor.device, dtype=dst_tensor.dtype))
+    return rows_to_copy
+
+
+def _restore_resume_vocab_sensitive_weights(model, resume_checkpoint):
+    embed_tensor, embed_key = _load_checkpoint_tensor_by_key(resume_checkpoint, "embed_tokens.weight")
+    lm_head_tensor, lm_head_key = _load_checkpoint_tensor_by_key(resume_checkpoint, "lm_head.weight")
+
+    input_embeddings = model.get_input_embeddings()
+    copied_embed_rows = _copy_partial_rows_(
+        input_embeddings.weight if input_embeddings is not None else None,
+        embed_tensor,
+        "embed_tokens.weight",
+    )
+    rank0_print(
+        f"[resume] embed_tokens restore: checkpoint_key={embed_key}, "
+        f"checkpoint_rows={(embed_tensor.shape[0] if embed_tensor is not None else None)}, "
+        f"model_rows={(input_embeddings.weight.shape[0] if input_embeddings is not None else None)}, "
+        f"copied_rows={copied_embed_rows}"
+    )
+
+    lm_head_module = getattr(model, "lm_head", None)
+    copied_lm_rows = _copy_partial_rows_(
+        lm_head_module.weight if lm_head_module is not None else None,
+        lm_head_tensor,
+        "lm_head.weight",
+    )
+    rank0_print(
+        f"[resume] lm_head restore: checkpoint_key={lm_head_key}, "
+        f"checkpoint_rows={(lm_head_tensor.shape[0] if lm_head_tensor is not None else None)}, "
+        f"model_rows={(lm_head_module.weight.shape[0] if lm_head_module is not None else None)}, "
+        f"copied_rows={copied_lm_rows}"
+    )
+
+
+def _restore_submodule_from_resume_checkpoint(model, resume_checkpoint, submodule_attr, prefix):
+    base_model = model.get_model() if hasattr(model, "get_model") else model
+    submodule = getattr(base_model, submodule_attr, None)
+    if submodule is None:
+        rank0_print(f"[resume] explicit restore skipped for {submodule_attr}: submodule missing.")
+        return
+    state_dict = _load_prefix_state_dict_from_checkpoint(resume_checkpoint, prefix)
+    if not state_dict:
+        rank0_print(f"[resume] explicit restore skipped for {submodule_attr}: no checkpoint keys for prefix {prefix}")
+        return
+    load_result = submodule.load_state_dict(state_dict, strict=False)
+    rank0_print(
+        f"[resume] explicit restore for {submodule_attr} from prefix {prefix}: "
+        f"loaded_keys={len(state_dict)}, missing_keys={load_result.missing_keys}, "
+        f"unexpected_keys={load_result.unexpected_keys}"
+    )
+
+
+def _is_full_model_resume_checkpoint(resume_checkpoint):
+    full_weight_markers = [
+        "model.safetensors",
+        "model.safetensors.index.json",
+        "pytorch_model.bin",
+        "pytorch_model.bin.index.json",
+    ]
+    return any(os.path.exists(os.path.join(resume_checkpoint, marker)) for marker in full_weight_markers)
+
+
+def get_model(
+    model_args,
+    training_args,
+    bnb_model_from_pretrained_args,
+    load_source=None,
+    forced_resume_config=None,
+    forced_resume_state_dict=None,
+):
     load_source = load_source or model_args.model_name_or_path
     assert training_args.attn_implementation
     if training_args.attn_implementation == "sdpa" and torch.__version__ < "2.1.2":
@@ -1584,7 +1915,9 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args, load_so
 
     customized_kwargs = dict()
     customized_kwargs.update(bnb_model_from_pretrained_args)
-    cfg_pretrained = None
+    if forced_resume_state_dict is not None:
+        customized_kwargs["state_dict"] = forced_resume_state_dict
+    cfg_pretrained = forced_resume_config
 
     overwrite_config = {}
     if any(
@@ -1597,7 +1930,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args, load_so
             model_args.mm_spatial_pool_mode is not None,
             model_args.mm_resampler_type is not None,
         ]
-    ):
+    ) and cfg_pretrained is None:
         cfg_pretrained = AutoConfig.from_pretrained(load_source)
 
     if model_args.use_pos_skipping is not None and model_args.pos_skipping_range is not None:
@@ -1697,12 +2030,15 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args, load_so
     overwrite_config["occ_detach_hidden_states"] = model_args.occ_detach_hidden_states
 
     if overwrite_config:
-        assert cfg_pretrained is not None, "cfg_pretrained is None"
+        if cfg_pretrained is None:
+            cfg_pretrained = AutoConfig.from_pretrained(load_source)
 
         rank0_print(f"Overwriting config with {overwrite_config}")
         for k, v in overwrite_config.items():
             setattr(cfg_pretrained, k, v)
 
+        customized_kwargs["config"] = cfg_pretrained
+    elif forced_resume_config is not None:
         customized_kwargs["config"] = cfg_pretrained
 
     if model_args.model_class_name is not None:
@@ -1832,6 +2168,7 @@ def train(attn_implementation=None):
     resume_checkpoint = str(existing_checkpoints[-1]) if existing_checkpoints else None
     is_resuming = resume_checkpoint is not None
     load_source = resume_checkpoint if is_resuming else model_args.model_name_or_path
+    resume_from_full_checkpoint = bool(is_resuming and resume_checkpoint and _is_full_model_resume_checkpoint(resume_checkpoint))
     if is_resuming:
         rank0_print(f"[resume] Using checkpoint as load source: {load_source}")
 
@@ -1870,7 +2207,68 @@ def train(attn_implementation=None):
     model_args.min_xyz_range = data_args.min_xyz_range
     model_args.max_xyz_range = data_args.max_xyz_range
 
-    model = get_model(model_args, training_args, bnb_model_from_pretrained_args, load_source=load_source)
+    forced_resume_config = None
+    forced_resume_state_dict = None
+    if is_resuming:
+        rank0_print(f"[resume] checkpoint path: {resume_checkpoint}")
+        resume_config = AutoConfig.from_pretrained(resume_checkpoint)
+        resume_embed_rows = _inspect_checkpoint_rows_by_suffix(resume_checkpoint, "embed_tokens.weight")
+        resume_lm_head_rows = _inspect_checkpoint_rows_by_suffix(resume_checkpoint, "lm_head.weight")
+        config_vocab_size_before = getattr(resume_config, "vocab_size", None)
+        text_config_vocab_size_before = None
+        if hasattr(resume_config, "text_config"):
+            text_config_vocab_size_before = getattr(resume_config.text_config, "vocab_size", None)
+        rank0_print(f"[resume] checkpoint embed_tokens rows: {resume_embed_rows}")
+        rank0_print(f"[resume] checkpoint lm_head rows: {resume_lm_head_rows}")
+        rank0_print(f"[resume] config.vocab_size before patch: {config_vocab_size_before}")
+        rank0_print(f"[resume] text_config.vocab_size before patch: {text_config_vocab_size_before}")
+
+        if resume_from_full_checkpoint:
+            if resume_embed_rows is not None and hasattr(resume_config, "vocab_size"):
+                resume_config.vocab_size = resume_embed_rows
+            if resume_embed_rows is not None and hasattr(resume_config, "text_config") and hasattr(resume_config.text_config, "vocab_size"):
+                resume_config.text_config.vocab_size = resume_embed_rows
+            forced_resume_config = resume_config
+            forced_resume_state_dict = _load_checkpoint_state_dict_without_lm_head(resume_checkpoint)
+            rank0_print("[resume] full-checkpoint resume: forcing config vocab to embed rows and loading without lm_head.")
+        else:
+            should_patch_resume_vocab = False
+            if resume_embed_rows is not None:
+                if config_vocab_size_before is not None and config_vocab_size_before != resume_embed_rows:
+                    should_patch_resume_vocab = True
+                if text_config_vocab_size_before is not None and text_config_vocab_size_before != resume_embed_rows:
+                    should_patch_resume_vocab = True
+
+            if should_patch_resume_vocab:
+                if hasattr(resume_config, "vocab_size"):
+                    resume_config.vocab_size = resume_embed_rows
+                if hasattr(resume_config, "text_config") and hasattr(resume_config.text_config, "vocab_size"):
+                    resume_config.text_config.vocab_size = resume_embed_rows
+                forced_resume_config = resume_config
+                rank0_print("[resume] vocab patching applied before model construction.")
+            else:
+                rank0_print("[resume] vocab patching skipped; checkpoint config already aligned or embed rows unavailable.")
+        rank0_print(f"[resume] config.vocab_size after patch: {getattr(resume_config, 'vocab_size', None)}")
+
+    if forced_resume_config is not None:
+        model = get_model(
+            model_args,
+            training_args,
+            bnb_model_from_pretrained_args,
+            load_source=load_source,
+            forced_resume_config=forced_resume_config,
+            forced_resume_state_dict=forced_resume_state_dict,
+        )
+    else:
+        model = get_model(
+            model_args,
+            training_args,
+            bnb_model_from_pretrained_args,
+            load_source=load_source,
+        )
+    if is_resuming:
+        rank0_print(f"[resume] final model embedding rows: {model.get_input_embeddings().weight.shape[0]}")
+        rank0_print(f"[resume] final model.config.vocab_size: {getattr(model.config, 'vocab_size', None)}")
     model.config.use_cache = False
     if model_args.rope_scaling_factor is not None and model_args.rope_scaling_type is not None:
         model.config.rope_scaling = {
@@ -2127,7 +2525,6 @@ def train(attn_implementation=None):
             model_max_length=training_args.model_max_length,
             padding_side="right",
         )
-
     rank0_print(f"Prompt version: {model_args.version}")
     if model_args.version == "v0":
         if tokenizer.pad_token is None:
@@ -2179,6 +2576,17 @@ def train(attn_implementation=None):
 
 
     if model_args.vision_tower is not None:
+        setattr(model_args, "resume_from_full_checkpoint", resume_from_full_checkpoint)
+        if is_resuming:
+            rank0_print(f"[resume] full checkpoint path detected: {resume_from_full_checkpoint}")
+            rank0_print(
+                "[resume] fresh mm_mlp_adapter preload: "
+                + ("skipped" if resume_from_full_checkpoint and model_args.pretrain_mm_mlp_adapter else "applied")
+            )
+            rank0_print(
+                "[resume] fresh mm_inv_adapter preload: "
+                + ("skipped" if resume_from_full_checkpoint and model_args.pretrain_mm_inv_adapter else "applied")
+            )
         model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
 
         vision_tower = model.get_vision_tower()
@@ -2350,6 +2758,23 @@ def train(attn_implementation=None):
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
+
+    if is_resuming:
+        tokenizer_len = len(tokenizer)
+        pre_resize_embed_rows = model.get_input_embeddings().weight.shape[0]
+        rank0_print(f"[resume] tokenizer length after load: {tokenizer_len}")
+        rank0_print(f"[resume] model embedding rows before resize: {pre_resize_embed_rows}")
+        if tokenizer_len != pre_resize_embed_rows:
+            model.resize_token_embeddings(tokenizer_len)
+        post_resize_embed_rows = model.get_input_embeddings().weight.shape[0]
+        lm_head_module = getattr(model, "lm_head", None)
+        post_resize_lm_head_rows = lm_head_module.weight.shape[0] if lm_head_module is not None else None
+        rank0_print(f"[resume] model embedding rows after resize: {post_resize_embed_rows}")
+        rank0_print(f"[resume] lm_head rows after resize: {post_resize_lm_head_rows}")
+
+    if is_resuming and resume_from_full_checkpoint:
+        _restore_resume_vocab_sensitive_weights(model, resume_checkpoint)
+        rank0_print("[resume] explicit multimodal submodule restore skipped for full-checkpoint resume.")
 
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer
